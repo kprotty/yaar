@@ -1,0 +1,27 @@
+[package]
+name = "zap"
+version = "0.1.0"
+authors = ["kprotty"]
+edition = "2018"
+readme = "README.md"
+
+[features]
+default = ["std", "os-platform"]
+std = []
+os-platform = ["libc", "winapi"]
+
+[target.'cfg(unix)'.dependencies.libc]
+optional = true
+version = "0.2"
+default-features = false
+
+[target.'cfg(windows)'.dependencies.winapi]
+optional = true
+version = "0.3"
+default-features = false
+features = [
+    "winbase",
+    "minwindef",
+    "sysinfoapi",
+    "processthreadsapi",
+]
