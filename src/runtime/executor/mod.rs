@@ -1,10 +1,14 @@
 
-mod serial;
-mod parallel;
-
 use super::Config;
+use core::{
+    cell::Cell,
+    ptr::NonNull,
+    alloc::GlobalAlloc,
+};
 
-pub enum Error {}
+pub enum Error {
+    TlsOutOfMemory,
+}
 
 pub enum Executor {
     Serial(SerialExecutor),
@@ -12,11 +16,15 @@ pub enum Executor {
 }
 
 impl Executor {
-    pub fn run<F>(, future: F) -> Result<F::Output, Error>
+    pub fn run<A, F>(config: &Config, allocator: &A, future: F) -> Result<F::Output, Error>
     where
+        A: GlobalAlloc,
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        Executor::run(self, future)
+        match config.max_threads {
+            1 => SerialExecutor::run(config, allocator, future),
+            _ => ParallelExecutor::run(config, allocator, future),
+        }
     }
 }

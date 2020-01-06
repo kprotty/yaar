@@ -14,15 +14,8 @@ optimized around configuration and no_std.
 """
 
 [features]
-default = []
-
-[dependencies.num_cpus]
-version = "1.11"
-
-[dependencies.crossbeam]
-version = "0.7"
-default-features = false
-features = ["crossbeam-utils"]
+default = ["std"]
+std = []
 
 [target.'cfg(unix)'.dependencies.libc]
 version = "0.2"
