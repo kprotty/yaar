@@ -6,25 +6,29 @@ edition = "2018"
 license = "Apache-2.0/MIT"
 readme = "README.md"
 repository = "https://github.com/kprotty/yaar"
+categories = ["asynchronous", "concurrency", "network-programming", "no-std"]
+keywords = ["io", "async", "await", "non-blocking", "futures", "no-std"]
 description = """
 Yet another asynchronous runtime 
 optimized around configuration and no_std.
 """
-categories = ["asynchronous", "concurrency", "network-programming"]
-keywords = ["io", "async", "await", "non-blocking", "futures", "no-std"]
 
 [features]
-default = ["std", "os-platform"]
-std = []
-os-platform = ["libc", "winapi"]
+default = []
+
+[dependencies.num_cpus]
+version = "1.11"
+
+[dependencies.crossbeam]
+version = "0.7"
+default-features = false
+features = ["crossbeam-utils"]
 
 [target.'cfg(unix)'.dependencies.libc]
-optional = true
 version = "0.2"
 default-features = false
 
 [target.'cfg(windows)'.dependencies.winapi]
-optional = true
 version = "0.3"
 default-features = false
 features = [
