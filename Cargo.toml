@@ -14,19 +14,13 @@ optimized around configuration and no_std.
 """
 
 [features]
-default = ["full"]
-full = ["alloc", "time", "fs", "net", "rt-serial", "rt-parallel"]
+default = []
+alloc = []
+lock = ["lock_api"]
 os = ["libc", "winapi"]
-time = []
-io = []
-fs = ["io"]
-net = ["io"]
-alloc = ["rt-alloc"]
 rt = []
 rt-alloc = []
 rt-serial = ["rt"]
-rt-parallel = ["rt", "lock"]
-lock = ["lock_api"]
 
 [dependencies.lock_api]
 optional = true
