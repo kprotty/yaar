@@ -1,5 +1,5 @@
 [package]
-name = "zap"
+name = "yaar"
 version = "0.1.0"
 authors = ["kprotty"]
 edition = "2018"
@@ -7,26 +7,38 @@ license = "Apache-2.0/MIT"
 readme = "README.md"
 repository = "https://github.com/kprotty/yaar"
 categories = ["asynchronous", "concurrency", "network-programming", "no-std"]
-keywords = ["io", "async", "await", "non-blocking", "futures", "no-std"]
+keywords = ["io", "async", "await", "non-blocking", "futures", "no-std", "thread", "mutex"]
 description = """
 Yet another asynchronous runtime 
 optimized around configuration and no_std.
 """
 
 [features]
-default = ["std"]
-std = []
+default = ["full"]
+full = ["alloc", "time", "fs", "net", "rt-serial", "rt-parallel"]
+os = ["libc", "winapi"]
+time = []
+io = []
+fs = ["io"]
+net = ["io"]
+alloc = ["rt-alloc"]
+rt = []
+rt-alloc = []
+rt-serial = ["rt"]
+rt-parallel = ["rt", "lock"]
+lock = ["lock_api"]
+
+[dependencies.lock_api]
+optional = true
+version = "0.3"
 
 [target.'cfg(unix)'.dependencies.libc]
+optional = true
 version = "0.2"
 default-features = false
 
 [target.'cfg(windows)'.dependencies.winapi]
+optional = true
 version = "0.3"
 default-features = false
-features = [
-    "winbase",
-    "minwindef",
-    "sysinfoapi",
-    "processthreadsapi",
-]
+features = []

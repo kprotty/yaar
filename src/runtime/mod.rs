@@ -1,18 +1,27 @@
 
-mod config;
-mod executor;
+pub mod task;
 
-pub use config::Config;
+#[cfg(feature = "rt-serial")]
+pub mod serial;
 
-pub mod task {
-    use core::future::Future;
-    use super::executor::Executor;
+#[cfg(feature = "alloc")]
+pub struct DefaultAllocator;
 
-    pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        Executor::get().unwrap(). 
+#[cfg(feature = "alloc")]
+unsafe impl core::alloc::GlobalAlloc for DefaultAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        alloc::alloc::alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        alloc::alloc::dealloc(ptr, layout)
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: core::alloc::Layout) -> *mut u8 {
+        alloc::alloc::alloc_zeroed(layout)
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: core::alloc::Layout, new_size: usize) -> *mut u8 {
+        alloc::alloc::realloc(ptr, layout, new_size)
     }
 }

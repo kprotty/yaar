@@ -1,0 +1,11 @@
+[package]
+name = "hello"
+version = "0.1.0"
+authors = ["kprotty"]
+edition = "2018"
+
+[dependencies.yaar]
+path = "../../"
+version = "*"
+default-features = false
+features = ["rt-serial"]

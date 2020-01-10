@@ -1,7 +1,7 @@
 <h1 align="center">yaar</h1>
 <div align="center">
     <strong>
-        Yet another asynchronous runtime.
+        Yet another asynchronous runtime optimized around configuration and no_std.
     </strong>
 </div>
 
