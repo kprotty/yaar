@@ -1,8 +1,12 @@
+use yaar::runtime::{task, serial};
 
 fn main() {
-    let result = yaar::runtime::serial::run(
+    let result = serial::run(
         async move {
-            println!("Hello world");
+            for i in 0..5 {
+                println!("Hello world {}", i);
+                task::yield_now().await;
+            }
             42usize
         },
     );

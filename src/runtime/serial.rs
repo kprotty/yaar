@@ -19,8 +19,10 @@ pub fn run<T>(
     }));
 
     task::with_executor_as(&executor, move |executor| {
-        let mut future = task::TaskFuture::new(task::Priority::Normal, future);
-        let _ = future.poll();
+        let mut future = task::FutureTask::new(task::Priority::Normal, future);
+        if future.resume().is_ready() {
+            return future.into_inner().unwrap();
+        }
 
         let runtime = unsafe { &mut *executor.0.get() };
         while let Some(task) = runtime.run_queue.pop() {

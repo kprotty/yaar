@@ -135,68 +135,6 @@ impl PriorityList {
     }
 }
 
-pub struct TaskFuture<F: Future> {
-    pub future: F,
-    pub task: Task,
-    result: Option<F::Output>,
-}
-
-impl<F: Future> TaskFuture<F> {
-    pub fn new(priority: Priority, future: F) -> Self {
-        Self {
-            future,
-            task: Task::new(priority, Self::resume),
-            result: None
-        }
-    }
-
-    unsafe fn resume(task: *mut Task) {
-        // TODO: wait for the lang to get offsetof()
-        let stub = MaybeUninit::<Self>::zeroed();
-        let base_ptr = stub.as_ptr() as usize;
-        let task_ptr = &(&*stub.as_ptr()).task as *const _ as usize;
-        let self_ptr = (task as usize) - (task_ptr - base_ptr);
-
-        let this = &mut *(self_ptr as *mut Self);
-        let _ = this.poll();
-    }
-
-    pub fn into_inner(self) -> Option<F::Output> {
-        self.result
-    }
-
-    pub fn poll(&mut self) -> Poll<Option<&F::Output>> {
-        // the result is cached
-        if self.result.is_some() {
-            return Poll::Ready(self.result.as_ref());
-        }
-
-        const WAKE: unsafe fn(*const ()) = |task| {
-            with_executor(|&(executor, vtable)| unsafe {
-                (vtable.schedule)(executor, task as *mut Task)
-            })
-        };
-
-        const VTABLE: RawWakerVTable = RawWakerVTable::new(
-            |task| RawWaker::new(task, &VTABLE),
-            WAKE,
-            WAKE,
-            |_task| {},
-        );
-
-        let ptr = &self.task as *const Task as *const ();
-        let waker = unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) };
-        let pinned = unsafe { Pin::new_unchecked(&mut self.future) };
-        match pinned.poll(&mut Context::from_waker(&waker)) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                self.result = Some(result);
-                Poll::Ready(self.result.as_ref())
-            }
-        }
-    }
-}
-
 pub trait Executor: Sync {
     fn schedule(&self, task: &mut Task);
 }
@@ -213,14 +151,6 @@ unsafe impl Sync for ExecutorRef {}
 /// Only modified by with_executor_as() which should not be called
 /// via multiple threads to its safe to use a mutable global.
 static EXECUTOR_REF: ExecutorRef = ExecutorRef(UnsafeCell::new(None));
-
-fn with_executor<T>(scoped: impl FnOnce(&(*const (), &'static ExecutorVTable)) -> T) -> T {
-    scoped(unsafe {
-        (&*EXECUTOR_REF.0.get())
-            .as_ref()
-            .expect("Executor is not set. Make sure this is invoked only inside the scope of `with_executor_as()`")
-    })
-}
 
 pub fn with_executor_as<E: Executor, T>(executor: &E, scoped: impl FnOnce(&E) -> T) -> T {
     // would have been const but "can't use generic parameters from outer function"
@@ -246,5 +176,100 @@ pub fn with_executor_as<E: Executor, T>(executor: &E, scoped: impl FnOnce(&E) ->
         debug_assert_eq!(our_vtable as *const _ as usize, vtable_ref as *const _ as usize);
 
         result
+    }
+}
+
+fn with_executor<T>(scoped: impl FnOnce(&(*const (), &'static ExecutorVTable)) -> T) -> T {
+    scoped(unsafe {
+        (&*EXECUTOR_REF.0.get())
+            .as_ref()
+            .expect("Executor is not set. Make sure this is invoked only inside the scope of `with_executor_as()`")
+    })
+}
+
+pub struct FutureTask<F: Future> {
+    future: F,
+    pub task: Task,
+    result: Option<F::Output>,
+}
+
+impl<F: Future> FutureTask<F> {
+    pub fn new(priority: Priority, future: F) -> Self {
+        Self {
+            future,
+            task: Task::new(priority, Self::on_resume),
+            result: None,
+        }
+    }
+
+    pub fn into_inner(self) -> Option<F::Output> {
+        self.result
+    }
+
+    unsafe fn on_resume(task: *mut Task) {
+        // zig: @fieldParentPtr(Self, "task", task)
+        let this = {
+            let stub = MaybeUninit::<Self>::zeroed();
+            let base_ptr = stub.as_ptr() as usize;
+            let task_ptr = &(&*stub.as_ptr()).task as *const _ as usize;
+            &mut *(((task as usize) - (task_ptr - base_ptr)) as *mut Self)
+        };
+        let _ = this.resume();
+    }
+
+    pub fn resume(&mut self) -> Poll<Option<&F::Output>> {
+        if self.result.is_some() {
+            return Poll::Ready(self.result.as_ref());
+        }
+
+        const WAKE: unsafe fn(*const ()) = |ptr| {
+            with_executor(|&(executor, vtable)| unsafe {
+                (vtable.schedule)(executor, ptr as *mut Task)
+            })
+        };
+
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |ptr| RawWaker::new(ptr, &VTABLE),
+            WAKE,
+            WAKE,
+            |_| {},
+        );
+
+        let ptr = &self.task as *const Task as *const ();
+        let waker = unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) };
+        let pinned = unsafe { Pin::new_unchecked(&mut self.future) };
+        let mut context = Context::from_waker(&waker);
+
+        match pinned.poll(&mut context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                self.result = Some(result);
+                Poll::Ready(self.result.as_ref())
+            }
+        }
+    }
+}
+
+pub fn yield_now() -> impl Future {
+    struct YieldTask {
+        did_yield: bool,
+    };
+
+    impl Future for YieldTask {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.did_yield {
+                return Poll::Ready(());
+            }
+
+            self.did_yield = true;
+            ctx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    YieldTask {
+        did_yield: false,
     }
 }
