@@ -1,10 +1,11 @@
 use core::{
     pin::Pin,
-    ptr::NonNull,
     future::Future,
-    task::{Poll, Context},
+    cell::UnsafeCell,
+    ptr::{null, NonNull},
     hint::unreachable_unchecked,
-    mem::{align_of, MaybeUninit},
+    mem::{self, align_of, MaybeUninit},
+    task::{Poll, Context, Waker, RawWaker, RawWakerVTable},
 };
 
 pub enum Priority {
@@ -18,47 +19,101 @@ impl Priority {
 }
 
 pub struct Task {
-    data: usize,
+    next: usize,
+    resume: unsafe fn(*mut Task),
 }
 
 impl Task {
-    pub fn new(priority: Priority, next: Option<NonNull<Self>>) -> Self {
+    pub fn new(priority: Priority, resume: unsafe fn(*mut Task)) -> Self {
         assert!(align_of::<Self>() > Priority::MASK);
-        let ptr = next.map(|ptr| ptr.as_ptr() as usize).unwrap_or(0);
-        Self { data: (priority as usize) | ptr }
+        let next = priority as usize;
+        Self { next, resume }
+    }
+
+    pub fn get_next(&self) -> Option<NonNull<Self>> {
+        NonNull::new((self.next & !Priority::MASK) as *mut Self)
     }
 
     pub fn set_next(&mut self, next: Option<NonNull<Self>>) {
-        *self = Self::new(self.get_priority(), next);
+        self.next = (self.next & Priority::MASK) | match next {
+            Some(ptr) => ptr.as_ptr() as usize,
+            None => null::<Self>() as usize,
+        };
     }
 
     pub fn set_priority(&mut self, priority: Priority) {
-        *self = Self::new(priority, self.get_next());
+        self.next = (self.next & !Priority::MASK) | (priority as usize);
     }
 
-    pub fn get_next(self) -> Option<NonNull<Self>> {
-        NonNull::new((self.data & !Priority::MASK) as *mut Self)
-    }
-
-    pub fn get_priority(self) -> Priority {
-        match self.data & Priority::MASK {
+    pub fn get_priority(&self) -> Priority {
+        match self.next & Priority::MASK {
             0 => Priority::Low,
             1 => Priority::Normal,
             2 => Priority::High,
             _ => unsafe { unreachable_unchecked() }
         }
     }
+
+    pub fn resume(&mut self) {
+        unsafe { (self.resume)(self) }
+    }
 }
 
+#[doc(hidden)]
 #[derive(Default)]
-pub struct TaskPriorityList {
-    front: TaskList,
-    back: TaskList,
-    size: usize,
+pub struct List {
+    head: Option<NonNull<Task>>,
+    tail: Option<NonNull<Task>>,
 }
 
-impl TaskPriorityList {
-    pub fn pop(&mut self) -> Option<NonNull<Task>> {
+impl List {
+    pub fn pop<'a>(&mut self) -> Option<&'a mut Task> {
+        self.head.map(|task| {
+            let task = unsafe { &mut *task.as_ptr() };
+            self.head = task.get_next();
+            if self.head.is_none() {
+                self.tail = None;
+            }
+            task
+        })
+    }
+
+    pub fn push(&mut self, priority_list: &PriorityList) {
+        self.push_front(&priority_list.front);
+        self.push_back(&priority_list.back);
+    }
+
+    pub fn push_front(&mut self, list: &Self) {
+        if let Some(tail) = list.tail {
+            unsafe { (&mut *tail.as_ptr()).set_next(self.head) };
+        }
+        if self.tail.is_none() {
+            self.tail = list.tail;
+        }
+        self.head = list.head;
+    }
+
+    pub fn push_back(&mut self, list: &Self) {
+        if let Some(tail) = self.tail {
+            unsafe { (&mut *tail.as_ptr()).set_next(list.head) };
+        }
+        if self.head.is_none() {
+            self.head = list.head;
+        }
+        self.tail = list.tail;
+    }
+}
+
+#[doc(hidden)]
+#[derive(Default)]
+pub struct PriorityList {
+    front: List,
+    back: List,
+    pub size: usize,
+}
+
+impl PriorityList {
+    pub fn pop<'a>(&mut self) -> Option<&'a mut Task> {
         self.front.pop()
             .or_else(|| self.back.pop())
             .map(|task| {
@@ -69,57 +124,127 @@ impl TaskPriorityList {
 
     pub fn push(&mut self, task: &mut Task) {
         self.size += 1;
-        let list = TaskList {
+        let list = List {
             head: NonNull::new(task),
             tail: NonNull::new(task),
         };
         match task.get_priority() {
-            Priority::Low,
-            Priority::Normal => self.back.push(&list),
-            Priority::High => self.front.push(list),
+            Priority::Low | Priority::Normal => self.back.push_back(&list),
+            Priority::High => self.front.push_back(&list),
         }
     }
 }
 
-#[derive(Default)]
-pub struct TaskList {
-    head: Option<NonNull<Task>>,
-    tail: Option<NonNull<Task>>,
+pub struct TaskFuture<F: Future> {
+    pub future: F,
+    pub task: Task,
+    result: Option<F::Output>,
 }
 
-impl TaskList {
-    pub fn pop(&mut self) -> Option<NonNull<Task>> {
-        self.head.map(|task| {
-            unsafe { self.head = task.as_mut().get_next() };
-            if self.head.is_none() {
-                self.tail = None;
+impl<F: Future> TaskFuture<F> {
+    pub fn new(priority: Priority, future: F) -> Self {
+        Self {
+            future,
+            task: Task::new(priority, Self::resume),
+            result: None
+        }
+    }
+
+    unsafe fn resume(task: *mut Task) {
+        // TODO: wait for the lang to get offsetof()
+        let stub = MaybeUninit::<Self>::zeroed();
+        let base_ptr = stub.as_ptr() as usize;
+        let task_ptr = &(&*stub.as_ptr()).task as *const _ as usize;
+        let self_ptr = (task as usize) - (task_ptr - base_ptr);
+
+        let this = &mut *(self_ptr as *mut Self);
+        let _ = this.poll();
+    }
+
+    pub fn into_inner(self) -> Option<F::Output> {
+        self.result
+    }
+
+    pub fn poll(&mut self) -> Poll<Option<&F::Output>> {
+        // the result is cached
+        if self.result.is_some() {
+            return Poll::Ready(self.result.as_ref());
+        }
+
+        const WAKE: unsafe fn(*const ()) = |task| {
+            with_executor(|&(executor, vtable)| unsafe {
+                (vtable.schedule)(executor, task as *mut Task)
+            })
+        };
+
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |task| RawWaker::new(task, &VTABLE),
+            WAKE,
+            WAKE,
+            |_task| {},
+        );
+
+        let ptr = &self.task as *const Task as *const ();
+        let waker = unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) };
+        let pinned = unsafe { Pin::new_unchecked(&mut self.future) };
+        match pinned.poll(&mut Context::from_waker(&waker)) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                self.result = Some(result);
+                Poll::Ready(self.result.as_ref())
             }
-            task
-        })
+        }
     }
+}
 
-    pub fn push(&mut self, priority_list: &TaskPriorityList) {
-        self.push_front(&priority_list.front);
-        self.push_back(&priority_list.back);
-    }
+pub trait Executor: Sync {
+    fn schedule(&self, task: &mut Task);
+}
 
-    pub fn push_front(&mut self, list: &Self) {
-        if let Some(tail) = list.tail {
-            unsafe { tail.as_mut().set_next(self.head) };
-        }
-        if self.tail.is_none() {
-            self.tail = list.tail;
-        }
-        self.head = list.head;
-    }
+struct ExecutorVTable {
+    schedule: unsafe fn(*const (), task: *mut Task),
+}
 
-    pub fn push_back(&mut self, list: &Self) {
-        if let Some(tail) = self.tail {
-            unsafe { tail.as_mut().set_next(list.head) };
-        }
-        if self.head.is_none() {
-            self.head = list.head;
-        }
-        self.tail = list.tail;
+struct ExecutorRef(UnsafeCell<Option<(*const (), &'static ExecutorVTable)>>);
+
+unsafe impl Sync for ExecutorRef {}
+
+/// Global reference to the current executor implementation.
+/// Only modified by with_executor_as() which should not be called
+/// via multiple threads to its safe to use a mutable global.
+static EXECUTOR_REF: ExecutorRef = ExecutorRef(UnsafeCell::new(None));
+
+fn with_executor<T>(scoped: impl FnOnce(&(*const (), &'static ExecutorVTable)) -> T) -> T {
+    scoped(unsafe {
+        (&*EXECUTOR_REF.0.get())
+            .as_ref()
+            .expect("Executor is not set. Make sure this is invoked only inside the scope of `with_executor_as()`")
+    })
+}
+
+pub fn with_executor_as<E: Executor, T>(executor: &E, scoped: impl FnOnce(&E) -> T) -> T {
+    // would have been const but "can't use generic parameters from outer function"
+    let vtable = ExecutorVTable {
+        schedule: |ptr, task| unsafe {
+            (&*(ptr as *const E)).schedule(&mut *task)
+        },
+    };
+
+    unsafe {
+        // promote our local vtable to static so it can be accessed from a global setting
+        let vtable_ref = &*(&vtable as *const _);
+        let old_executor = mem::replace(
+            &mut *EXECUTOR_REF.0.get(),
+            Some((executor as *const E as *const (), vtable_ref)),
+        );
+
+        let result = scoped(executor);
+
+        // restore the old executor and make sure ours was on-top of the stack
+        let (our_ptr, our_vtable) = mem::replace(&mut *EXECUTOR_REF.0.get(), old_executor).unwrap();
+        debug_assert_eq!(our_ptr as usize, executor as *const _ as usize);
+        debug_assert_eq!(our_vtable as *const _ as usize, vtable_ref as *const _ as usize);
+
+        result
     }
 }
