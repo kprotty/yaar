@@ -3,7 +3,23 @@ yaar-lock
 [![Documentation](https://docs.rs/yaar-lock/badge.svg)](https://docs.rs/yaar-lock/)
 ====
 
-Fast, no_std synchronization primitives.
+This library currently provides Mutex implementations which are based on parking_lot
+making them small (only a `usize` large), fast, and configurable in `#![no_std]`
+environments.
+
+## Usage
+Add this to your `Cargo.toml`:
+```toml
+[dependencies]
+yaar_lock = "0.1"
+```
+
+To disable the default provided OS implements for `#![no_std]` 
+provided by the `os` feature, set the default features manually:
+```toml
+[dependencies]
+yaar_lock = { version = "0.1", default-features = false }
+```
 
 ## License
 

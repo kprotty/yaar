@@ -13,6 +13,10 @@ mod posix;
 #[cfg(all(feature = "os", unix, not(target_os = "linux")))]
 pub use posix::OsEvent;
 
+/// Blocking event abstraction used to provide thread parking.
+///
+/// This allows for customization on how the thread should yield internally
+/// for platforms not supported by the library or for more efficient implementations.
 pub unsafe trait Event: Sized + Default + Send + Sync {
     /// Restore an event back to it's unset state.
     /// Since this owns the Event, it can be done without synchronization
