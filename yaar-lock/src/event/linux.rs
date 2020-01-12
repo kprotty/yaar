@@ -8,6 +8,8 @@ const UNSET: i32 = 0;
 const WAIT: i32 = 1;
 const SET: i32 = 2;
 
+/// The default [`Event`] implementation for linux.
+/// Utilizes `futex()` for blocking and notification.
 pub struct OsEvent {
     state: AtomicI32,
 }
@@ -61,6 +63,7 @@ unsafe impl Event for OsEvent {
             }
         }
 
+        // wait until the state changes from WAIT to SET
         while self.state.load(Ordering::Acquire) != SET {
             let ptr = &self.state as *const _ as *const i32;
             let r = unsafe { syscall(SYS_futex, ptr, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, WAIT, 0) };

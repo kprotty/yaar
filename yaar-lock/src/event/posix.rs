@@ -6,6 +6,8 @@ use libc::{
     PTHREAD_COND_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
 };
 
+/// The default [`Event`] implementation for posix platforms that aren't linux.
+/// Utilizes `pthread_cond_t` for blocking and notification.
 pub struct OsEvent {
     is_set: Cell<bool>,
     cond: UnsafeCell<pthread_cond_t>,

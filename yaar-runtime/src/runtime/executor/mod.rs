@@ -31,7 +31,7 @@ pub fn with_executor_as<E: Executor, T>(executor: &E, scoped: impl FnOnce(&E) ->
         unsafe { &mut *EXECUTOR_CELL.0.get() },
         Some(ExecutorRef {
             ptr: executor as *const E as *const (),
-            _schedule: |ptr, task| unsafe { (&*(ptr as *const E)).schedule(&mut *task) },
+            _schedule: |ptr, task| unsafe { (&*(ptr as *const E)).schedule(task) },
         }),
     );
 

@@ -1,0 +1,35 @@
+[package]
+name = "yaar-lock"
+version = "0.1.0"
+authors = ["kprotty"]
+edition = "2018"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/kprotty/yaar/yaar-lock"
+categories = ["concurrency", "no-std"]
+keywords = ["no-std", "thread", "mutex"]
+description = """
+Fast, no_std synchronization primitives.
+"""
+
+[features]
+default = ["os"]
+os = ["libc", "winapi"]
+
+[dependencies.lock_api]
+version = "0.3"
+
+[target.'cfg(unix)'.dependencies.libc]
+optional = true
+version = "0.2"
+default-features = false
+
+[target.'cfg(windows)'.dependencies.winapi]
+optional = true
+version = "0.3"
+default-features = false
+features = [
+    "winbase",
+    "handleapi",
+    "libloaderapi",
+]

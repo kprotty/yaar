@@ -28,6 +28,12 @@ const UNSET: u32 = 0;
 const WAIT: u32 = 1;
 const SET: u32 = 2;
 
+/// The default [`Event`] implementation for windows.
+/// Relies on [`WaitOnAddress`], falling back to [`NT Keyed Events`],
+/// for blocking and notification.
+///
+/// [`WaitOnAddress`]: https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitonaddress
+/// [`NT Keyed Events`]: https://locklessinc.com/articles/keyed_events/
 pub struct OsEvent {
     state: AtomicU32,
 }
@@ -55,6 +61,8 @@ unsafe impl Event for OsEvent {
     }
 
     fn set(&self) {
+        // Only do the wake up if theres a thread waiting.
+        // Prevents a deadlock on NtReleaseKeyedEvent and an extra syscall for WakeByAddressSingle.
         if self.state.swap(SET, Ordering::Release) == WAIT {
             unsafe {
                 match get_backend() {
@@ -85,6 +93,7 @@ unsafe impl Event for OsEvent {
     }
 
     fn wait(&self) {
+        // Try to transition in the waiting state.
         let mut state = self.state.load(Ordering::Acquire);
         loop {
             if state == SET {
@@ -189,6 +198,7 @@ unsafe fn load_wait_on_address() -> bool {
         _WakeByAddressSingle.store(WakeByAddressSingle as usize, Ordering::Relaxed);
     }
 
+    // Release the stores to the function pointers above for threads calling them to use.
     assert_eq!(WAIT_ON_ADDRESS, INVALID_HANDLE_VALUE as usize);
     BACKEND_HANDLE.store(WAIT_ON_ADDRESS, Ordering::Release);
     true
@@ -239,6 +249,8 @@ unsafe fn load_keyed_events() -> bool {
         return false;
     }
 
+    // Release the stores to the function pointers above for threads calling them to use.
+    // Racy submission of a keyed event handle (appears faster than using a spinlock).
     let handle = handle.assume_init();
     match BACKEND_HANDLE.compare_exchange(0, handle as usize, Ordering::Release, Ordering::Relaxed)
     {
