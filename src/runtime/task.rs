@@ -214,9 +214,7 @@ impl<F: Future> FutureTask<F> {
     }
 }
 
-pub fn yield_now() -> impl Future {
-    // TODO: yield_now(priority)
-
+pub fn yield_now(priority: Priority) -> impl Future {
     struct YieldTask {
         did_yield: bool,
     };
@@ -235,7 +233,7 @@ pub fn yield_now() -> impl Future {
         }
     }
 
-    YieldTask {
+    FutureTask::new(priority, YieldTask {
         did_yield: false,
-    }
+    })
 }
