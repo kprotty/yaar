@@ -54,7 +54,7 @@ impl Task {
 
     /// Modify the runtime priority of the task.
     /// Should only be called before the task is resumed as
-    /// the scheduler could also have ownership internally. 
+    /// the scheduler could also have ownership internally.
     pub fn set_priority(&mut self, priority: Priority) {
         self.next = (self.next & !Priority::MASK) | (priority as usize);
     }
@@ -211,7 +211,7 @@ impl<F: Future> FutureTask<F> {
 
     unsafe fn on_resume(task: *mut Task) {
         // Given a pointer to a task, get it's corresponding FutureTask.
-        // This uses a `MaybeUninit::zeroed()` instance in order to 
+        // This uses a `MaybeUninit::zeroed()` instance in order to
         // compute the task field offset but should be replaced if this is merged:
         // https://internals.rust-lang.org/t/pre-rfc-add-a-new-offset-of-macro-to-core-mem/9273
         let this = {
@@ -226,7 +226,7 @@ impl<F: Future> FutureTask<F> {
     /// Resume the future wrapped task, returning the resulting output.
     ///
     /// This effectively calls `Future::poll()` with the waker and context
-    /// setup to resume the future using the task as a reference if the 
+    /// setup to resume the future using the task as a reference if the
     /// futures output is not already polled() and stored.
     pub fn resume(&mut self) -> Poll<&F::Output> {
         // check if the output is cached before polling down below
@@ -254,8 +254,8 @@ impl<F: Future> FutureTask<F> {
 /// Returns a future which can be used to yield the current
 /// future to the executor in order to let another task run.
 ///
-/// Takes in a `Priority` to potentially influence 
-/// the re-scheduling of the current future task. 
+/// Takes in a `Priority` to potentially influence
+/// the re-scheduling of the current future task.
 pub fn yield_now(priority: Priority) -> impl Future {
     struct YieldTask {
         did_yield: bool,

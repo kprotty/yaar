@@ -218,7 +218,7 @@ impl<E: Event> WordLock<E> {
             //
             // [&4:1, null:2, null:3, &4:4]
             //  ^head                 ^tail
-            // 
+            //
             // When a new node comes in as the head, the list only needs to be traversed
             // once since the old head points to the tail and can be found there instead
             // of traversing the entire list again.

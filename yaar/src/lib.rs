@@ -1,6 +1,6 @@
 #![no_std]
 
-pub mod task;
 mod executor;
+pub mod task;
 
 pub use self::executor::*;

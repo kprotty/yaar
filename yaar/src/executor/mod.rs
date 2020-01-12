@@ -4,13 +4,12 @@ use core::{cell::UnsafeCell, marker::Sync, mem};
 #[cfg(feature = "serial")]
 pub mod serial;
 
-/// Abstraction over providing execution of runtime [`Task`]s. 
+/// Abstraction over providing execution of runtime [`Task`]s.
 pub trait Executor: Sync {
-
     // ~ brainstorming
     // fn blocking(&self, task: &mut Task, cfg(time) Option<Duration>) -> bool;
 
-    /// Mark the given task as runnable and execute it eventually in the future. 
+    /// Mark the given task as runnable and execute it eventually in the future.
     fn schedule(&self, task: &mut Task);
 }
 
@@ -40,22 +39,20 @@ static EXECUTOR_CELL: ExecutorCell = ExecutorCell(UnsafeCell::new(None));
 /// is restored via stack but should not be called in parellel.
 pub fn with_executor_as<E: Executor, T>(executor: &E, scoped: impl FnOnce(&E) -> T) -> T {
     // The vtable for the provided executor.
-    // Wish it could be `const` but rust doesnt currently 
+    // Wish it could be `const` but rust doesnt currently
     // support function type parameters in const :(
     let executor_ref = ExecutorRef {
         ptr: executor as *const _ as *const (),
-        _schedule: |ptr, task| unsafe {
-            (&*(ptr as *const E)).schedule(&mut *task)
-        },
+        _schedule: |ptr, task| unsafe { (&*(ptr as *const E)).schedule(&mut *task) },
     };
-    
+
     // promote the executor_ref to &'static ExecutorRef for storage in the global executor cell.
     let static_ref = unsafe { Some(&*(&executor_ref as *const _)) };
     let old_ref = unsafe { mem::replace(&mut *EXECUTOR_CELL.0.get(), static_ref) };
     let result = scoped(executor);
     let our_ref = unsafe { mem::replace(&mut *EXECUTOR_CELL.0.get(), old_ref) };
 
-    // ensure that the stack of executor_ref's invariant is maintained. 
+    // ensure that the stack of executor_ref's invariant is maintained.
     debug_assert_eq!(our_ref, static_ref);
     result
 }

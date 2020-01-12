@@ -1,7 +1,7 @@
 //! Fast, no_std synchronization primitives.
 //!
 //! ## Feature flags
-//! 
+//!
 //! - `os` (on by default): exposes operating system primitives which implement blocking functionality.
 #![no_std]
 
