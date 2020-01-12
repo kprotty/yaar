@@ -18,7 +18,6 @@ default = []
 alloc = []
 lock = ["lock_api"]
 os = ["libc", "winapi"]
-io = []
 rt = []
 rt-serial = ["rt"]
 

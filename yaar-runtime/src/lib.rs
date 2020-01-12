@@ -17,6 +17,3 @@ pub mod lock;
 
 #[cfg(feature = "rt")]
 pub mod runtime;
-
-#[cfg(feature = "io")]
-pub mod io;
