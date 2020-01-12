@@ -1,10 +1,11 @@
+use super::executor::{with_executor};
 use core::{
     pin::Pin,
+    marker::Unpin,
     future::Future,
-    cell::UnsafeCell,
     ptr::{null, NonNull},
     hint::unreachable_unchecked,
-    mem::{self, align_of, MaybeUninit},
+    mem::{align_of, MaybeUninit},
     task::{Poll, Context, Waker, RawWaker, RawWakerVTable},
 };
 
@@ -135,62 +136,33 @@ impl PriorityList {
     }
 }
 
-pub trait Executor: Sync {
-    fn schedule(&self, task: &mut Task);
-}
-
-struct ExecutorVTable {
-    schedule: unsafe fn(*const (), task: *mut Task),
-}
-
-struct ExecutorRef(UnsafeCell<Option<(*const (), &'static ExecutorVTable)>>);
-
-unsafe impl Sync for ExecutorRef {}
-
-/// Global reference to the current executor implementation.
-/// Only modified by with_executor_as() which should not be called
-/// via multiple threads to its safe to use a mutable global.
-static EXECUTOR_REF: ExecutorRef = ExecutorRef(UnsafeCell::new(None));
-
-pub fn with_executor_as<E: Executor, T>(executor: &E, scoped: impl FnOnce(&E) -> T) -> T {
-    // would have been const but "can't use generic parameters from outer function"
-    let vtable = ExecutorVTable {
-        schedule: |ptr, task| unsafe {
-            (&*(ptr as *const E)).schedule(&mut *task)
-        },
-    };
-
-    unsafe {
-        // promote our local vtable to static so it can be accessed from a global setting
-        let vtable_ref = &*(&vtable as *const _);
-        let old_executor = mem::replace(
-            &mut *EXECUTOR_REF.0.get(),
-            Some((executor as *const E as *const (), vtable_ref)),
-        );
-
-        let result = scoped(executor);
-
-        // restore the old executor and make sure ours was on-top of the stack
-        let (our_ptr, our_vtable) = mem::replace(&mut *EXECUTOR_REF.0.get(), old_executor).unwrap();
-        debug_assert_eq!(our_ptr as usize, executor as *const _ as usize);
-        debug_assert_eq!(our_vtable as *const _ as usize, vtable_ref as *const _ as usize);
-
-        result
-    }
-}
-
-fn with_executor<T>(scoped: impl FnOnce(&(*const (), &'static ExecutorVTable)) -> T) -> T {
-    scoped(unsafe {
-        (&*EXECUTOR_REF.0.get())
-            .as_ref()
-            .expect("Executor is not set. Make sure this is invoked only inside the scope of `with_executor_as()`")
-    })
-}
-
 pub struct FutureTask<F: Future> {
     future: F,
     pub task: Task,
-    result: Option<F::Output>,
+    output: Option<F::Output>,
+}
+
+impl<F: Future> Unpin for FutureTask<F> {}
+
+impl<F: Future> Future for FutureTask<F> {
+    type Output = NonNull<F::Output>;
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            if let Some(output) = this.output.as_mut() {
+                return Poll::Ready(unsafe { NonNull::new_unchecked(output) });
+            }
+            let pinned = unsafe { Pin::new_unchecked(&mut this.future) };
+            match pinned.poll(ctx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(output) => {
+                    this.output = Some(output);
+                    continue;
+                },
+            }
+        }
+    }
 }
 
 impl<F: Future> FutureTask<F> {
@@ -198,12 +170,12 @@ impl<F: Future> FutureTask<F> {
         Self {
             future,
             task: Task::new(priority, Self::on_resume),
-            result: None,
+            output: None,
         }
     }
 
-    pub fn into_inner(self) -> Option<F::Output> {
-        self.result
+    pub fn into_output(self) -> Option<F::Output> {
+        self.output
     }
 
     unsafe fn on_resume(task: *mut Task) {
@@ -217,14 +189,10 @@ impl<F: Future> FutureTask<F> {
         let _ = this.resume();
     }
 
-    pub fn resume(&mut self) -> Poll<Option<&F::Output>> {
-        if self.result.is_some() {
-            return Poll::Ready(self.result.as_ref());
-        }
-
+    pub fn resume(&mut self) -> Poll<&F::Output> {
         const WAKE: unsafe fn(*const ()) = |ptr| {
-            with_executor(|&(executor, vtable)| unsafe {
-                (vtable.schedule)(executor, ptr as *mut Task)
+            with_executor(|executor| unsafe {
+                executor.schedule(&mut *(ptr as *mut Task))
             })
         };
 
@@ -237,20 +205,18 @@ impl<F: Future> FutureTask<F> {
 
         let ptr = &self.task as *const Task as *const ();
         let waker = unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) };
-        let pinned = unsafe { Pin::new_unchecked(&mut self.future) };
-        let mut context = Context::from_waker(&waker);
+        let pinned = unsafe { Pin::new_unchecked(self) };
 
-        match pinned.poll(&mut context) {
+        match pinned.poll(&mut Context::from_waker(&waker)) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                self.result = Some(result);
-                Poll::Ready(self.result.as_ref())
-            }
+            Poll::Ready(ptr) => Poll::Ready(unsafe { &*ptr.as_ptr() }),
         }
     }
 }
 
 pub fn yield_now() -> impl Future {
+    // TODO: yield_now(priority)
+
     struct YieldTask {
         did_yield: bool,
     };
