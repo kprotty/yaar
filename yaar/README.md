@@ -1,6 +1,6 @@
 yaar
 [![Licence](https://img.shields.io/badge/license-MIT%20or%20Apache-blue.svg)](#License)
-[![Documentation](https://docs.rs/yaar-runtime/badge.svg)](https://docs.rs/yaar/)
+[![Documentation](https://docs.rs/yaar/badge.svg)](https://docs.rs/yaar/)
 ====
 
 **Y**et **A**nother **A**synchronous **R**untime (yaar - pronounced "yaare/yah-are")
