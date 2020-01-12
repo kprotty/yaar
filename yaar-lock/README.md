@@ -1,4 +1,6 @@
 yaar-lock
+[![Licence](https://img.shields.io/badge/license-MIT%20or%20Apache-blue.svg)](#License)
+[![Documentation](https://docs.rs/yaar-lock/badge.svg)](https://docs.rs/yaar-lock/)
 ====
 
 Fast, no_std synchronization primitives.
