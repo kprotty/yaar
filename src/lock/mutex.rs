@@ -1,10 +1,10 @@
 use super::Event;
 use core::{
-    ptr::null,
     cell::Cell,
-    mem::align_of,
     marker::PhantomData,
-    sync::atomic::{fence, spin_loop_hint, Ordering, AtomicUsize},
+    mem::align_of,
+    ptr::null,
+    sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
 };
 
 const MUTEX_LOCK: usize = 1 << 0;
@@ -70,7 +70,7 @@ impl<E: Event> WordLock<E> {
     #[cold]
     fn lock_slow(&self) {
         const SPIN_COUNT_DOUBLING: usize = 4;
-        
+
         // try to lock the mutex before allocating the node on the stack
         // as that may be potentially expensive due to the Event implementation.
         let mut spin = 0;
@@ -94,7 +94,7 @@ impl<E: Event> WordLock<E> {
                 break;
             }
         }
-        
+
         assert!(align_of::<QueueNode<E>>() > !QUEUE_MASK);
         let mut node = QueueNode {
             prev: Cell::new(null()),
@@ -123,7 +123,7 @@ impl<E: Event> WordLock<E> {
                 state = self.state.load(Ordering::Relaxed);
                 continue;
             }
-            
+
             let head = (state & QUEUE_MASK) as *const QueueNode<E>;
             if head.is_null() {
                 node.tail.set(&node);

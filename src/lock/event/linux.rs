@@ -1,14 +1,7 @@
 use super::Event;
-use core::sync::atomic::{Ordering, AtomicI32};
+use core::sync::atomic::{AtomicI32, Ordering};
 use libc::{
-    syscall,
-    SYS_futex,
-    FUTEX_WAIT,
-    FUTEX_WAKE,
-    FUTEX_PRIVATE_FLAG,
-    __errno_location,
-    EAGAIN,
-    EINTR,
+    syscall, SYS_futex, __errno_location, EAGAIN, EINTR, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE,
 };
 
 const UNSET: i32 = 0;
@@ -28,7 +21,7 @@ impl Default for OsEvent {
 impl OsEvent {
     pub const fn new() -> Self {
         Self {
-            state: AtomicI32::new(UNSET)
+            state: AtomicI32::new(UNSET),
         }
     }
 }
@@ -57,7 +50,12 @@ unsafe impl Event for OsEvent {
             if state == SET {
                 return;
             }
-            match self.state.compare_exchange_weak(UNSET, WAIT, Ordering::Acquire, Ordering::Acquire) {
+            match self.state.compare_exchange_weak(
+                UNSET,
+                WAIT,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
                 Err(s) => state = s,
                 Ok(_) => break,
             }
@@ -65,7 +63,7 @@ unsafe impl Event for OsEvent {
 
         while self.state.load(Ordering::Acquire) != SET {
             let ptr = &self.state as *const _ as *const i32;
-            let r = unsafe { syscall(SYS_futex, ptr, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, WAIT, 0) }; 
+            let r = unsafe { syscall(SYS_futex, ptr, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, WAIT, 0) };
             debug_assert!(r == 0 || r == -1);
             if r == -1 {
                 let errno = unsafe { *__errno_location() };

@@ -2,22 +2,25 @@
 
 use super::Event;
 use core::{
-    ptr::null_mut,
     mem::{size_of, transmute, MaybeUninit},
-    sync::atomic::{Ordering, AtomicU32, AtomicUsize},
+    ptr::null_mut,
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 use winapi::{
     shared::{
         basetsd::SIZE_T,
-        ntdef::{NTSTATUS, FALSE},
+        minwindef::{BOOL, DWORD, TRUE, ULONG},
+        ntdef::{FALSE, NTSTATUS},
         ntstatus::STATUS_SUCCESS,
-        minwindef::{BOOL, TRUE, DWORD, ULONG},
     },
     um::{
-        winbase::INFINITE,
         handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
         libloaderapi::{GetModuleHandleA, GetProcAddress},
-        winnt::{PVOID, PHANDLE, HANDLE, PLARGE_INTEGER, ACCESS_MASK, BOOLEAN, GENERIC_READ, GENERIC_WRITE, LPCSTR},
+        winbase::INFINITE,
+        winnt::{
+            ACCESS_MASK, BOOLEAN, GENERIC_READ, GENERIC_WRITE, HANDLE, LPCSTR, PHANDLE,
+            PLARGE_INTEGER, PVOID,
+        },
     },
 };
 
@@ -38,7 +41,7 @@ impl Default for OsEvent {
 impl OsEvent {
     pub const fn new() -> Self {
         Self {
-            state: AtomicU32::new(UNSET)
+            state: AtomicU32::new(UNSET),
         }
     }
 }
@@ -61,7 +64,8 @@ unsafe impl Event for OsEvent {
                             Key: PVOID,
                             Alertable: BOOLEAN,
                             Timeout: PLARGE_INTEGER,
-                        ) -> NTSTATUS = transmute(_NtReleaseKeyedEvent.load(Ordering::Relaxed));
+                        )
+                            -> NTSTATUS = transmute(_NtReleaseKeyedEvent.load(Ordering::Relaxed));
                         let r = NtReleaseKeyedEvent(
                             handle,
                             &self.state as *const _ as PVOID,
@@ -69,13 +73,12 @@ unsafe impl Event for OsEvent {
                             null_mut(),
                         );
                         debug_assert_eq!(r, STATUS_SUCCESS);
-                    },
+                    }
                     Backend::WaitOnAddress => {
-                        let WakeByAddressSingle: extern "stdcall" fn(
-                            Address: PVOID,
-                        ) = transmute(_WakeByAddressSingle.load(Ordering::Relaxed));
+                        let WakeByAddressSingle: extern "stdcall" fn(Address: PVOID) =
+                            transmute(_WakeByAddressSingle.load(Ordering::Relaxed));
                         WakeByAddressSingle(&self.state as *const _ as PVOID);
-                    },
+                    }
                 }
             }
         }
@@ -87,7 +90,12 @@ unsafe impl Event for OsEvent {
             if state == SET {
                 return;
             }
-            match self.state.compare_exchange_weak(UNSET, WAIT, Ordering::Acquire, Ordering::Acquire) {
+            match self.state.compare_exchange_weak(
+                UNSET,
+                WAIT,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
                 Err(s) => state = s,
                 Ok(_) => break,
             }
@@ -109,7 +117,7 @@ unsafe impl Event for OsEvent {
                         null_mut(),
                     );
                     debug_assert_eq!(r, STATUS_SUCCESS);
-                },
+                }
                 Backend::WaitOnAddress => {
                     let WaitOnAddress: extern "stdcall" fn(
                         Address: PVOID,
@@ -126,7 +134,7 @@ unsafe impl Event for OsEvent {
                         );
                         debug_assert_eq!(r, TRUE);
                     }
-                },
+                }
             }
         }
     }
@@ -148,9 +156,11 @@ unsafe fn get_backend() -> Backend {
             } else if load_keyed_events() {
                 Backend::KeyedEvent(BACKEND_HANDLE.load(Ordering::Relaxed) as HANDLE)
             } else {
-                unreachable!("OsEvent requires either WaitOnAddress (Win8+) or NT Keyed Events (WinXP+)")
+                unreachable!(
+                    "OsEvent requires either WaitOnAddress (Win8+) or NT Keyed Events (WinXP+)"
+                )
             }
-        },
+        }
         WAIT_ON_ADDRESS => Backend::WaitOnAddress,
         handle => Backend::KeyedEvent(handle as HANDLE),
     }
@@ -230,7 +240,8 @@ unsafe fn load_keyed_events() -> bool {
     }
 
     let handle = handle.assume_init();
-    match BACKEND_HANDLE.compare_exchange(0, handle as usize, Ordering::Release, Ordering::Relaxed) {
+    match BACKEND_HANDLE.compare_exchange(0, handle as usize, Ordering::Release, Ordering::Relaxed)
+    {
         Ok(_) => true,
         Err(_) => {
             let r = CloseHandle(handle);

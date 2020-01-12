@@ -8,4 +8,4 @@ edition = "2018"
 path = "../../"
 version = "*"
 default-features = false
-features = ["rt-serial", "rt-alloc"]
+features = ["rt-serial", "io"]

@@ -1,13 +1,5 @@
-use super::{
-    Executor,
-    super::task,
-    with_executor_as,
-};
-use core::{
-    marker::Sync,
-    future::Future,
-    cell::UnsafeCell,
-};
+use super::{super::task, with_executor_as, Executor};
+use core::{cell::UnsafeCell, future::Future, marker::Sync};
 
 pub fn run<T>(future: impl Future<Output = T>) -> T {
     let executor = SerialExecutor(UnsafeCell::new(Runtime {
@@ -53,4 +45,3 @@ impl Executor for SerialExecutor {
         runtime.run_queue.push(&list);
     }
 }
-

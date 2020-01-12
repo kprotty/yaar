@@ -1,4 +1,3 @@
-
 #[cfg(all(feature = "os", windows))]
 mod windows;
 #[cfg(all(feature = "os", windows))]

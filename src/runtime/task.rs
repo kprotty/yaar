@@ -1,12 +1,12 @@
-use super::executor::{with_executor};
+use super::executor::with_executor;
 use core::{
-    pin::Pin,
-    marker::Unpin,
     future::Future,
-    ptr::{null, NonNull},
     hint::unreachable_unchecked,
+    marker::Unpin,
     mem::{align_of, MaybeUninit},
-    task::{Poll, Context, Waker, RawWaker, RawWakerVTable},
+    pin::Pin,
+    ptr::{null, NonNull},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
 pub enum Priority {
@@ -36,10 +36,11 @@ impl Task {
     }
 
     pub fn set_next(&mut self, next: Option<NonNull<Self>>) {
-        self.next = (self.next & Priority::MASK) | match next {
-            Some(ptr) => ptr.as_ptr() as usize,
-            None => null::<Self>() as usize,
-        };
+        self.next = (self.next & Priority::MASK)
+            | match next {
+                Some(ptr) => ptr.as_ptr() as usize,
+                None => null::<Self>() as usize,
+            };
     }
 
     pub fn set_priority(&mut self, priority: Priority) {
@@ -51,7 +52,7 @@ impl Task {
             0 => Priority::Low,
             1 => Priority::Normal,
             2 => Priority::High,
-            _ => unsafe { unreachable_unchecked() }
+            _ => unsafe { unreachable_unchecked() },
         }
     }
 
@@ -115,12 +116,10 @@ pub struct PriorityList {
 
 impl PriorityList {
     pub fn pop<'a>(&mut self) -> Option<&'a mut Task> {
-        self.front.pop()
-            .or_else(|| self.back.pop())
-            .map(|task| {
-                self.size -= 1;
-                task
-            })
+        self.front.pop().or_else(|| self.back.pop()).map(|task| {
+            self.size -= 1;
+            task
+        })
     }
 
     pub fn push(&mut self, task: &mut Task) {
@@ -159,7 +158,7 @@ impl<F: Future> Future for FutureTask<F> {
                 Poll::Ready(output) => {
                     this.output = Some(output);
                     continue;
-                },
+                }
             }
         }
     }
@@ -190,18 +189,11 @@ impl<F: Future> FutureTask<F> {
     }
 
     pub fn resume(&mut self) -> Poll<&F::Output> {
-        const WAKE: unsafe fn(*const ()) = |ptr| {
-            with_executor(|executor| unsafe {
-                executor.schedule(&mut *(ptr as *mut Task))
-            })
-        };
+        const WAKE: unsafe fn(*const ()) =
+            |ptr| with_executor(|executor| unsafe { executor.schedule(&mut *(ptr as *mut Task)) });
 
-        const VTABLE: RawWakerVTable = RawWakerVTable::new(
-            |ptr| RawWaker::new(ptr, &VTABLE),
-            WAKE,
-            WAKE,
-            |_| {},
-        );
+        const VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|ptr| RawWaker::new(ptr, &VTABLE), WAKE, WAKE, |_| {});
 
         let ptr = &self.task as *const Task as *const ();
         let waker = unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) };
@@ -233,7 +225,5 @@ pub fn yield_now(priority: Priority) -> impl Future {
         }
     }
 
-    FutureTask::new(priority, YieldTask {
-        did_yield: false,
-    })
+    FutureTask::new(priority, YieldTask { did_yield: false })
 }
