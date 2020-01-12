@@ -33,14 +33,13 @@ pub trait Reactor: Sync {
 #[derive(Debug, PartialEq)]
 pub struct ReactorRef {
     ptr: *const (),
-    _poll: unsafe fn(*const (), timeout: Option<Duration>) -> usize,
+    _poll: unsafe fn(*const (), timeout: Option<Duration>) -> Result<NonZeroUsize, PollError>,
 }
 
 impl ReactorRef {
-
     /// Proxy for [`Reactor::poll`].
     #[inline]
-    pub fn poll(&self, timeout: Option<Duration>) -> usize {
+    pub fn poll(&self, timeout: Option<Duration>) -> Result<NonZeroUsize, PollError> {
         unsafe { (self._poll)(self.ptr, timeout) }
     }
 }

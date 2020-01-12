@@ -5,21 +5,18 @@ authors = ["kprotty"]
 edition = "2018"
 license = "Apache-2.0/MIT"
 readme = "README.md"
-repository = "https://github.com/kprotty/yaar"
-categories = ["asynchronous", "concurrency", "network-programming", "no-std"]
-keywords = ["io", "async", "await", "non-blocking", "futures", "no-std", "thread", "mutex"]
+repository = "https://github.com/kprotty/yaar/yaar"
+categories = ["asynchronous", "concurrency", "no-std"]
+keywords = ["async", "await", "non-blocking", "futures", "no-std"]
 description = """
 Yet another asynchronous runtime 
 optimized around configuration and no_std.
 """
 
 [features]
-default = []
-alloc = []
-lock = ["lock_api"]
-os = ["libc", "winapi"]
-rt = []
-rt-serial = ["rt"]
+default = ["serial", "parallel"]
+serial = []
+parallel = ["lock_api"]
 
 [dependencies.lock_api]
 optional = true

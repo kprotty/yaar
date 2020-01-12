@@ -1,16 +1,16 @@
-yaar-reactor
+yaar
 [![Licence](https://img.shields.io/badge/license-MIT%20or%20Apache-blue.svg)](#License)
-[![Documentation](https://docs.rs/yaar-reactor/badge.svg)](https://docs.rs/yaar-reactor/)
+[![Documentation](https://docs.rs/yaar-runtime/badge.svg)](https://docs.rs/yaar/)
 ====
 
-Non-blocking IO abstractions for building executors. 
-This crate is currently under development.
+**Y**et **A**nother **A**synchronous **R**untime (yaar - pronounced "yaare/yah-are")
+optimized around configuration and no_std. This crate is currently under development.
 
 ## Usage
 Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
-yaar-reactor = "0.1"
+yaar = "0.1"
 ```
 
 ## License

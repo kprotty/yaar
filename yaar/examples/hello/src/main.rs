@@ -1,4 +1,4 @@
-use yaar::runtime::{serial, task};
+use yaar::{serial, task};
 
 fn main() {
     let result = serial::run(async move {

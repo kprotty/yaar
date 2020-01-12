@@ -1,6 +1,6 @@
 [workspace]
 members = [
+    "yaar",
     "yaar-lock",
     "yaar-reactor",
-    "yaar-runtime",
 ]
