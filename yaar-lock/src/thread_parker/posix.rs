@@ -1,7 +1,7 @@
 use super::ThreadParker;
 use core::{
-    task::Poll,
     cell::{Cell, UnsafeCell},
+    task::Poll,
 };
 use libc::{
     pthread_cond_destroy, pthread_cond_signal, pthread_cond_t, pthread_cond_wait,
@@ -60,7 +60,7 @@ unsafe impl Sync for Parker {}
 unsafe impl ThreadParker for Parker {
     type Context = ();
 
-    fn from(context: Self::Context) -> Self {
+    fn from(_context: Self::Context) -> Self {
         Self::new()
     }
 

@@ -1,7 +1,7 @@
 use super::ThreadParker;
 use core::{
-    task::Poll,
     sync::atomic::{AtomicI32, Ordering},
+    task::Poll,
 };
 use libc::{
     syscall, SYS_futex, __errno_location, EAGAIN, EINTR, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE,
@@ -36,10 +36,10 @@ unsafe impl Sync for Parker {}
 unsafe impl ThreadParker for Parker {
     type Context = ();
 
-    fn from(context: Self::Context) -> Self {
+    fn from(_context: Self::Context) -> Self {
         Self::new()
     }
-    
+
     fn reset(&self) {
         self.state.store(UNSET, Ordering::Relaxed);
     }

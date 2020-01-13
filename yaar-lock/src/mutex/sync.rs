@@ -1,4 +1,4 @@
-use crate::ThreadParker;
+use super::{ThreadParker, WordLock};
 use core::task::Poll;
 
 #[cfg(feature = "os")]
@@ -29,10 +29,8 @@ unsafe impl<Parker: ThreadParker<Context = ()>> lock_api::RawMutex for SyncMutex
     }
 
     fn lock(&self) {
-        if !self.try_lock() {
-            let result = self.0.lock_slow(());
-            debug_assert_eq!(result, Poll::Ready(()));
-        }
+        let result = self.0.lock(());
+        debug_assert_eq!(result, Poll::Ready(()));
     }
 
     fn unlock(&self) {

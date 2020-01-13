@@ -1,7 +1,11 @@
 use super::ThreadParker;
 use core::{
+    cell::Cell,
     marker::PhantomData,
-    sync::atomic::{fence, spin_loop_hint, Ordering, AtomicUsize},
+    mem::align_of,
+    ptr::null,
+    sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
+    task::Poll,
 };
 
 #[cfg(feature = "sync")]
@@ -13,11 +17,11 @@ const MUTEX_LOCK: usize = 1 << 0;
 const QUEUE_LOCK: usize = 1 << 1;
 const QUEUE_MASK: usize = !(MUTEX_LOCK | QUEUE_LOCK);
 
-struct WaitQueueNode<P> {
+struct WaitQueueNode<Parker> {
     prev: Cell<*const Self>,
     next: Cell<*const Self>,
     tail: Cell<*const Self>,
-    thread_parker: P,
+    thread_parker: Parker,
 }
 
 /// WordLock from https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
@@ -44,9 +48,10 @@ impl<Parker: ThreadParker> WordLock<Parker> {
             .is_ok()
     }
 
-    pub fn lock(&self, context: Parker::Context) {
-        if !self.try_lock() {
-            self.lock_slow(context);
+    pub fn lock(&self, context: Parker::Context) -> Poll<()> {
+        match self.try_lock() {
+            true => Poll::Ready(()),
+            _ => self.lock_slow(context),
         }
     }
 
@@ -64,7 +69,7 @@ impl<Parker: ThreadParker> WordLock<Parker> {
     }
 
     #[cold]
-    fn lock_slow(&self, context: Parker::Context) {
+    fn lock_slow(&self, context: Parker::Context) -> Poll<()> {
         // Configurable spin count which incrementally increases
         // spinning on `spin_loop_hint()` up to 2^(N - 1)
         const SPIN_COUNT_DOUBLING: usize = 4;
@@ -81,7 +86,7 @@ impl<Parker: ThreadParker> WordLock<Parker> {
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => return,
+                    Ok(_) => return Poll::Ready(()),
                     Err(s) => state = s,
                 }
             } else if (state & QUEUE_MASK == 0) && spin < SPIN_COUNT_DOUBLING {
@@ -95,12 +100,12 @@ impl<Parker: ThreadParker> WordLock<Parker> {
 
         // Either spun too much or the queue is contended and has sleeping nodes
         // so we should prepare to block as well by creating our own node.
-        assert!(align_of::<WaitQueueNode<P>>() > !QUEUE_MASK);
-        let mut node = WaitQueueNode {
+        assert!(align_of::<WaitQueueNode<Parker>>() > !QUEUE_MASK);
+        let node = WaitQueueNode {
             prev: Cell::new(null()),
             next: Cell::new(null()),
             tail: Cell::new(null()),
-            event: Parker::from(context),
+            thread_parker: Parker::from(context),
         };
 
         loop {
@@ -112,7 +117,7 @@ impl<Parker: ThreadParker> WordLock<Parker> {
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => return,
+                    Ok(_) => return Poll::Ready(()),
                     Err(s) => state = s,
                 }
                 continue;
@@ -131,7 +136,7 @@ impl<Parker: ThreadParker> WordLock<Parker> {
             // prepare our node to be put on the queue.
             // If the queue head is null, set the queue tail to ourselves.
             // If its not, then our tail will be computed by a thread in `unlock_slow()`.
-            let head = (state & QUEUE_MASK) as *const WaitQueueNode<P>;
+            let head = (state & QUEUE_MASK) as *const WaitQueueNode<Parker>;
             node.next.set(head);
             if head.is_null() {
                 node.tail.set(&node);
@@ -153,13 +158,15 @@ impl<Parker: ThreadParker> WordLock<Parker> {
 
             // We are now in the queue.
             // Wait to be notified by an unlocking thread.
-            node.thread_parker.park();
+            if node.thread_parker.park() == Poll::Pending {
+                return Poll::Pending;
+            }
 
             // Reset everything to prepare spinning on the lock again.
-            node.thread_parker.reset();
-            node.prev.set(null());
             spin = 0;
+            node.prev.set(null());
             state = self.state.load(Ordering::Relaxed);
+            node.thread_parker.reset();
         }
     }
 
@@ -201,7 +208,7 @@ impl<Parker: ThreadParker> WordLock<Parker> {
             // When a new node comes in as the head, the list only needs to be traversed
             // once since the old head points to the tail and can be found there instead
             // of traversing the entire list again.
-            let head = &*((state & QUEUE_MASK) as *const WaitQueueNode<P>);
+            let head = &*((state & QUEUE_MASK) as *const WaitQueueNode<Parker>);
             let mut current = head;
             while current.tail.get().is_null() {
                 let next = &*current.next.get();

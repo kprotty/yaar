@@ -2,10 +2,10 @@
 
 use super::ThreadParker;
 use core::{
-    task::Poll,
     mem::{size_of, transmute, MaybeUninit},
     ptr::null_mut,
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    task::Poll,
 };
 use winapi::{
     shared::{
@@ -58,7 +58,7 @@ unsafe impl Sync for Parker {}
 impl ThreadParker for Parker {
     type Context = ();
 
-    fn from(context: Self::Context) -> Self {
+    fn from(_context: Self::Context) -> Self {
         Self::new()
     }
 
@@ -103,7 +103,7 @@ impl ThreadParker for Parker {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
             if state == SET {
-                return;
+                return Poll::Ready(());
             }
             match self.state.compare_exchange_weak(
                 UNSET,
