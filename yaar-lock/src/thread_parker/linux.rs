@@ -1,5 +1,8 @@
-use super::Event;
-use core::sync::atomic::{AtomicI32, Ordering};
+use super::ThreadParker;
+use core::{
+    task::Poll,
+    sync::atomic::{AtomicI32, Ordering},
+};
 use libc::{
     syscall, SYS_futex, __errno_location, EAGAIN, EINTR, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE,
 };
@@ -8,19 +11,19 @@ const UNSET: i32 = 0;
 const WAIT: i32 = 1;
 const SET: i32 = 2;
 
-/// The default [`Event`] implementation for linux.
-/// Utilizes `futex()` for blocking and notification.
-pub struct OsEvent {
+/// The default [`ThreadParker`] implementation for linux.
+/// Utilizes `futex()` for parking and unparking.
+pub struct Parker {
     state: AtomicI32,
 }
 
-impl Default for OsEvent {
+impl Default for Parker {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl OsEvent {
+impl Parker {
     pub const fn new() -> Self {
         Self {
             state: AtomicI32::new(UNSET),
@@ -28,15 +31,20 @@ impl OsEvent {
     }
 }
 
-unsafe impl Send for OsEvent {}
-unsafe impl Sync for OsEvent {}
+unsafe impl Sync for Parker {}
 
-unsafe impl Event for OsEvent {
-    fn reset(&mut self) {
-        *self.state.get_mut() = UNSET;
+unsafe impl ThreadParker for Parker {
+    type Context = ();
+
+    fn from(context: Self::Context) -> Self {
+        Self::new()
+    }
+    
+    fn reset(&self) {
+        self.state.store(UNSET, Ordering::Relaxed);
     }
 
-    fn set(&self) {
+    fn unpark(&self) {
         // Check if theres a thread waiting to avoid an unnecessary FUTEX_WAKE if possible.
         if self.state.swap(SET, Ordering::Release) == WAIT {
             let ptr = &self.state as *const _ as *const i32;
@@ -45,12 +53,12 @@ unsafe impl Event for OsEvent {
         }
     }
 
-    fn wait(&self) {
+    fn park(&self) -> Poll<()> {
         // try to set the state to WAIT for the setter, exit if already set.
         let mut state = self.state.load(Ordering::Acquire);
         loop {
             if state == SET {
-                return;
+                return Poll::Ready(());
             }
             match self.state.compare_exchange_weak(
                 UNSET,
@@ -73,5 +81,7 @@ unsafe impl Event for OsEvent {
                 debug_assert!(errno == EAGAIN || errno == EINTR);
             }
         }
+
+        Poll::Ready(())
     }
 }

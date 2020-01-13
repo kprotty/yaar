@@ -1,7 +1,8 @@
 #![allow(non_upper_case_globals, non_snake_case)]
 
-use super::Event;
+use super::ThreadParker;
 use core::{
+    task::Poll,
     mem::{size_of, transmute, MaybeUninit},
     ptr::null_mut,
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
@@ -28,23 +29,23 @@ const UNSET: u32 = 0;
 const WAIT: u32 = 1;
 const SET: u32 = 2;
 
-/// The default [`Event`] implementation for windows.
+/// The default [`ThreadParker`] implementation for windows.
 /// Relies on [`WaitOnAddress`], falling back to [`NT Keyed Events`],
-/// for blocking and notification.
+/// for parking and unparking.
 ///
 /// [`WaitOnAddress`]: https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitonaddress
 /// [`NT Keyed Events`]: https://locklessinc.com/articles/keyed_events/
-pub struct OsEvent {
+pub struct Parker {
     state: AtomicU32,
 }
 
-impl Default for OsEvent {
+impl Default for Parker {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl OsEvent {
+impl Parker {
     pub const fn new() -> Self {
         Self {
             state: AtomicU32::new(UNSET),
@@ -52,15 +53,20 @@ impl OsEvent {
     }
 }
 
-unsafe impl Send for OsEvent {}
-unsafe impl Sync for OsEvent {}
+unsafe impl Sync for Parker {}
 
-unsafe impl Event for OsEvent {
-    fn reset(&mut self) {
-        *self.state.get_mut() = UNSET;
+impl ThreadParker for Parker {
+    type Context = ();
+
+    fn from(context: Self::Context) -> Self {
+        Self::new()
     }
 
-    fn set(&self) {
+    fn reset(&self) {
+        self.state.store(UNSET, Ordering::Relaxed);
+    }
+
+    fn unpark(&self) {
         // Only do the wake up if theres a thread waiting.
         // Prevents a deadlock on NtReleaseKeyedEvent and an extra syscall for WakeByAddressSingle.
         if self.state.swap(SET, Ordering::Release) == WAIT {
@@ -92,7 +98,7 @@ unsafe impl Event for OsEvent {
         }
     }
 
-    fn wait(&self) {
+    fn park(&self) -> Poll<()> {
         // Try to transition in the waiting state.
         let mut state = self.state.load(Ordering::Acquire);
         loop {
@@ -146,6 +152,8 @@ unsafe impl Event for OsEvent {
                 }
             }
         }
+
+        Poll::Ready(())
     }
 }
 

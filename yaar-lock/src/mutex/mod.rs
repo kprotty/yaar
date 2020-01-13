@@ -1,66 +1,56 @@
-use super::Event;
+use super::ThreadParker;
 use core::{
-    cell::Cell,
     marker::PhantomData,
-    mem::align_of,
-    ptr::null,
-    sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
+    sync::atomic::{fence, spin_loop_hint, Ordering, AtomicUsize},
 };
+
+#[cfg(feature = "sync")]
+mod sync;
+#[cfg(feature = "sync")]
+pub use self::sync::*;
 
 const MUTEX_LOCK: usize = 1 << 0;
 const QUEUE_LOCK: usize = 1 << 1;
 const QUEUE_MASK: usize = !(MUTEX_LOCK | QUEUE_LOCK);
 
-struct QueueNode<E> {
+struct WaitQueueNode<P> {
     prev: Cell<*const Self>,
     next: Cell<*const Self>,
     tail: Cell<*const Self>,
-    event: E,
+    thread_parker: P,
 }
 
 /// WordLock from https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
 #[doc(hidden)]
-pub struct WordLock<E> {
+pub(crate) struct WordLock<Parker> {
     state: AtomicUsize,
-    phantom: PhantomData<E>,
+    phantom: PhantomData<Parker>,
 }
 
-/// Implementation of a Mutex which requires an Event implementation for blocking.
-///
-/// The mutex is a `usize` large and is based off of [`WordLock`] from parking_lot
-/// which employs adaptive spinning and fast acquire for uncontended cases. Because
-/// it is a raw mutex, it depends on an [`Event`] implementation to handle parking
-/// / blocking the current thread when contended. See [`lock_api::Mutex`] for more info.
-///
-/// [`WordLock`]: https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
-/// [`Event`]: trait.Event.html
-/// [`lock_api::Mutex`]: ../lock_api/struct.Mutex.html
-pub type RawMutex<T, E> = lock_api::Mutex<WordLock<E>, T>;
+impl<Parker> WordLock<Parker> {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            phantom: PhantomData,
+        }
+    }
+}
 
-/// An RAII implemented of a "scoped lock" for [`RawMutex`].
-/// See [`lock_api::MutexGuard`] for more info.
-///
-/// [`lock_api::MutexGuard`]: ../lock_api/struct.MutexGuard.html
-pub type RawMutexGuard<'a, T, E> = lock_api::MutexGuard<'a, WordLock<E>, T>;
-
-unsafe impl<E: Event> lock_api::RawMutex for WordLock<E> {
-    const INIT: Self = Self::new();
-
-    type GuardMarker = lock_api::GuardSend;
-
-    fn try_lock(&self) -> bool {
+impl<Parker: ThreadParker> WordLock<Parker> {
+    pub fn try_lock(&self) -> bool {
+        // fast-path cas
         self.state
             .compare_exchange_weak(0, MUTEX_LOCK, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
     }
 
-    fn lock(&self) {
+    pub fn lock(&self, context: Parker::Context) {
         if !self.try_lock() {
-            self.lock_slow();
+            self.lock_slow(context);
         }
     }
 
-    fn unlock(&self) {
+    pub fn unlock(&self) {
         // Unlock the mutex immediately without looking at the queue.
         // fetch_sub(MUTEX) can be implemented more efficiently on
         // common platforms compared to fetch_and(!MUTEX_LOCK).
@@ -72,20 +62,9 @@ unsafe impl<E: Event> lock_api::RawMutex for WordLock<E> {
             unsafe { self.unlock_slow() };
         }
     }
-}
 
-impl<E> WordLock<E> {
-    pub const fn new() -> Self {
-        Self {
-            state: AtomicUsize::new(0),
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<E: Event> WordLock<E> {
     #[cold]
-    fn lock_slow(&self) {
+    fn lock_slow(&self, context: Parker::Context) {
         // Configurable spin count which incrementally increases
         // spinning on `spin_loop_hint()` up to 2^(N - 1)
         const SPIN_COUNT_DOUBLING: usize = 4;
@@ -116,12 +95,12 @@ impl<E: Event> WordLock<E> {
 
         // Either spun too much or the queue is contended and has sleeping nodes
         // so we should prepare to block as well by creating our own node.
-        assert!(align_of::<QueueNode<E>>() > !QUEUE_MASK);
-        let mut node = QueueNode {
+        assert!(align_of::<WaitQueueNode<P>>() > !QUEUE_MASK);
+        let mut node = WaitQueueNode {
             prev: Cell::new(null()),
             next: Cell::new(null()),
             tail: Cell::new(null()),
-            event: E::default(),
+            event: Parker::from(context),
         };
 
         loop {
@@ -152,7 +131,7 @@ impl<E: Event> WordLock<E> {
             // prepare our node to be put on the queue.
             // If the queue head is null, set the queue tail to ourselves.
             // If its not, then our tail will be computed by a thread in `unlock_slow()`.
-            let head = (state & QUEUE_MASK) as *const QueueNode<E>;
+            let head = (state & QUEUE_MASK) as *const WaitQueueNode<P>;
             node.next.set(head);
             if head.is_null() {
                 node.tail.set(&node);
@@ -174,10 +153,10 @@ impl<E: Event> WordLock<E> {
 
             // We are now in the queue.
             // Wait to be notified by an unlocking thread.
-            node.event.wait();
+            node.thread_parker.park();
 
             // Reset everything to prepare spinning on the lock again.
-            node.event.reset();
+            node.thread_parker.reset();
             node.prev.set(null());
             spin = 0;
             state = self.state.load(Ordering::Relaxed);
@@ -222,7 +201,7 @@ impl<E: Event> WordLock<E> {
             // When a new node comes in as the head, the list only needs to be traversed
             // once since the old head points to the tail and can be found there instead
             // of traversing the entire list again.
-            let head = &*((state & QUEUE_MASK) as *const QueueNode<E>);
+            let head = &*((state & QUEUE_MASK) as *const WaitQueueNode<P>);
             let mut current = head;
             while current.tail.get().is_null() {
                 let next = &*current.next.get();
@@ -286,7 +265,7 @@ impl<E: Event> WordLock<E> {
             }
 
             // Popped the tail from the queue. wake up its event.
-            tail.event.set();
+            tail.thread_parker.unpark();
             return;
         }
     }

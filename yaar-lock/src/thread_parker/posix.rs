@@ -1,26 +1,29 @@
-use super::Event;
-use core::cell::{Cell, UnsafeCell};
+use super::ThreadParker;
+use core::{
+    task::Poll,
+    cell::{Cell, UnsafeCell},
+};
 use libc::{
     pthread_cond_destroy, pthread_cond_signal, pthread_cond_t, pthread_cond_wait,
     pthread_mutex_destroy, pthread_mutex_lock, pthread_mutex_t, pthread_mutex_unlock,
     PTHREAD_COND_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
 };
 
-/// The default [`Event`] implementation for posix platforms that aren't linux.
-/// Utilizes `pthread_cond_t` for blocking and notification.
-pub struct OsEvent {
+/// The default [`ThreadParker`] implementation for posix platforms that aren't linux.
+/// Utilizes `pthread_cond_t/pthread_mutex_t` for parking and unparking.
+pub struct Parker {
     is_set: Cell<bool>,
     cond: UnsafeCell<pthread_cond_t>,
     mutex: UnsafeCell<pthread_mutex_t>,
 }
 
-impl Default for OsEvent {
+impl Default for Parker {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl OsEvent {
+impl Parker {
     pub const fn new() -> Self {
         Self {
             is_set: Cell::new(false),
@@ -30,7 +33,7 @@ impl OsEvent {
     }
 }
 
-impl Drop for OsEvent {
+impl Drop for Parker {
     fn drop(&mut self) {
         // Seems as though the destroy functions can return EAGAIN
         // when called using statically initialized types on DragonflyBSD.
@@ -52,15 +55,26 @@ impl Drop for OsEvent {
     }
 }
 
-unsafe impl Send for OsEvent {}
-unsafe impl Sync for OsEvent {}
+unsafe impl Sync for Parker {}
 
-unsafe impl Event for OsEvent {
-    fn reset(&mut self) {
-        self.is_set.set(false);
+unsafe impl ThreadParker for Parker {
+    type Context = ();
+
+    fn from(context: Self::Context) -> Self {
+        Self::new()
     }
 
-    fn set(&self) {
+    fn reset(&self) {
+        let r = pthread_mutex_lock(self.mutex.get());
+        debug_assert_eq!(r, 0);
+
+        self.is_set.set(false);
+
+        let r = pthread_mutex_unlock(self.mutex.get());
+        debug_assert_eq!(r, 0);
+    }
+
+    fn unpark(&self) {
         unsafe {
             let r = pthread_mutex_lock(self.mutex.get());
             debug_assert_eq!(r, 0);
@@ -76,7 +90,7 @@ unsafe impl Event for OsEvent {
         }
     }
 
-    fn wait(&self) {
+    fn park(&self) -> Poll<()> {
         unsafe {
             let r = pthread_mutex_lock(self.mutex.get());
             debug_assert_eq!(r, 0);
@@ -88,6 +102,7 @@ unsafe impl Event for OsEvent {
 
             let r = pthread_mutex_unlock(self.mutex.get());
             debug_assert_eq!(r, 0);
+            Poll::Ready(())
         }
     }
 }
