@@ -1,11 +1,11 @@
 [package]
 name = "yaar"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["kprotty"]
 edition = "2018"
 license = "Apache-2.0/MIT"
 readme = "README.md"
-repository = "https://github.com/kprotty/yaar/yaar"
+repository = "https://github.com/kprotty/yaar/tree/master/yaar"
 categories = ["asynchronous", "concurrency", "no-std"]
 keywords = ["async", "await", "non-blocking", "futures", "no-std"]
 description = """

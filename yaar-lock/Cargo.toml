@@ -1,11 +1,11 @@
 [package]
 name = "yaar-lock"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["kprotty"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/kprotty/yaar/yaar-lock"
+repository = "https://github.com/kprotty/yaar/tree/master/yaar-lock"
 categories = ["concurrency", "no-std"]
 keywords = ["no-std", "thread", "mutex"]
 description = """
