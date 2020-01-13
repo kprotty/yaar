@@ -1,6 +1,6 @@
 [package]
 name = "yaar"
-version = "0.1.1"
+version = "0.1.1-alpha.1"
 authors = ["kprotty"]
 edition = "2018"
 license = "Apache-2.0/MIT"

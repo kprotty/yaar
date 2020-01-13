@@ -57,7 +57,7 @@ impl Drop for Parker {
 
 unsafe impl Sync for Parker {}
 
-unsafe impl ThreadParker for Parker {
+impl ThreadParker for Parker {
     type Context = ();
 
     fn from(_context: Self::Context) -> Self {
