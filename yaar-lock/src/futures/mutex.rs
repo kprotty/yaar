@@ -1,15 +1,18 @@
 use core::{
-    mem,
-    fmt,
-    pin::Pin,
-    future::Future,
-    ptr::{null, NonNull},
     cell::{Cell, UnsafeCell},
-    ops::{Drop, Deref, DerefMut},
-    task::{Poll, Waker, Context},
-    sync::atomic::{fence, spin_loop_hint, Ordering, AtomicUsize},
+    fmt,
+    future::Future,
+    mem,
+    ops::{Deref, DerefMut, Drop},
+    pin::Pin,
+    ptr::{null, NonNull},
+    sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
+    task::{Context, Poll, Waker},
 };
 
+/// Future aware mutex based on [`WordLock`] from parking_lot.
+///
+/// [`WordLock`]: https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
 pub struct Mutex<T> {
     state: AtomicUsize,
     value: UnsafeCell<T>,
@@ -54,7 +57,11 @@ const MUTEX_LOCK: usize = 1 << 0;
 const QUEUE_LOCK: usize = 1 << 1;
 const QUEUE_MASK: usize = !(MUTEX_LOCK | QUEUE_LOCK);
 
+// doc comments copied
+// from: https://docs.rs/lock_api/0.3.3/lock_api/struct.Mutex.html
+// and: https://docs.rs/futures-intrusive/0.2.2/futures_intrusive/sync/struct.GenericMutex.html
 impl<T> Mutex<T> {
+    /// Creates a new mutex in an unlocked state ready for use.
     pub const fn new(value: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
@@ -62,22 +69,37 @@ impl<T> Mutex<T> {
         }
     }
 
+    /// Consumes this mutex, returning the underlying data.
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
+    }
+
+    /// Returns a mutable reference to the underlying data.
+    ///
+    /// Since this call borrows the `Mutex` mutably, no actual locking needs to
+    /// take place---the mutable borrow statically guarantees no locks exist.
     pub fn get_mut(&mut self) -> &mut T {
         unsafe { &mut *self.value.get() }
     }
 
-    pub fn is_locked(&self) -> bool {
-        self.state.load(Ordering::Acquire) & MUTEX_LOCK != 0
-    }
-
+    /// Attempts to acquire this lock.
+    ///
+    /// If the lock could not be acquired at this time, then `None` is returned.
+    /// Otherwise, an RAII guard is returned. The lock will be unlocked when the
+    /// guard is dropped.
+    ///
+    /// This function does not block.
     #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         self.state
             .compare_exchange_weak(0, MUTEX_LOCK, Ordering::Acquire, Ordering::Relaxed)
             .ok()
-            .map(|_| MutexGuard{ mutex: self })
+            .map(|_| MutexGuard { mutex: self })
     }
 
+    /// Acquire the mutex asynchronously.
+    ///
+    /// Returns a future that will resolve once the mutex has been successfully acquired.
     pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, T>> {
         FutureLock {
             mutex: self,
@@ -102,13 +124,18 @@ impl<'a, T> Future for FutureLock<'a, T> {
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        match this.mutex.try_lock().or_else(|| this.lock_slow(context.waker())) {
+        match this
+            .mutex
+            .try_lock()
+            .or_else(|| this.lock_slow(context.waker()))
+        {
             Some(guard) => Poll::Ready(guard),
             None => Poll::Pending,
         }
     }
 }
 
+// See [`crate::sync::RawMutex`] for details on the implementation.
 impl<'a, T> FutureLock<'a, T> {
     #[cold]
     fn lock_slow(&self, waker: &'_ Waker) -> Option<MutexGuard<'a, T>> {
@@ -117,7 +144,6 @@ impl<'a, T> FutureLock<'a, T> {
         let mut spin = 0;
         let mut state = self.mutex.state.load(Ordering::Relaxed);
         loop {
-            // Anytime the mutex is unlocked, try to acquire it.
             if state & MUTEX_LOCK == 0 {
                 match self.mutex.state.compare_exchange_weak(
                     state,
@@ -161,6 +187,11 @@ impl<'a, T> FutureLock<'a, T> {
     }
 }
 
+/// An RAII implementation of a "scoped lock" of a mutex. When this structure is
+/// dropped (falls out of scope), the lock will be unlocked.
+///
+/// The data protected by the mutex can be accessed through this guard via its
+/// `Deref` and `DerefMut` implementations.
 pub struct MutexGuard<'a, T> {
     mutex: &'a Mutex<T>,
 }
@@ -174,6 +205,7 @@ impl<'a, T> Drop for MutexGuard<'a, T> {
     }
 }
 
+// See [`crate::sync::RawMutex`] for details on the implementation.
 impl<'a, T> MutexGuard<'a, T> {
     #[cold]
     unsafe fn unlock_slow(&self) {
@@ -236,14 +268,13 @@ impl<'a, T> MutexGuard<'a, T> {
                         continue 'outer;
                     }
                 }
-
             } else {
                 head.tail.set(new_tail);
                 self.mutex.state.fetch_and(!QUEUE_LOCK, Ordering::Release);
             }
 
             let waker = mem::replace(&mut *tail.waker.as_ptr(), None);
-            let waker = &* waker.unwrap().as_ptr();
+            let waker = &*waker.unwrap().as_ptr();
             waker.wake_by_ref();
             return;
         }

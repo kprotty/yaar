@@ -1,4 +1,4 @@
-use crate::ThreadParker;
+use super::ThreadParker;
 use core::{
     cell::Cell,
     marker::PhantomData,
@@ -7,17 +7,25 @@ use core::{
     sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
 };
 
+/// RawMutex implementation which uses the default OS implementation for thread parking
 #[cfg(feature = "os")]
-pub type Mutex<T> = RawMutex<T, crate::OsThreadParker>;
+pub type Mutex<T> = RawMutex<T, super::OsThreadParker>;
 
+/// MutexGuard for [`Mutex`].
 #[cfg(feature = "os")]
-pub type MutexGuard<'a, T> = RawMutexGuard<'a, T, crate::OsThreadParker>;
+pub type MutexGuard<'a, T> = RawMutexGuard<'a, T, super::OsThreadParker>;
 
+/// Mutex abstract which utilizes [`WordLock`] from parking_lot
+/// in order to implement a fair lock which is only a `usize` large.
+/// This is platform agnostic and requires the user to provide their
+/// own method for blocking the current thread via [`ThreadParker`].
+///
+/// [`WordLock`]: https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
 pub type RawMutex<T, Parker> = lock_api::Mutex<WordLock<Parker>, T>;
 
+/// MutexGuard for [`RawMutex`].
 pub type RawMutexGuard<'a, T, Parker> = lock_api::MutexGuard<'a, WordLock<Parker>, T>;
 
-/// WordLock from https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
 #[doc(hidden)]
 pub struct WordLock<Parker> {
     state: AtomicUsize,

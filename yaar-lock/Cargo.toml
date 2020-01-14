@@ -13,10 +13,10 @@ Fast, no_std synchronization primitives.
 """
 
 [features]
-default = ["os", "sync", "async"]
+default = ["os", "sync", "futures"]
 os = ["libc", "winapi"]
 sync = ["lock_api"]
-async = []
+futures = []
 
 [dependencies.lock_api]
 optional = true
