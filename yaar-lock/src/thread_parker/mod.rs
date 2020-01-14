@@ -1,11 +1,6 @@
-use core::task::Poll;
 
-pub trait ThreadParker: Sized + Sync {
-    type Context;
-
-    fn from(context: Self::Context) -> Self;
-
-    fn park(&self) -> Poll<()>;
+pub trait ThreadParker: Default + Sync {
+    fn park(&self);
 
     fn unpark(&self);
 

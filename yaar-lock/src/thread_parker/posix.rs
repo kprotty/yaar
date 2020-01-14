@@ -1,8 +1,5 @@
 use super::ThreadParker;
-use core::{
-    cell::{Cell, UnsafeCell},
-    task::Poll,
-};
+use core::cell::{Cell, UnsafeCell};
 use libc::{
     pthread_cond_destroy, pthread_cond_signal, pthread_cond_t, pthread_cond_wait,
     pthread_mutex_destroy, pthread_mutex_lock, pthread_mutex_t, pthread_mutex_unlock,
@@ -15,12 +12,6 @@ pub struct Parker {
     is_set: Cell<bool>,
     cond: UnsafeCell<pthread_cond_t>,
     mutex: UnsafeCell<pthread_mutex_t>,
-}
-
-impl Default for Parker {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Parker {
@@ -57,13 +48,13 @@ impl Drop for Parker {
 
 unsafe impl Sync for Parker {}
 
-impl ThreadParker for Parker {
-    type Context = ();
-
-    fn from(_context: Self::Context) -> Self {
+impl Default for Parker {
+    fn default() -> Self {
         Self::new()
     }
+}
 
+impl ThreadParker for Parker {
     fn reset(&self) {
         let r = pthread_mutex_lock(self.mutex.get());
         debug_assert_eq!(r, 0);
@@ -90,7 +81,7 @@ impl ThreadParker for Parker {
         }
     }
 
-    fn park(&self) -> Poll<()> {
+    fn park(&self) {
         unsafe {
             let r = pthread_mutex_lock(self.mutex.get());
             debug_assert_eq!(r, 0);
@@ -102,7 +93,6 @@ impl ThreadParker for Parker {
 
             let r = pthread_mutex_unlock(self.mutex.get());
             debug_assert_eq!(r, 0);
-            Poll::Ready(())
         }
     }
 }

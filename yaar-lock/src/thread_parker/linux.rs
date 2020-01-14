@@ -1,8 +1,5 @@
 use super::ThreadParker;
-use core::{
-    sync::atomic::{AtomicI32, Ordering},
-    task::Poll,
-};
+use core::sync::atomic::{AtomicI32, Ordering};
 use libc::{
     syscall, SYS_futex, __errno_location, EAGAIN, EINTR, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE,
 };
@@ -17,12 +14,6 @@ pub struct Parker {
     state: AtomicI32,
 }
 
-impl Default for Parker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Parker {
     pub const fn new() -> Self {
         Self {
@@ -33,13 +24,13 @@ impl Parker {
 
 unsafe impl Sync for Parker {}
 
-impl ThreadParker for Parker {
-    type Context = ();
-
-    fn from(_context: Self::Context) -> Self {
+impl Default for Parker {
+    fn default() -> Self {
         Self::new()
     }
+}
 
+impl ThreadParker for Parker {
     fn reset(&self) {
         self.state.store(UNSET, Ordering::Relaxed);
     }
@@ -53,12 +44,12 @@ impl ThreadParker for Parker {
         }
     }
 
-    fn park(&self) -> Poll<()> {
+    fn park(&self) {
         // try to set the state to WAIT for the setter, exit if already set.
         let mut state = self.state.load(Ordering::Acquire);
         loop {
             if state == SET {
-                return Poll::Ready(());
+                return;
             }
             match self.state.compare_exchange_weak(
                 UNSET,
@@ -81,7 +72,5 @@ impl ThreadParker for Parker {
                 debug_assert!(errno == EAGAIN || errno == EINTR);
             }
         }
-
-        Poll::Ready(())
     }
 }

@@ -5,7 +5,6 @@ use core::{
     mem::{size_of, transmute, MaybeUninit},
     ptr::null_mut,
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
-    task::Poll,
 };
 use winapi::{
     shared::{
@@ -39,12 +38,6 @@ pub struct Parker {
     state: AtomicU32,
 }
 
-impl Default for Parker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Parker {
     pub const fn new() -> Self {
         Self {
@@ -55,13 +48,13 @@ impl Parker {
 
 unsafe impl Sync for Parker {}
 
-impl ThreadParker for Parker {
-    type Context = ();
-
-    fn from(_context: Self::Context) -> Self {
+impl Default for Parker {
+    fn default() -> Self {
         Self::new()
     }
+}
 
+impl ThreadParker for Parker {
     fn reset(&self) {
         self.state.store(UNSET, Ordering::Relaxed);
     }
@@ -98,12 +91,12 @@ impl ThreadParker for Parker {
         }
     }
 
-    fn park(&self) -> Poll<()> {
+    fn park(&self) {
         // Try to transition in the waiting state.
         let mut state = self.state.load(Ordering::Acquire);
         loop {
             if state == SET {
-                return Poll::Ready(());
+                return;
             }
             match self.state.compare_exchange_weak(
                 UNSET,
@@ -152,8 +145,6 @@ impl ThreadParker for Parker {
                 }
             }
         }
-
-        Poll::Ready(())
     }
 }
 
