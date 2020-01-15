@@ -163,10 +163,10 @@ pub struct FutureTask<F: Future> {
     output: Option<F::Output>,
 }
 
-// TODO: is this safe? as I understand it, the FutureTask
-//       shouldnt be moved in memory considering it uses
-//       the task pointer in order to compute its reference.
-impl<F: Future> Unpin for FutureTask<F> {}
+/// Because waking a `FutureTask` relies on getting its pointer
+/// from a task pointer internally, the `FutureTask` shouldnt be
+/// moved after being pinned as then the task pointer used would be invalid.
+impl<F: Future> !Unpin for FutureTask<F> {}
 
 impl<F: Future> Future for FutureTask<F> {
     type Output = NonNull<F::Output>;
