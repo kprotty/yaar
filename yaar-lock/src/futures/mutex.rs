@@ -2,19 +2,287 @@ use core::{
     cell::{Cell, UnsafeCell},
     fmt,
     future::Future,
-    mem,
+    mem::{self, MaybeUninit},
     ops::{Deref, DerefMut, Drop},
     pin::Pin,
-    ptr::{null, NonNull},
+    ptr::null,
     sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
 };
+
+const MUTEX_LOCK: usize = 1 << 0;
+const QUEUE_LOCK: usize = 1 << 1;
+const QUEUE_MASK: usize = !(MUTEX_LOCK | QUEUE_LOCK);
+
+struct WordLock {
+    state: AtomicUsize,
+}
+
+impl WordLock {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+        }
+    }
+
+    /// Try to lock the mutex without blocking or
+    /// enqueuing into the wait queue.
+    #[inline]
+    pub fn try_lock(&self) -> bool {
+        self.state
+            .compare_exchange_weak(0, MUTEX_LOCK, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Try to lock the mutex without blocking, returning true 
+    /// if it was successful, or false if it is locked/contended
+    /// and if the given node/waker is pushed onto the wait queue.
+    #[inline]
+    pub fn lock(&self, node: &WaitNode, waker: &Waker) -> bool {
+        (node.flags.get() & DIRECT_HANDOFF != 0) || 
+            self.try_lock() || 
+            self.lock_slow(node, waker)
+    }
+
+    /// Tries to lock the mutex without blocking. 
+    /// 
+    /// If the mutex remains locked, then we add ourselves
+    /// to the queue of waiting futures, clone the waker,
+    /// and return false.
+    #[cold]
+    fn lock_slow(&self, node: &WaitNode, waker: &Waker) -> bool {
+        const SPIN_COUNT_DOUBLING: usize = 4;
+
+        let mut spin = 0;
+        let mut state = self.state.load(Ordering::Relaxed);
+        loop {
+            // try to lock the mutex if its unlocked
+            if state & MUTEX_LOCK == 0 {
+                match self.state.compare_exchange_weak(
+                    state,
+                    state | MUTEX_LOCK,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(s) => state = s,
+                }
+                continue;
+            }
+
+            // spin a bit if there arent any waiting futures & we haven't spun too much
+            if (state & QUEUE_MASK == 0) && spin < SPIN_COUNT_DOUBLING {
+                spin += 1;
+                (0..(1 << spin)).for_each(|_| spin_loop_hint());
+                state = self.state.load(Ordering::Relaxed);
+                continue;
+            }
+
+            // prepare the node to be added to the queue.
+            node.prepare((state & QUEUE_MASK) as *const _, waker);
+
+            // Try to push ourselves to the head of the queue
+            match self.state.compare_exchange_weak(
+                state,
+                (node as *const _ as usize) | (state & !QUEUE_MASK),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return false,
+                Err(s) => state = s,
+            }
+        }
+    }
+
+    /// Unlock the queue in an unfair manner.
+    ///
+    /// This means that the current thread has the ability
+    /// to acquire the lock again immediately even if there
+    /// are WaitNodes waiting the queue.
+    #[inline]
+    pub unsafe fn unlock_unfair(&self) {
+        let state = self.state.fetch_sub(MUTEX_LOCK, Ordering::Release);
+        if (state & QUEUE_LOCK == 0) && (state & QUEUE_MASK != 0) {
+            self.unlock_unfair_slow();
+        }
+    }
+
+    #[cold]
+    unsafe fn unlock_unfair_slow(&self) {
+        // first, try to lock the queue
+        let mut state = self.state.load(Ordering::Relaxed);
+        loop {
+            if (state & QUEUE_LOCK != 0) || (state & QUEUE_MASK == 0) {
+                return;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state | QUEUE_LOCK,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(s) => state = s,
+            }
+        }
+
+        'outer: loop {
+            // then find the tail node
+            let head = &*((state & QUEUE_MASK) as *const WaitNode);
+            let tail = head.find_tail();
+
+            // if the queue is already locked, let the unlocker future
+            // handling popping of a node from the queue to wake it.
+            if state & MUTEX_LOCK != 0 {
+                match self.state.compare_exchange_weak(
+                    state,
+                    state & !QUEUE_LOCK,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return,
+                    Err(s) => state = s,
+                }
+                fence(Ordering::Acquire);
+                continue;
+            }
+
+            // pop the tail node off the queue by replacing the
+            // tail its the tail's previous link + unlocking the queue.
+            let new_tail = tail.prev.get().assume_init();
+            if new_tail.is_null() {
+                loop {
+                    match self.state.compare_exchange_weak(
+                        state,
+                        state & MUTEX_LOCK,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(s) => state = s,
+                    }
+                    if state & QUEUE_MASK != 0 {
+                        fence(Ordering::Acquire);
+                        continue 'outer;
+                    }
+                }
+            } else {
+                head.tail.set(MaybeUninit::new(new_tail));
+                self.state.fetch_and(!QUEUE_LOCK, Ordering::Release);
+            }
+
+            // Wake up the waker registered to the tail node we just popped.
+            tail.wake();
+            return;
+        }
+    }
+}
+
+const HAS_WAKER: u8 = 1 << 0;
+const DIRECT_HANDOFF: u8 = 1 << 1;
+
+struct WaitNode {
+    flags: Cell<u8>,
+    waker: Cell<MaybeUninit<Waker>>,
+    prev: Cell<MaybeUninit<*const Self>>,
+    next: Cell<MaybeUninit<*const Self>>,
+    tail: Cell<MaybeUninit<*const Self>>,
+}
+
+// Use `MaybeUninit` to lazy initialize for lock/unlock fast path.
+// This should avoid writing memory (excluding flags) and only do the stack allocation.
+impl Default for WaitNode {
+    fn default() -> Self {
+        Self {
+            flags: Cell::new(0),
+            waker: Cell::new(MaybeUninit::uninit()),
+            prev: Cell::new(MaybeUninit::uninit()),
+            next: Cell::new(MaybeUninit::uninit()),
+            tail: Cell::new(MaybeUninit::uninit()),
+        }
+    }
+}
+
+// Only drop the waker if its set
+impl Drop for WaitNode {
+    fn drop(&mut self) {
+        if self.flags.get() & HAS_WAKER != 0 {
+            unsafe {
+                let waker = mem::replace(&mut *self.waker.as_ptr(), MaybeUninit::uninit());
+                mem::drop(waker.assume_init());
+            }
+        }
+    }
+}
+
+impl WaitNode {
+    /// Prepare the wait node to be pushed to the queue
+    /// using the queue head and its waker to wake once
+    /// popped from the queue.
+    ///
+    /// Returns whether the node is already in the queue.
+    #[inline]
+    pub fn prepare(&self, head: *const Self, waker: &Waker) {
+        // lazily initialize the waker only once as clone() could be expensive.
+        let flags = self.flags.get();
+        if flags & HAS_WAKER == 0 {
+            self.flags.set(flags | HAS_WAKER);
+            self.prev.set(MaybeUninit::new(null()));
+            self.waker.set(MaybeUninit::new(waker.clone()));
+        }
+
+        // update the node link pointers based on the head node 
+        self.next.set(MaybeUninit::new(head));
+        if head.is_null() {
+            self.tail.set(MaybeUninit::new(self));
+        } else {
+            self.tail.set(MaybeUninit::new(null()));
+        }
+    }
+
+    /// Starting from the head of the queue as ourselves,
+    /// try to find the tail of the queue by following the queue
+    /// linked list until we see a node with the tail.
+    ///
+    /// Then, we cache tail on ourself so that later `find_tail()`
+    /// calls will have less of the linked list to traverse.
+    #[inline]
+    pub unsafe fn find_tail<'a>(&self) -> &'a Self {
+        let mut current = self;
+        loop {
+            let tail = current.tail.get().assume_init();
+            if tail.is_null() {
+                let next = &*current.next.get().assume_init();
+                next.prev.set(MaybeUninit::new(current));
+                current = next;
+            } else {
+                self.tail.set(MaybeUninit::new(tail));
+                return &*tail;
+            }
+        }
+    }
+
+    /// Wake up the current waker stored
+    /// in this wait node, consuming it in the process.
+    #[inline]
+    pub fn wake(&self) {
+        #[cfg(debug_assertions)] {
+            let flags = self.flags.get();
+            debug_assert!(flags & HAS_WAKER != 0);
+            self.flags.set(flags & !HAS_WAKER);
+        }
+        unsafe {
+            let waker = mem::replace(&mut *self.waker.as_ptr(), MaybeUninit::uninit());
+            waker.assume_init().wake();
+        }
+    }
+}
 
 /// Future aware mutex based on [`WordLock`] from parking_lot.
 ///
 /// [`WordLock`]: https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
 pub struct Mutex<T> {
-    state: AtomicUsize,
+    lock: WordLock,
     value: UnsafeCell<T>,
 }
 
@@ -53,10 +321,6 @@ impl<T: fmt::Debug> fmt::Debug for Mutex<T> {
     }
 }
 
-const MUTEX_LOCK: usize = 1 << 0;
-const QUEUE_LOCK: usize = 1 << 1;
-const QUEUE_MASK: usize = !(MUTEX_LOCK | QUEUE_LOCK);
-
 // doc comments copied
 // from: https://docs.rs/lock_api/0.3.3/lock_api/struct.Mutex.html
 // and: https://docs.rs/futures-intrusive/0.2.2/futures_intrusive/sync/struct.GenericMutex.html
@@ -64,7 +328,7 @@ impl<T> Mutex<T> {
     /// Creates a new mutex in an unlocked state ready for use.
     pub const fn new(value: T) -> Self {
         Self {
-            state: AtomicUsize::new(0),
+            lock: WordLock::new(),
             value: UnsafeCell::new(value),
         }
     }
@@ -82,6 +346,22 @@ impl<T> Mutex<T> {
         unsafe { &mut *self.value.get() }
     }
 
+    /// Forcibly unlocks the mutex.
+    ///
+    /// This is useful when combined with `mem::forget` to hold a lock without
+    /// the need to maintain a `MutexGuard` object alive, for example when
+    /// dealing with FFI.
+    ///
+    /// # Safety
+    ///
+    /// This method must only be called if the current thread logically owns a
+    /// `MutexGuard` but that guard has be discarded using `mem::forget`.
+    /// Behavior is undefined if a mutex is unlocked when not locked.
+    #[inline]
+    pub unsafe fn force_unlock(&self) {
+        self.lock.unlock_unfair() 
+    }
+
     /// Attempts to acquire this lock.
     ///
     /// If the lock could not be acquired at this time, then `None` is returned.
@@ -91,98 +371,39 @@ impl<T> Mutex<T> {
     /// This function does not block.
     #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        self.state
-            .compare_exchange_weak(0, MUTEX_LOCK, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| MutexGuard { mutex: self })
+        if self.lock.try_lock() {
+            Some(MutexGuard{ mutex: self })
+        } else {
+            None
+        }
     }
 
     /// Acquire the mutex asynchronously.
     ///
     /// Returns a future that will resolve once the mutex has been successfully acquired.
+    /// TODO: Ensure !Unpin for the returned future.
     pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, T>> {
+        struct FutureLock<'a, T> {
+            mutex: &'a Mutex<T>,
+            node: WaitNode,
+        }
+
+        impl<'a, T> Future for FutureLock<'a, T> {
+            type Output = MutexGuard<'a, T>;
+
+            fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+                let this = self.as_ref();
+                if this.mutex.lock.lock(&this.node, ctx.waker()) {
+                    Poll::Ready(MutexGuard { mutex: this.mutex })
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
         FutureLock {
             mutex: self,
-            waker: Cell::new(None),
-            prev: Cell::new(null()),
-            next: Cell::new(null()),
-            tail: Cell::new(null()),
-        }
-    }
-}
-
-struct FutureLock<'a, T> {
-    mutex: &'a Mutex<T>,
-    prev: Cell<*const Self>,
-    next: Cell<*const Self>,
-    tail: Cell<*const Self>,
-    waker: Cell<Option<NonNull<Waker>>>,
-}
-
-impl<'a, T> Future for FutureLock<'a, T> {
-    type Output = MutexGuard<'a, T>;
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        match this
-            .mutex
-            .try_lock()
-            .or_else(|| this.lock_slow(context.waker()))
-        {
-            Some(guard) => Poll::Ready(guard),
-            None => Poll::Pending,
-        }
-    }
-}
-
-// See [`crate::sync::RawMutex`] for details on the implementation.
-impl<'a, T> FutureLock<'a, T> {
-    #[cold]
-    fn lock_slow(&self, waker: &'_ Waker) -> Option<MutexGuard<'a, T>> {
-        const SPIN_COUNT_DOUBLING: usize = 4;
-
-        let mut spin = 0;
-        let mut state = self.mutex.state.load(Ordering::Relaxed);
-        loop {
-            if state & MUTEX_LOCK == 0 {
-                match self.mutex.state.compare_exchange_weak(
-                    state,
-                    state | MUTEX_LOCK,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return Some(MutexGuard { mutex: self.mutex }),
-                    Err(s) => state = s,
-                }
-                continue;
-            }
-
-            if (state & QUEUE_MASK == 0) && spin < SPIN_COUNT_DOUBLING {
-                spin += 1;
-                (0..(1 << spin)).for_each(|_| spin_loop_hint());
-                state = self.mutex.state.load(Ordering::Relaxed);
-                continue;
-            }
-
-            let head = (state & QUEUE_MASK) as *const Self;
-            self.next.set(head);
-            self.prev.set(null());
-            self.waker.set(NonNull::new(waker as *const _ as *mut _));
-            if head.is_null() {
-                self.tail.set(self);
-            } else {
-                self.tail.set(null());
-            }
-
-            match self.mutex.state.compare_exchange_weak(
-                state,
-                (self as *const _ as usize) | (state & !QUEUE_MASK),
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return None,
-                Err(s) => state = s,
-            }
+            node: WaitNode::default(),
         }
     }
 }
@@ -198,86 +419,7 @@ pub struct MutexGuard<'a, T> {
 
 impl<'a, T> Drop for MutexGuard<'a, T> {
     fn drop(&mut self) {
-        let state = self.mutex.state.fetch_sub(MUTEX_LOCK, Ordering::Release);
-        if (state & QUEUE_LOCK == 0) && (state & QUEUE_MASK != 0) {
-            unsafe { self.unlock_slow() };
-        }
-    }
-}
-
-// See [`crate::sync::RawMutex`] for details on the implementation.
-impl<'a, T> MutexGuard<'a, T> {
-    #[cold]
-    unsafe fn unlock_slow(&self) {
-        let mut state = self.mutex.state.load(Ordering::Relaxed);
-        loop {
-            if (state & QUEUE_LOCK != 0) || (state & QUEUE_MASK == 0) {
-                return;
-            }
-            match self.mutex.state.compare_exchange_weak(
-                state,
-                state | QUEUE_LOCK,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(s) => state = s,
-            }
-        }
-
-        'outer: loop {
-            let head = &*((state & QUEUE_MASK) as *const FutureLock<'a, T>);
-            let mut current = head;
-            while current.tail.get().is_null() {
-                let next = &*current.next.get();
-                next.prev.set(current);
-                current = next;
-            }
-            let tail = &*current.tail.get();
-            head.tail.set(tail);
-
-            if state & MUTEX_LOCK != 0 {
-                match self.mutex.state.compare_exchange_weak(
-                    state,
-                    state & !QUEUE_LOCK,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return,
-                    Err(s) => state = s,
-                }
-                fence(Ordering::Acquire);
-                continue;
-            }
-
-            let new_tail = tail.prev.get();
-            if new_tail.is_null() {
-                loop {
-                    match self.mutex.state.compare_exchange_weak(
-                        state,
-                        state & MUTEX_LOCK,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(s) => state = s,
-                    }
-
-                    if state & QUEUE_MASK != 0 {
-                        fence(Ordering::Acquire);
-                        continue 'outer;
-                    }
-                }
-            } else {
-                head.tail.set(new_tail);
-                self.mutex.state.fetch_and(!QUEUE_LOCK, Ordering::Release);
-            }
-
-            let waker = mem::replace(&mut *tail.waker.as_ptr(), None);
-            let waker = &*waker.unwrap().as_ptr();
-            waker.wake_by_ref();
-            return;
-        }
+        unsafe { self.mutex.lock.unlock_unfair() };
     }
 }
 
@@ -305,4 +447,13 @@ impl<'a, T: fmt::Display> fmt::Display for MutexGuard<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)
     }
+}
+
+impl<'a, T> MutexGuard<'a, T> {
+    // TODO: 
+    // - unlock_fair()
+    // - bump()
+    // - unlocked_fair(f)
+    // - map
+    // - try_map
 }

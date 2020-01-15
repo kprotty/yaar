@@ -2,7 +2,6 @@ use super::executor::with_executor;
 use core::{
     future::Future,
     hint::unreachable_unchecked,
-    marker::Unpin,
     mem::{align_of, MaybeUninit},
     pin::Pin,
     ptr::{null, NonNull},
@@ -163,10 +162,12 @@ pub struct FutureTask<F: Future> {
     output: Option<F::Output>,
 }
 
-/// Because waking a `FutureTask` relies on getting its pointer
-/// from a task pointer internally, the `FutureTask` shouldnt be
-/// moved after being pinned as then the task pointer used would be invalid.
-impl<F: Future> !Unpin for FutureTask<F> {}
+// TODO:
+//
+// Because waking a `FutureTask` relies on getting its pointer
+// from a task pointer internally, the `FutureTask` shouldnt be
+// moved after being pinned as then the task pointer used would be invalid.
+// impl<F: Future> !Unpin for FutureTask<F> {}
 
 impl<F: Future> Future for FutureTask<F> {
     type Output = NonNull<F::Output>;

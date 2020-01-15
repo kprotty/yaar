@@ -4,7 +4,7 @@ use super::ThreadParker;
 use core::{
     mem::{size_of, transmute, MaybeUninit},
     ptr::null_mut,
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering},
 };
 use winapi::{
     shared::{
