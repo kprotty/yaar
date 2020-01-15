@@ -1,5 +1,5 @@
 use super::ThreadParker;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{fence, AtomicI32, Ordering};
 use libc::{
     syscall, SYS_futex, __errno_location, EAGAIN, EINTR, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE,
 };
@@ -54,12 +54,13 @@ impl ThreadParker for Parker {
             match self.state.compare_exchange_weak(
                 UNSET,
                 WAIT,
-                Ordering::Acquire,
-                Ordering::Acquire,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Err(s) => state = s,
                 Ok(_) => break,
             }
+            fence(Ordering::Acquire);
         }
 
         // wait until the state changes from WAIT to SET

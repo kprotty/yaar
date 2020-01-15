@@ -101,12 +101,13 @@ impl ThreadParker for Parker {
             match self.state.compare_exchange_weak(
                 UNSET,
                 WAIT,
-                Ordering::Acquire,
-                Ordering::Acquire,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Err(s) => state = s,
                 Ok(_) => break,
             }
+            fence(Ordering::Acquire);
         }
 
         unsafe {
