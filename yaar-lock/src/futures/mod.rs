@@ -1,5 +1,5 @@
 //! Collection of synchronization primitives which
-//! support non-blocking integration with futures. 
+//! support non-blocking integration with futures.
 
 mod mutex;
 

@@ -1,11 +1,11 @@
 use core::{
-    pin::Pin,
-    future::Future,
-    ptr::null,
-    mem::{self, align_of, MaybeUninit},
     cell::{Cell, UnsafeCell},
-    task::{Poll, Waker, Context},
-    sync::atomic::{fence, Ordering, AtomicUsize},
+    future::Future,
+    mem::{self, align_of, MaybeUninit},
+    pin::Pin,
+    ptr::null,
+    sync::atomic::{fence, AtomicUsize, Ordering},
+    task::{Context, Poll, Waker},
 };
 
 pub struct Mutex<T> {
@@ -59,7 +59,12 @@ impl<T> Mutex<T> {
             type Output = MutexGuard<'a, T>;
 
             fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-                if acquire(&self.mutex.state, &self.wait_node, ctx.waker(), self.wait_node.flags.get()) {
+                if acquire(
+                    &self.mutex.state,
+                    &self.wait_node,
+                    ctx.waker(),
+                    self.wait_node.flags.get(),
+                ) {
                     Poll::Ready(MutexGuard { mutex: self.mutex })
                 } else {
                     Poll::Pending
@@ -92,7 +97,10 @@ impl<'a, T> MutexGuard<'a, T> {
         MappedMutexGuard { state, value }
     }
 
-    pub fn try_map<U>(self, f: impl FnOnce(&mut T) -> Option<&mut U>) -> Result<MappedMutexGuard<'a, U>, Self> {
+    pub fn try_map<U>(
+        self,
+        f: impl FnOnce(&mut T) -> Option<&mut U>,
+    ) -> Result<MappedMutexGuard<'a, U>, Self> {
         match f(unsafe { &mut *self.mutex.value.get() }) {
             None => Err(self),
             Some(value) => {
@@ -115,7 +123,10 @@ impl<'a, T> MutexGuard<'a, T> {
         self.unlocked_fair(|| {})
     }
 
-    pub fn unlocked_fair<R: 'a>(&mut self, f: impl FnOnce() -> R + 'a) -> impl Future<Output = R> + 'a {
+    pub fn unlocked_fair<R: 'a>(
+        &mut self,
+        f: impl FnOnce() -> R + 'a,
+    ) -> impl Future<Output = R> + 'a {
         unsafe { release_fair(&self.mutex.state) };
         FutureUnlock {
             state: &self.mutex.state,
@@ -144,7 +155,10 @@ impl<'a, T: 'a> MappedMutexGuard<'a, T> {
         MappedMutexGuard { state, value }
     }
 
-    pub fn try_map<U>(self, f: impl FnOnce(&mut T) -> Option<&mut U>) -> Result<MappedMutexGuard<'a, U>, Self> {
+    pub fn try_map<U>(
+        self,
+        f: impl FnOnce(&mut T) -> Option<&mut U>,
+    ) -> Result<MappedMutexGuard<'a, U>, Self> {
         match f(unsafe { &mut *self.value }) {
             None => Err(self),
             Some(value) => {
@@ -167,7 +181,10 @@ impl<'a, T: 'a> MappedMutexGuard<'a, T> {
         self.unlocked_fair(|| {})
     }
 
-    pub fn unlocked_fair<R: 'a>(&mut self, f: impl FnOnce() -> R + 'a) -> impl Future<Output = R> + 'a {
+    pub fn unlocked_fair<R: 'a>(
+        &mut self,
+        f: impl FnOnce() -> R + 'a,
+    ) -> impl Future<Output = R> + 'a {
         unsafe { release_fair(self.state) };
         FutureUnlock {
             state: self.state,
@@ -189,7 +206,12 @@ impl<'a, T> Future for FutureUnlock<'a, T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        if acquire(self.state, &self.wait_node, ctx.waker(), self.wait_node.flags.get()) {
+        if acquire(
+            self.state,
+            &self.wait_node,
+            ctx.waker(),
+            self.wait_node.flags.get(),
+        ) {
             Poll::Ready(unsafe {
                 mem::replace(&mut *self.output.as_ptr(), MaybeUninit::uninit()).assume_init()
             })
@@ -214,8 +236,7 @@ impl Drop for WaitNode {
     fn drop(&mut self) {
         if self.flags.get() & WAIT_FLAG_WAKER != 0 {
             mem::drop(unsafe {
-                mem::replace(&mut *self.waker.as_ptr(), MaybeUninit::uninit())
-                    .assume_init()
+                mem::replace(&mut *self.waker.as_ptr(), MaybeUninit::uninit()).assume_init()
             })
         }
     }
@@ -261,13 +282,18 @@ fn try_acquire(state_ref: &AtomicUsize) -> bool {
 
 #[inline]
 fn acquire(state_ref: &AtomicUsize, wait_node: &WaitNode, waker: &Waker, flags: u8) -> bool {
-    (flags & WAIT_FLAG_HANDOFF != 0) 
+    (flags & WAIT_FLAG_HANDOFF != 0)
         || try_acquire(state_ref)
         || acquire_slow(state_ref, wait_node, waker, flags)
 }
 
 #[cold]
-fn acquire_slow(state_ref: &AtomicUsize, wait_node: &WaitNode, waker: &Waker, mut flags: u8) -> bool {
+fn acquire_slow(
+    state_ref: &AtomicUsize,
+    wait_node: &WaitNode,
+    waker: &Waker,
+    mut flags: u8,
+) -> bool {
     let enqueued = flags & WAIT_FLAG_WAKER != 0;
     let mut state = state_ref.load(Ordering::Relaxed);
     loop {
@@ -283,7 +309,7 @@ fn acquire_slow(state_ref: &AtomicUsize, wait_node: &WaitNode, waker: &Waker, mu
             }
             continue;
         }
-        
+
         if enqueued {
             return false;
         }
@@ -294,7 +320,7 @@ fn acquire_slow(state_ref: &AtomicUsize, wait_node: &WaitNode, waker: &Waker, mu
             wait_node.prev.set(MaybeUninit::new(null()));
             wait_node.waker.set(MaybeUninit::new(waker.clone()));
         }
-        
+
         let head = (state & QUEUE_MASK) as *const WaitNode;
         wait_node.next.set(MaybeUninit::new(head));
         if head.is_null() {
@@ -395,12 +421,7 @@ unsafe fn release_fair(state_ref: &AtomicUsize) {
         let head = (state & QUEUE_MASK) as *const WaitNode;
 
         if head.is_null() {
-            match state_ref.compare_exchange_weak(
-                state,
-                0,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
+            match state_ref.compare_exchange_weak(state, 0, Ordering::Release, Ordering::Relaxed) {
                 Ok(_) => return,
                 Err(s) => state = s,
             }
@@ -411,23 +432,24 @@ unsafe fn release_fair(state_ref: &AtomicUsize) {
         let head = &*head;
         let tail = head.find_tail();
         let new_tail = tail.prev.get().assume_init();
-        
+
         if new_tail.is_null() {
             if let Err(s) = state_ref.compare_exchange_weak(
                 state,
                 MUTEX_LOCK,
                 Ordering::Release,
-                Ordering::Relaxed,   
+                Ordering::Relaxed,
             ) {
                 state = s;
                 fence(Ordering::Acquire);
                 continue;
             }
         }
-        
+
         head.tail.set(MaybeUninit::new(new_tail));
         let waker = mem::replace(&mut *tail.waker.as_ptr(), MaybeUninit::uninit());
-        tail.flags.set((tail.flags.get() & !WAIT_FLAG_WAKER) | WAIT_FLAG_HANDOFF);
+        tail.flags
+            .set((tail.flags.get() & !WAIT_FLAG_WAKER) | WAIT_FLAG_HANDOFF);
         waker.assume_init().wake();
         return;
     }

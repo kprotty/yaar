@@ -1,20 +1,15 @@
-use criterion::{
-    criterion_group,
-    criterion_main,
-    Benchmark,
-    Criterion,
-};
+use async_std::{sync::Mutex as AsyncStdMutex, task};
+use criterion::{criterion_group, criterion_main, Benchmark, Criterion};
+use futures_intrusive::sync::{Mutex as IntrusiveMutex, Semaphore};
 use std::{
-    time::Duration,
-    sync::Arc,
     future::Future,
     pin::Pin,
-    task::{Poll, Context},
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
 };
 use tokio::sync::Mutex as TokioMutex;
-use async_std::{task, sync::Mutex as AsyncStdMutex};
 use yaar_lock::futures::Mutex as YaarMutex;
-use futures_intrusive::sync::{Semaphore, Mutex as IntrusiveMutex};
 
 const TEST_SECS: u64 = 20;
 const ITERATIONS: usize = 50;
@@ -60,7 +55,7 @@ macro_rules! run_mutex {
                 let mutex = Arc::new($new);
                 let mut tasks = Vec::new();
                 let sema = Arc::new(Semaphore::new(false, 0));
-                
+
                 let num_tasks = $threads;
                 for _ in 0..num_tasks {
                     let mutex = mutex.clone();
@@ -232,7 +227,7 @@ fn async_std_tokio(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default().measurement_time(Duration::from_secs(TEST_SECS));
-    targets = 
+    targets =
         // tokio
         tokio_rt_intrusive_fair,
         tokio_rt_intrusive_unfair,
