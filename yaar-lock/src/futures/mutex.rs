@@ -13,6 +13,14 @@ use core::{
     task::{Context, Poll, Waker},
 };
 
+/// A mutual exclusion primitive useful for protecting shared data
+///
+/// This mutex will block futures waiting for the lock to become available. The
+/// mutex can also be statically initialized or created via a `new`
+/// constructor. Each mutex has a type parameter which represents the data that
+/// it is protecting. The data can only be accessed through the RAII guards
+/// returned from `lock` and `try_lock`, which guarantees that the data is only
+/// ever accessed when the mutex is locked.
 pub struct Mutex<T> {
     value: UnsafeCell<T>,
     state: AtomicUsize,
@@ -93,6 +101,12 @@ impl<T> Mutex<T> {
     ///
     /// This method returns a future that will resolve once the mutex has been
     /// successfully acquired.
+    /// 
+    /// # Safety
+    ///
+    /// While it may not encoded in the type system since it's feature gated
+    /// by `#[feature(opt_in_builtin_traits)]`, the Future returns by this
+    /// function MUST be treaetd as `!Unpin`.
     #[inline]
     pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, T>> + Send {
         struct FutureLock<'a, T> {
@@ -158,7 +172,7 @@ impl<T> Mutex<T> {
     }
 }
 
-// An RAII implementation of a "scoped lock" of a mutex. When this structure is
+/// An RAII implementation of a "scoped lock" of a mutex. When this structure is
 /// dropped (falls out of scope), the lock will be unlocked.
 ///
 /// The data protected by the mutex can be accessed through this guard via its
@@ -263,6 +277,12 @@ impl<'a, T> MutexGuard<'a, T> {
     /// This method is functionally equivalent to calling `unlock_fair` followed
     /// by `lock`, however it can be much more efficient in the case where there
     /// are no waiting threads.
+    /// 
+    /// # Safety
+    ///
+    /// While it may not encoded in the type system since it's feature gated
+    /// by `#[feature(opt_in_builtin_traits)]`, the Future returns by this
+    /// function MUST be treaetd as `!Unpin`.
     #[inline]
     pub fn bump(&'a mut self) -> impl Future<Output = ()> + 'a {
         // TODO: replace with more efficient version:
@@ -278,6 +298,12 @@ impl<'a, T> MutexGuard<'a, T> {
     ///
     /// This is safe because `&mut` guarantees that there exist no other
     /// references to the data protected by the mutex.
+    /// 
+    /// # Safety
+    ///
+    /// While it may not encoded in the type system since it's feature gated
+    /// by `#[feature(opt_in_builtin_traits)]`, the Future returns by this
+    /// function MUST be treaetd as `!Unpin`.
     pub fn unlocked<R: 'a>(
         &'a mut self,
         f: impl FnOnce() -> R + 'a,
@@ -298,6 +324,12 @@ impl<'a, T> MutexGuard<'a, T> {
     ///
     /// This is safe because `&mut` guarantees that there exist no other
     /// references to the data protected by the mutex.
+    /// 
+    /// # Safety
+    ///
+    /// While it may not encoded in the type system since it's feature gated
+    /// by `#[feature(opt_in_builtin_traits)]`, the Future returns by this
+    /// function MUST be treaetd as `!Unpin`.
     pub fn unlocked_fair<R: 'a>(
         &'a mut self,
         f: impl FnOnce() -> R + 'a,
@@ -313,6 +345,13 @@ impl<'a, T> MutexGuard<'a, T> {
     }
 }
 
+/// An RAII mutex guard returned by `MutexGuard::map`, which can point to a
+/// subfield of the protected data.
+///
+/// The main difference between `MappedMutexGuard` and `MutexGuard` is that the
+/// former doesn't support temporarily unlocking and re-locking, since that
+/// could introduce soundness issues if the locked object is modified by another
+/// thread.
 pub struct MappedMutexGuard<'a, T> {
     state: &'a AtomicUsize,
     value: *mut T,
@@ -407,60 +446,6 @@ impl<'a, T: 'a> MappedMutexGuard<'a, T> {
         let state = self.state;
         mem::forget(self);
         unsafe { release_fair(state) };
-    }
-
-    /// Temporarily yields the mutex to a waiting thread if there is one.
-    ///
-    /// This method is functionally equivalent to calling `unlock_fair` followed
-    /// by `lock`, however it can be much more efficient in the case where there
-    /// are no waiting threads.
-    #[inline]
-    pub fn bump(&'a mut self) -> impl Future<Output = ()> + 'a {
-        // TODO: replace with more efficient version:
-        // - if queue is empty: return
-        // - if node in queue:
-        //   - replace tail with ourselves
-        //   - wake up old tail with handoff
-        //   - try to acquire the lock ourselves
-        self.unlocked_fair(|| {})
-    }
-
-    /// Temporarily unlocks the mutex to execute the given function.
-    ///
-    /// This is safe because `&mut` guarantees that there exist no other
-    /// references to the data protected by the mutex.
-    pub fn unlocked<R: 'a>(
-        &'a mut self,
-        f: impl FnOnce() -> R + 'a,
-    ) -> impl Future<Output = R> + 'a {
-        let state = self.state;
-        release_unfair(state);
-        FutureUnlock {
-            state,
-            mutex: self,
-            wait_node: WaitNode::new(),
-            output: Cell::new(MaybeUninit::new(f())),
-        }
-    }
-
-    /// Temporarily unlocks the mutex to execute the given function.
-    ///
-    /// The mutex is unlocked using a fair unlock protocol.
-    ///
-    /// This is safe because `&mut` guarantees that there exist no other
-    /// references to the data protected by the mutex.
-    pub fn unlocked_fair<R: 'a>(
-        &'a mut self,
-        f: impl FnOnce() -> R + 'a,
-    ) -> impl Future<Output = R> + 'a {
-        let state = self.state;
-        unsafe { release_fair(state) };
-        FutureUnlock {
-            state,
-            mutex: self,
-            wait_node: WaitNode::new(),
-            output: Cell::new(MaybeUninit::new(f())),
-        }
     }
 }
 
