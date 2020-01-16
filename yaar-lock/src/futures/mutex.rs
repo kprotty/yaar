@@ -4,9 +4,9 @@
 use core::{
     cell::{Cell, UnsafeCell},
     fmt,
-    ops::{Deref, DerefMut},
     future::Future,
     mem::{self, align_of, MaybeUninit},
+    ops::{Deref, DerefMut},
     pin::Pin,
     ptr::null,
     sync::atomic::{fence, AtomicUsize, Ordering},
@@ -101,7 +101,7 @@ impl<T> Mutex<T> {
     ///
     /// This method returns a future that will resolve once the mutex has been
     /// successfully acquired.
-    /// 
+    ///
     /// # Safety
     ///
     /// While it may not encoded in the type system since it's feature gated
@@ -198,7 +198,7 @@ impl<'a, T> DerefMut for MutexGuard<'a, T> {
 
 impl<'a, T> Deref for MutexGuard<'a, T> {
     type Target = T;
-    
+
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.mutex.value.get() }
     }
@@ -259,7 +259,7 @@ impl<'a, T> MutexGuard<'a, T> {
     ///
     /// By default, mutexes are unfair and allow the current future to re-lock
     /// the mutex before another has the chance to acquire the lock, even if
-    /// that future has been blocked on the mutex for a long time. This can 
+    /// that future has been blocked on the mutex for a long time. This can
     /// result in one future acquiring a mutex many more times than other futures.
     ///
     /// However in some cases it can be beneficial to ensure fairness by forcing
@@ -277,7 +277,7 @@ impl<'a, T> MutexGuard<'a, T> {
     /// This method is functionally equivalent to calling `unlock_fair` followed
     /// by `lock`, however it can be much more efficient in the case where there
     /// are no waiting threads.
-    /// 
+    ///
     /// # Safety
     ///
     /// While it may not encoded in the type system since it's feature gated
@@ -298,7 +298,7 @@ impl<'a, T> MutexGuard<'a, T> {
     ///
     /// This is safe because `&mut` guarantees that there exist no other
     /// references to the data protected by the mutex.
-    /// 
+    ///
     /// # Safety
     ///
     /// While it may not encoded in the type system since it's feature gated
@@ -324,7 +324,7 @@ impl<'a, T> MutexGuard<'a, T> {
     ///
     /// This is safe because `&mut` guarantees that there exist no other
     /// references to the data protected by the mutex.
-    /// 
+    ///
     /// # Safety
     ///
     /// While it may not encoded in the type system since it's feature gated
@@ -435,7 +435,7 @@ impl<'a, T: 'a> MappedMutexGuard<'a, T> {
     ///
     /// By default, mutexes are unfair and allow the current future to re-lock
     /// the mutex before another has the chance to acquire the lock, even if
-    /// that future has been blocked on the mutex for a long time. This can 
+    /// that future has been blocked on the mutex for a long time. This can
     /// result in one future acquiring a mutex many more times than other futures.
     ///
     /// However in some cases it can be beneficial to ensure fairness by forcing
@@ -483,8 +483,8 @@ impl<'a, T, M> Future for FutureUnlock<'a, T, M> {
     }
 }
 
-/// Flag set on the [`WaitNode`] to 
-/// indicate that the futuer which woke 
+/// Flag set on the [`WaitNode`] to
+/// indicate that the futuer which woke
 /// it up kept the mutex locked and that
 /// they should assume to now have acquired it.
 const WAIT_FLAG_HANDOFF: u8 = 1 << 0;
@@ -602,15 +602,15 @@ fn acquire_slow(
             }
             continue;
         }
-        
+
         // if the mutex is locked, and were already in the queue, start pending.
         if enqueued {
             return false;
         }
-        
+
         // Lazy initialize the WaitNode with the waker.
         // This both acts as an optimization for the MaybeUninit
-        // and serves as a way to memoize the waker.clone() call 
+        // and serves as a way to memoize the waker.clone() call
         // as it could be arbitrarily expensive.
         if flags & WAIT_FLAG_WAKER == 0 {
             flags |= WAIT_FLAG_WAKER;
@@ -680,7 +680,7 @@ unsafe fn release_unfair_slow(state_ref: &AtomicUsize) {
         // get the tail node of the queue to pop it
         let head = &*((state & QUEUE_MASK) as *const WaitNode);
         let tail = head.find_tail();
-        
+
         // if the mutex is locked, let the unlocker take care of waking up the node.
         if state & MUTEX_LOCK != 0 {
             match state_ref.compare_exchange_weak(
@@ -695,7 +695,7 @@ unsafe fn release_unfair_slow(state_ref: &AtomicUsize) {
             fence(Ordering::Acquire);
             continue;
         }
-        
+
         // try to pop the tail from the queue, unlocking the queue at the same time.
         let new_tail = tail.prev.get().assume_init();
         if new_tail.is_null() {
@@ -731,7 +731,7 @@ unsafe fn release_fair(state_ref: &AtomicUsize) {
     let mut state = state_ref.load(Ordering::Acquire);
     loop {
         let head = (state & QUEUE_MASK) as *const WaitNode;
-        
+
         // if the wait queue is empty, try to just unlock
         if head.is_null() {
             match state_ref.compare_exchange_weak(state, 0, Ordering::Release, Ordering::Relaxed) {
@@ -746,7 +746,7 @@ unsafe fn release_fair(state_ref: &AtomicUsize) {
         let head = &*head;
         let tail = head.find_tail();
         let new_tail = tail.prev.get().assume_init();
-        
+
         // handle the case where the tail is the last node in the queue
         // by updating the state to zero out the queue mask without unlocking the mutex.
         if new_tail.is_null() {
