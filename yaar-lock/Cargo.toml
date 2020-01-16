@@ -36,3 +36,19 @@ features = [
     "handleapi",
     "libloaderapi",
 ]
+
+[lib]
+name = "yaar_lock"
+
+[dev-dependencies]
+num_cpus = "1.11"
+parking_lot = "0.10"
+futures-intrusive = "0.2"
+criterion = "0.3"
+crossbeam = "0.7"
+async-std = "1.4"
+tokio = { version = "0.2", features = ["full"] }
+
+[[bench]]
+name = "async_mutex"
+harness = false

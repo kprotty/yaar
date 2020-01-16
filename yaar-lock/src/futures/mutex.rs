@@ -5,13 +5,16 @@ use core::{
     mem::{self, align_of, MaybeUninit},
     cell::{Cell, UnsafeCell},
     task::{Poll, Waker, Context},
-    sync::atomic::{fence, spin_loop_hint, Ordering, AtomicUsize},
+    sync::atomic::{fence, Ordering, AtomicUsize},
 };
 
 pub struct Mutex<T> {
     value: UnsafeCell<T>,
     state: AtomicUsize,
 }
+
+unsafe impl<T: Send> Send for Mutex<T> {}
+unsafe impl<T: Send> Sync for Mutex<T> {}
 
 impl<T: Default> Default for Mutex<T> {
     fn default() -> Self {
@@ -44,11 +47,13 @@ impl<T> Mutex<T> {
         }
     }
 
-    pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, T>> {
+    pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, T>> + Send {
         struct FutureLock<'a, T> {
             mutex: &'a Mutex<T>,
             wait_node: WaitNode,
         }
+
+        unsafe impl<'a, T> Send for FutureLock<'a, T> {}
 
         impl<'a, T> Future for FutureLock<'a, T> {
             type Output = MutexGuard<'a, T>;
@@ -100,7 +105,9 @@ impl<'a, T> MutexGuard<'a, T> {
 
     #[inline]
     pub fn unlock_fair(self) {
-        unsafe { release_fair(&self.mutex.state) };
+        let state = &self.mutex.state;
+        mem::forget(self);
+        unsafe { release_fair(state) };
     }
 
     #[inline]
@@ -150,7 +157,9 @@ impl<'a, T: 'a> MappedMutexGuard<'a, T> {
 
     #[inline]
     pub fn unlock_fair(self) {
-        unsafe { release_fair(self.state) };
+        let state = self.state;
+        mem::forget(self);
+        unsafe { release_fair(state) };
     }
 
     #[inline]
@@ -173,6 +182,8 @@ struct FutureUnlock<'a, T> {
     wait_node: WaitNode,
     output: Cell<MaybeUninit<T>>,
 }
+
+unsafe impl<'a, T> Send for FutureUnlock<'a, T> {}
 
 impl<'a, T> Future for FutureUnlock<'a, T> {
     type Output = T;
@@ -257,9 +268,6 @@ fn acquire(state_ref: &AtomicUsize, wait_node: &WaitNode, waker: &Waker, flags: 
 
 #[cold]
 fn acquire_slow(state_ref: &AtomicUsize, wait_node: &WaitNode, waker: &Waker, mut flags: u8) -> bool {
-    const SPIN_COUNT_DOUBLING: usize = 3;
-
-    let mut spin = 0;
     let enqueued = flags & WAIT_FLAG_WAKER != 0;
     let mut state = state_ref.load(Ordering::Relaxed);
     loop {
@@ -276,14 +284,6 @@ fn acquire_slow(state_ref: &AtomicUsize, wait_node: &WaitNode, waker: &Waker, mu
             continue;
         }
         
-        let head = (state & QUEUE_MASK) as *const WaitNode;
-        if spin <= SPIN_COUNT_DOUBLING && head.is_null() {
-            spin += 1;
-            (0..(1 << spin)).for_each(|_| spin_loop_hint());
-            state = state_ref.load(Ordering::Relaxed);
-            continue;
-        }
-
         if enqueued {
             return false;
         }
@@ -294,7 +294,8 @@ fn acquire_slow(state_ref: &AtomicUsize, wait_node: &WaitNode, waker: &Waker, mu
             wait_node.prev.set(MaybeUninit::new(null()));
             wait_node.waker.set(MaybeUninit::new(waker.clone()));
         }
-
+        
+        let head = (state & QUEUE_MASK) as *const WaitNode;
         wait_node.next.set(MaybeUninit::new(head));
         if head.is_null() {
             wait_node.tail.set(MaybeUninit::new(wait_node));
@@ -334,7 +335,7 @@ unsafe fn release_unfair_slow(state_ref: &AtomicUsize) {
             state,
             state | QUEUE_LOCK,
             Ordering::Acquire,
-            Ordering::Release,
+            Ordering::Relaxed,
         ) {
             Ok(_) => break,
             Err(s) => state = s,
@@ -414,7 +415,7 @@ unsafe fn release_fair(state_ref: &AtomicUsize) {
         if new_tail.is_null() {
             if let Err(s) = state_ref.compare_exchange_weak(
                 state,
-                0,
+                MUTEX_LOCK,
                 Ordering::Release,
                 Ordering::Relaxed,   
             ) {
@@ -426,7 +427,7 @@ unsafe fn release_fair(state_ref: &AtomicUsize) {
         
         head.tail.set(MaybeUninit::new(new_tail));
         let waker = mem::replace(&mut *tail.waker.as_ptr(), MaybeUninit::uninit());
-        tail.flags.set(tail.flags.get() & !WAIT_FLAG_WAKER);
+        tail.flags.set((tail.flags.get() & !WAIT_FLAG_WAKER) | WAIT_FLAG_HANDOFF);
         waker.assume_init().wake();
         return;
     }
