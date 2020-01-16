@@ -50,6 +50,7 @@ struct WaitQueueNode<Parker> {
     next: Cell<*const Self>,
     tail: Cell<*const Self>,
     thread_parker: Parker,
+    handoff: Cell<bool>,
 }
 
 unsafe impl<Parker: ThreadParker> lock_api::RawMutex for WordLock<Parker> {
@@ -80,6 +81,61 @@ unsafe impl<Parker: ThreadParker> lock_api::RawMutex for WordLock<Parker> {
         // go try and lock the queue in order to pop a node off and wake it up.
         if (state & QUEUE_LOCK == 0) && (state & QUEUE_MASK != 0) {
             unsafe { self.unlock_slow() };
+        }
+    }
+}
+
+unsafe impl<Parker: ThreadParker> lock_api::RawMutexFair for WordLock<Parker> {
+    fn unlock_fair(&self) {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            let head = (state & QUEUE_MASK) as *const WaitQueueNode<Parker>;
+            
+            // if the wait queue is empty, try to just unlock
+            if head.is_null() {
+                match self.state.compare_exchange_weak(state, 0, Ordering::Release, Ordering::Relaxed) {
+                    Ok(_) => return,
+                    Err(s) => state = s,
+                }
+                fence(Ordering::Acquire);
+                continue;
+            }
+
+            // prepare to pop the tail from the wait queue
+            let (head, tail) = unsafe {
+                let head = &*head;
+                let mut current = head;
+                while current.tail.get().is_null() {
+                    let next = &*current.next.get();
+                    next.prev.set(current);
+                    current = next;
+                }
+                (head, &*current.tail.get())
+            };
+            
+            // handle the case where the tail is the last node in the queue
+            // by updating the state to zero out the queue mask without unlocking the mutex.
+            let new_tail = tail.prev.get();
+            if new_tail.is_null() {
+                if let Err(s) = self.state.compare_exchange_weak(
+                    state,
+                    MUTEX_LOCK,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    state = s;
+                    fence(Ordering::Acquire);
+                    continue;
+                }
+            } else {
+                head.tail.set(new_tail);
+            }
+
+            // wake up the tail node using direct handoff without unlocking the mutex.
+            // the woken up node will see the handoff flags when acquring and assume it holds the mutex.
+            tail.handoff.set(true);
+            tail.thread_parker.unpark();
+            return;
         }
     }
 }
@@ -122,6 +178,7 @@ impl<Parker: ThreadParker> WordLock<Parker> {
             prev: Cell::new(null()),
             next: Cell::new(null()),
             tail: Cell::new(null()),
+            handoff: Cell::new(false),
             thread_parker: Parker::default(),
         };
 
@@ -175,7 +232,11 @@ impl<Parker: ThreadParker> WordLock<Parker> {
 
             // We are now in the queue.
             // Wait to be notified by an unlocking thread.
+            // If handoff, the lock was directly given to us.
             node.thread_parker.park();
+            if node.handoff.get() {
+                return;
+            }
 
             // Reset everything to prepare spinning on the lock again.
             spin = 0;
