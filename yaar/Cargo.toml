@@ -14,13 +14,15 @@ optimized around configuration and no_std.
 """
 
 [features]
-default = ["serial", "parallel"]
-serial = []
-parallel = ["lock_api"]
+default = ["os"]
+os = ["libc", "winapi", "yaar-lock/os"]
+io = []
+time = []
 
-[dependencies.lock_api]
-optional = true
-version = "0.3"
+[dependencies.yaar-lock]
+path = "../yaar-lock"
+default-features = false
+features = ["sync", "futures"]
 
 [target.'cfg(unix)'.dependencies.libc]
 optional = true

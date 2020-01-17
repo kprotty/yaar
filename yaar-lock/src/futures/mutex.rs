@@ -5,6 +5,7 @@ use core::{
     cell::{Cell, UnsafeCell},
     fmt,
     future::Future,
+    marker::PhantomPinned,
     mem::{self, align_of, MaybeUninit},
     ops::{Deref, DerefMut},
     pin::Pin,
@@ -102,13 +103,8 @@ impl<T> Mutex<T> {
     /// This method returns a future that will resolve once the mutex has been
     /// successfully acquired.
     ///
-    /// # Safety
-    ///
-    /// While it may not encoded in the type system since it's feature gated
-    /// by `#[feature(opt_in_builtin_traits)]`, the Future returns by this
-    /// function MUST be treaetd as `!Unpin`.
     #[inline]
-    pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, T>> + Send {
+    pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, T>> {
         struct FutureLock<'a, T> {
             mutex: &'a Mutex<T>,
             wait_node: WaitNode,
@@ -277,12 +273,6 @@ impl<'a, T> MutexGuard<'a, T> {
     /// This method is functionally equivalent to calling `unlock_fair` followed
     /// by `lock`, however it can be much more efficient in the case where there
     /// are no waiting threads.
-    ///
-    /// # Safety
-    ///
-    /// While it may not encoded in the type system since it's feature gated
-    /// by `#[feature(opt_in_builtin_traits)]`, the Future returns by this
-    /// function MUST be treaetd as `!Unpin`.
     #[inline]
     pub fn bump(&'a mut self) -> impl Future<Output = ()> + 'a {
         // TODO: replace with more efficient version:
@@ -298,12 +288,6 @@ impl<'a, T> MutexGuard<'a, T> {
     ///
     /// This is safe because `&mut` guarantees that there exist no other
     /// references to the data protected by the mutex.
-    ///
-    /// # Safety
-    ///
-    /// While it may not encoded in the type system since it's feature gated
-    /// by `#[feature(opt_in_builtin_traits)]`, the Future returns by this
-    /// function MUST be treaetd as `!Unpin`.
     pub fn unlocked<R: 'a>(
         &'a mut self,
         f: impl FnOnce() -> R + 'a,
@@ -324,12 +308,6 @@ impl<'a, T> MutexGuard<'a, T> {
     ///
     /// This is safe because `&mut` guarantees that there exist no other
     /// references to the data protected by the mutex.
-    ///
-    /// # Safety
-    ///
-    /// While it may not encoded in the type system since it's feature gated
-    /// by `#[feature(opt_in_builtin_traits)]`, the Future returns by this
-    /// function MUST be treaetd as `!Unpin`.
     pub fn unlocked_fair<R: 'a>(
         &'a mut self,
         f: impl FnOnce() -> R + 'a,
@@ -496,6 +474,7 @@ const WAIT_FLAG_WAKER: u8 = 1 << 1;
 
 struct WaitNode {
     flags: Cell<u8>,
+    _pinned: PhantomPinned,
     prev: Cell<MaybeUninit<*const Self>>,
     next: Cell<MaybeUninit<*const Self>>,
     tail: Cell<MaybeUninit<*const Self>>,
@@ -521,6 +500,7 @@ impl WaitNode {
     pub const fn new() -> Self {
         Self {
             flags: Cell::new(0),
+            _pinned: PhantomPinned,
             prev: Cell::new(MaybeUninit::uninit()),
             next: Cell::new(MaybeUninit::uninit()),
             tail: Cell::new(MaybeUninit::uninit()),
