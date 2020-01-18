@@ -1,3 +1,4 @@
+use yaar_lock::sync::{RawMutex, ThreadParker};
 use core::{
     convert::{AsMut, AsRef},
     future::Future,
@@ -6,6 +7,7 @@ use core::{
     mem::{align_of, MaybeUninit},
     pin::Pin,
     ptr::{null, NonNull},
+    sync::atomic::{spin_loop_hint, Ordering},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
@@ -76,17 +78,34 @@ impl Task {
         (self.resume)(self)
     }
 
-    /// Polls a given future using the task's resume function for waking.
-    pub unsafe fn poll<F: Future>(&mut self, future: &mut F) -> Poll<F::Output> {
-        const WAKE: unsafe fn(*const ()) = |ptr| unsafe {
-            let executor = (&*super::EXECUTOR_CELL.0.as_ptr()).as_ref().unwrap();
-            executor.schedule(ptr as *mut Task);
-        };
+    /// Schedule the task on the executor to be eventually ran.
+    ///
+    /// # Panic
+    /// 
+    /// This function panics if there is no current running executor.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the same task must not be scheduled more
+    /// than once before it is resumed. This may result in resume being called
+    /// on multiple threads as is therefor undefiend behavior. 
+    pub unsafe fn schedule(&mut self) {
+        let executor = (&*super::EXECUTOR_CELL.0.as_ptr()).as_ref().unwrap();
+        (executor._schedule)(executor.ptr, self)
+    }
 
+    /// Polls a given future using the task, scheduling the task on wake in order 
+    /// to run its resume function.
+    ///
+    /// # Safety
+    ///
+    /// Similar to [`schedule`], the caller must ensure that the task is not
+    /// polled more than once before being resumed.
+    pub unsafe fn poll<F: Future>(&mut self, future: &mut F) -> Poll<F::Output> {
         const VTABLE: RawWakerVTable = RawWakerVTable::new(
             |ptr| RawWaker::new(ptr, &VTABLE),
-            WAKE,
-            WAKE,
+            |ptr| unsafe { (&mut *(ptr as *mut Task)).schedule() },
+            |ptr| unsafe { (&mut *(ptr as *mut Task)).schedule() },
             |_| {},
         );
 
@@ -322,6 +341,262 @@ impl PriorityList {
         match task.priority() {
             Priority::Low | Priority::Normal => self.back.push_back(&list),
             Priority::High => self.front.push_back(&list),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Injector {
+    list: List,
+    size: usize,
+}
+
+impl Injector {
+    pub fn push(&mut self, list: &PriorityList) {
+        self.list.push(list);
+        self.size += list.size;
+    }
+
+    pub fn pop<'a>(&mut self, queue: &mut LocalQueue, queue_count: usize, max: usize) -> Option<&'a mut Task> {
+        if self.size == 0 {
+            return None;
+        }
+
+        let mut tail = *queue.tail().as_mut();
+        let mut head = queue.head().load(Ordering::Acquire);
+        let mut size = (self.size / queue_count)
+            .min(tail.wrapping_sub(head))
+            .max(max);
+
+        let task = self.list.pop();
+        self.size -= size;
+        size -= 1;
+        if size != 0 {
+            debug_assert_eq!(tail.wrapping_sub(head), 0);
+        }
+
+        for i in 0..size {
+            if let Some(task) = self.list.pop() {
+                match task.priority() {
+                    Priority::Low,
+                    Priority::Normal => {
+                        queue.tasks[tail % QUEUE_SIZE] = MaybeUninit::new(task);
+                        tail = tail.wrapping_add(1);
+                    },
+                    Priority::High => {
+                        queue.tasks[head.wrapping_sub(1) % QUEUE_SIZE] = MaybeUninit::new(task);
+                        head = head.wrapping_sub(1);
+                    },
+                }
+            } else {
+                break;
+            }
+        }
+
+        let pos = unsafe { &*(queue.head() as *const _ as *const AtomicPos) };
+        pos.store(unsafe { transmute([head, tail]) }, Ordering::Release);
+        Some(unsafe { &* task })
+    }
+}
+
+use self::queue_index::*;
+
+#[cfg(target_pointer_width = "32")]
+mod queue_index {
+    pub type Index = u16;
+    pub type AtomicPos = core::sync::atomic::AtomicU32;
+    pub type AtomicIndex = core::sync::atomic::AtomicU16;
+}
+
+#[cfg(target_pointer_width = "64")]
+mod queue_index {
+    pub type Index = u32;
+    pub type AtomicPos = core::sync::atomic::AtomicU64;
+    pub type AtomicIndex = core::sync::atomic::AtomicU32;
+}
+
+const QUEUE_SIZE: usize = 256;
+pub(super) struct LocalQueue {
+    pos: [Index; 2],
+    tasks: [MaybeUninit<*mut Task>; QUEUE_SIZE],
+}
+
+impl Default for LocalQueue {
+    fn default() -> Self {
+        Self {
+            pos: [Index::new(0), Index::new(0)],
+            tasks: [MaybeUninit::uninit(); QUEUE_SIZE],
+        }
+    }
+}
+
+impl LocalQueue {
+    #[inline(always)]
+    pub fn head(&mut self) -> &mut AtomicIndex {
+        &self.pos[0];
+    }
+
+    #[inline(always)]
+    pub fn tail(&mut self) -> &mut AtomicIndex {
+        &self.pos[1];
+    }
+
+    pub fn size(&self) -> usize {
+        let tail = self.tail().load(Ordering::Acquire);
+        let head = self.head().load(Ordering::Acquire);
+        tail.wrapping_sub(head)
+    }
+
+    pub fn push<P: ThreadParker>(&mut self, task: &mut Task, injector: &RawMutex<Injector, P>) {
+        unsafe {
+            match task.priority() {
+                Priority::Low,
+                Priority::Normal => self.push_back(task),
+                Priority::High => self.push_front(task),
+            }
+        }
+    }
+
+    unsafe fn push_back<P: ThreadParker>(&mut self, task: &mut Task, injector: &RawMutex<Injector, P>) {
+        loop {
+            let tail = *self.tail().get_mut();
+            let head = self.head().load(Ordering::Acquire);
+
+            if tail.wrapping_sub(head) < QUEUE_SIZE {
+                self.tasks[tail % QUEUE_SIZE] = MaybeUninit::new(task);
+                self.tail().store(tail.wrapping_add(1), Ordering::Release);
+                return;
+            }
+
+            if self.push_overflow(task, injector) {
+                return;
+            } else {
+                spin_loop_hint();
+            }
+        }
+    }
+
+    unsafe fn push_front<P: ThreadParker>(&mut self, task: &mut Task, injector: &RawMutex<Injector, P>) {
+        loop {
+            let tail = *self.tail().get_mut();
+            let head = self.head().load(Ordering::Acquire);
+
+            if tail.wrapping_sub(head) < QUEUE_SIZE {
+                self.tasks[head.wrapping_sub(1) % QUEUE_SIZE] = MaybeUninit::new(task);
+                if let Ok(_) = self.head().compare_exchange_weak(
+                    head,
+                    head.wrapping_sub(1),
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    return;
+                }
+                spin_loop_hint();
+                continue;
+            }
+
+            if self.push_overflow(task, injector, head) {
+                return;
+            } else {
+                spin_loop_hint();
+            }
+        }
+    }
+
+    unsafe fn push_overflow<P: ThreadParker>(&mut self, task: &mut Task, injector: &RawMutex<Injector, P>, head: Index) -> bool {
+        let grab = QUEUE_SIZE / 2;
+        if self.head().compare_exchange_weak(
+            head,
+            head.wrapping_add(grab),
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ).is_err() {
+            return false;
+        }
+
+        let mut list = PriorityList::default();
+        list.push(task);
+        for i in 0..grab {
+            list.push(self.tasks[head.wrapping_add(i) % QUEUE_SIZE].assume_init());
+        }
+        injector.lock().push(&list);
+    }
+
+    pub fn pop<'a>(&mut self) -> Option<&'a mut Task> {
+        loop {
+            let tail = *self.tail().get_mut();
+            let head = self.head().load(Ordering::Acquire);
+            if tail.wrapping_sub(head) == 0 {
+                return None;
+            }
+
+            let task = self.tasks[head % QUEUE_SIZE].assume_init();
+            match self.head().compare_exchange_weak(
+                head,
+                head.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(task),
+                Err(_) => spin_loop_hint(),
+            }
+        }
+    }
+
+    pub fn pop_back<'a>(&mut self) -> Option<&'a mut Task> {
+        loop {
+            let tail = *self.tail().get_mut();
+            let head = self.head().load(Ordering::Acquire);
+            if tail.wrapping_sub(head) == 0 {
+                return None;
+            }
+
+            let task = self.tasks[tail.wrapping_sub(1) % QUEUE_SIZE].assume_init();
+            let pos = unsafe { &*(self.head() as *const _ as *const AtomicPos) };
+            match pos.compare_exchange_weak(
+                unsafe { transmute([head, tail]) },
+                unsafe { transmute([head, tail.wrapping_sub(1)]) },
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(unsafe { &*task }),
+                Err(_) => spin_loop_hint(),
+            }
+        }
+    }
+
+    pub fn steal<'a>(&mut self, other: &mut LocalQueue) -> Option<&'a mut Task> {
+        let t = *self.tail().get_mut();
+        let h = self.head().load(Ordering::Acquire);
+        debug_assert!(t.wrapping_sub(h) == 0);
+
+        loop {
+            let head = other.head().load(Ordering::Acquire);
+            let tail = other.tail().load(Ordering::Acquire);
+            let size = tail.wrapping_sub(head);
+            let size = size - (size / 2);
+            if size == 0 {
+                return None;
+            }
+
+            for i in 0..size {
+                let task = other.tasks[head.wrapping_add(i) % QUEUE_SIZE];
+                self.tasks[t.wrapping_add(i) % QUEUE_SIZE] = task;
+            }
+
+            if other.head().compare_exchange_weak(
+                head,
+                head.wrapping_add(size),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ).is_err() {
+                spin_loop_hint();
+                continue;
+            }
+
+            let task = self.tasks[t % QUEUE_SIZE].assume_init();
+            self.tail().store(t.wrapping_add(size - 1), Ordering::Release);
+            return Some(task);
         }
     }
 }
