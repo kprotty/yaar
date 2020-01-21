@@ -1,4 +1,3 @@
-
 /// An interface for the runtime executor
 /// to interact with the underlying platform/system.
 pub trait Platform {

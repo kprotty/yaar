@@ -1,4 +1,4 @@
-use super::{Platform, Task, TaskPriority, CachedFutureTask};
+use super::{CachedFutureTask, Platform, Task, TaskPriority};
 use core::{cell::Cell, future::Future, mem::MaybeUninit, num::NonZeroUsize, ptr::NonNull};
 use yaar_lock::sync::{RawMutex, ThreadParker};
 
@@ -53,10 +53,7 @@ pub(super) struct ExecutorRef {
 
 /// Get a reference to the current running executor
 pub(super) fn get_executor_ref<'a>() -> Option<&'a ExecutorRef> {
-    EXECUTOR_CELL
-        .0
-        .get()
-        .map(|ptr| unsafe { &*ptr.as_ptr() })
+    EXECUTOR_CELL.0.get().map(|ptr| unsafe { &*ptr.as_ptr() })
 }
 
 struct Executor<'a, P>
@@ -107,8 +104,10 @@ where
         let result = {
             let mut future = CachedFutureTask::new(TaskPriority::Normal, future);
             executor.schedule(future.as_mut());
-            // TODO: event loop 
-            future.into_inner().expect("The provided future hit a deadlock")
+            // TODO: event loop
+            future
+                .into_inner()
+                .expect("The provided future hit a deadlock")
         };
 
         // store what was originally in the executor cell stack & ensure our context was popped.

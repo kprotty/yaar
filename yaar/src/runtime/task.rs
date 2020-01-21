@@ -1,23 +1,26 @@
 use super::get_executor_ref;
 use core::{
-    convert::{AsMut, AsRef},
+    convert::{AsMut, AsRef, TryInto},
     future::Future,
+    hint::unreachable_unchecked,
     marker::PhantomPinned,
     mem::{self, align_of, MaybeUninit},
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     pin::Pin,
     ptr::NonNull,
+    sync::atomic::{spin_loop_hint, AtomicUsize, Ordering},
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
+use yaar_lock::sync::{RawMutex, ThreadParker};
 
 macro_rules! field_parent_ptr {
-    ($type:ty, $field:ident, $ptr:expr) => ({
+    ($type:ty, $field:ident, $ptr:expr) => {{
         // TODO: A non-UB way of offsetof() on stable?
         let stub = MaybeUninit::<$type>::zeroed();
         let base = stub.as_ptr() as usize;
         let field = &(*stub.as_ptr()).$field as *const _ as usize;
         &mut *((($ptr) as usize - (field - base)) as *mut $type)
-    });
+    }};
 }
 
 /// Importance level of a task used to influence its scheduling delay.
@@ -50,14 +53,16 @@ pub struct Task {
 unsafe impl Send for Task {}
 
 impl Task {
-    /// Create a new task using the provided priority and a function to be called when resumed.
+    /// Create a new task using the provided priority
+    /// and a function to be called when resumed.
     ///
-    /// The resume function uses a pointer to the current task in order to continue execution.
-    /// It can be invoked manually through [`resume`]
+    /// The resume function uses a pointer to the current
+    /// task in order to continue execution. It can be
+    /// invoked manually through [`resume`].
     ///
     /// [`resume`]: struct.Task.html#method.resume
     pub fn new(priority: TaskPriority, resume: unsafe fn(*mut Self)) -> Self {
-        assert!(align_of::<Self>() > TaskPriority::MASK);
+        debug_assert!(align_of::<Self>() > TaskPriority::MASK);
         Self {
             next: priority as usize,
             resume,
@@ -95,7 +100,10 @@ impl Task {
             0 => TaskPriority::Low,
             1 => TaskPriority::Normal,
             2 => TaskPriority::High,
-            _ => unreachable!(),
+            _ => unsafe {
+                debug_assert!(false, "invalid TaskPriority");
+                unreachable_unchecked()
+            },
         }
     }
 
@@ -103,9 +111,9 @@ impl Task {
     /// This may be useful for implementing custom scheduling.
     ///
     /// # Safety
-    /// 
+    ///
     /// The caller should ensure that the task isn't already scheduled
-    /// onto the executor and that the resume function used to create 
+    /// onto the executor and that the resume function used to create
     /// the task is inheritly safe.
     #[inline]
     pub unsafe fn resume(&mut self) {
@@ -119,7 +127,7 @@ impl Task {
     /// # Safety
     ///
     /// As this interacts with executor internals directly, the caller
-    /// should uphold that the task's resume function is both safe to 
+    /// should uphold that the task's resume function is both safe to
     /// call and that the task has not been scheduled more than once
     /// before it's resume was called. If this were the case, the executor
     /// could call the resume function in paralell causing undefined behaviour.
@@ -302,6 +310,8 @@ pub fn yield_now(priority: TaskPriority) -> impl Future<Output = ()> {
                 return Poll::Ready(());
             }
 
+            // it is safe to get_unchecked_mut()/schedule() since
+            // the future is !Unpin and wont move.
             unsafe {
                 let this = self.get_unchecked_mut();
                 this.waker = Some(ctx.waker().clone());
@@ -337,7 +347,7 @@ pub fn run_blocking<T>(
 ) -> impl Future<Output = T> {
     // TODO
     unreachable!();
-    
+
     struct Stub<T>(T);
     impl<T> Future for Stub<T> {
         type Output = T;
@@ -346,4 +356,429 @@ pub fn run_blocking<T>(
         }
     }
     Stub(f())
+}
+
+/// Am intrusive linked list of [`Task`]s
+#[derive(Default)]
+struct LinkedList {
+    head: Option<NonNull<Task>>,
+    tail: Option<NonNull<Task>>,
+}
+
+impl LinkedList {
+    /// Pop one task from the front of the list.
+    pub fn pop<'a>(&mut self) -> Option<&'a mut Task> {
+        self.head.map(|task| {
+            let task = unsafe { &mut *task.as_ptr() };
+            self.head = task.next();
+            if self.head.is_none() {
+                self.tail = None;
+            }
+            task
+        })
+    }
+
+    /// Push an entire list at once to the back of this list
+    pub fn push(&mut self, list: Self) {
+        if let Some(mut tail) = self.tail {
+            unsafe { tail.as_mut().set_next(list.head) }
+        }
+        if self.head.is_none() {
+            self.head = list.head;
+        }
+        self.tail = list.tail;
+    }
+
+    /// Push an entire list at once to the front of this list
+    pub fn push_front(&mut self, list: Self) {
+        if let Some(mut tail) = list.tail {
+            unsafe { tail.as_mut().set_next(self.head) }
+        }
+        if self.tail.is_none() {
+            self.tail = list.tail;
+        }
+        self.head = list.head;
+    }
+}
+
+// A prioritized, intrusive linked list of [`Task`]s.
+#[derive(Default)]
+pub(super) struct TaskList {
+    front: LinkedList,
+    back: LinkedList,
+    size: usize,
+}
+
+impl TaskList {
+    /// Get the size of the task list
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Push the task to the internal list, ordering it based on it's priority
+    pub fn push(&mut self, task: &mut Task) {
+        task.set_next(None);
+        let list = LinkedList {
+            head: NonNull::new(task),
+            tail: NonNull::new(task),
+        };
+
+        self.size += 1;
+        match task.priority() {
+            TaskPriority::Low | TaskPriority::Normal => self.back.push(list),
+            TaskPriority::High => self.front.push(list),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct TaskInjector {
+    list: LinkedList,
+    size: usize,
+}
+
+impl TaskInjector {
+    pub fn push(&mut self, list: TaskList) {
+        let TaskList { front, back, size } = list;
+        if size != 0 {
+            self.list.push_front(front);
+            self.list.push(back);
+            self.size += size;
+        }
+    }
+
+    pub fn pop<'a>(
+        &mut self,
+        queue: &mut TaskQueue,
+        partitions: NonZeroUsize,
+        max: usize,
+    ) -> Option<&'a mut Task> {
+        if self.size == 0 {
+            return None;
+        }
+
+        // Safe to "unwrap()" since size should be guaranteed by push() above
+        let mut size = ((self.size / partitions.get()) + 1)
+            .max(max)
+            .max(TaskQueue::SIZE / 2);
+        debug_assert!(size != 0);
+        self.size -= size;
+        let task = self.list.pop();
+
+        // push all the other tasks without synchronization.
+        size -= 1;
+        if size != 0 {
+            let mut tail = queue.unsync_load_tail();
+            let mut head = queue.head().load(Ordering::Relaxed);
+            debug_assert_eq!(
+                tail.wrapping_sub(head),
+                0,
+                "Attempting to pop many from injector with a non-empty queue"
+            );
+
+            // move the batch of tasks into the provided queue
+            for _ in 0..size {
+                let task = match self.list.pop() {
+                    Some(task) => task,
+                    None => break,
+                };
+                match task.priority() {
+                    TaskPriority::Low | TaskPriority::Normal => {
+                        queue.tasks[(tail as usize) % TaskQueue::SIZE] = MaybeUninit::new(task);
+                        tail = tail.wrapping_add(1);
+                    }
+                    TaskPriority::High => {
+                        head = head.wrapping_sub(1);
+                        queue.tasks[(head as usize) % TaskQueue::SIZE] = MaybeUninit::new(task);
+                    }
+                }
+            }
+
+            // Make the new tasks in the queue available to itself & consumers
+            queue
+                .pos
+                .store(TaskQueue::to_pos(head, tail), Ordering::Release);
+        }
+
+        task
+    }
+}
+
+/// A Bounded Multi-Consumer Single-Producer Queue
+/// of tasks which supports batched stealing.
+pub(super) struct TaskQueue {
+    pos: AtomicUsize,
+    tasks: [MaybeUninit<*mut Task>; TaskQueue::SIZE],
+}
+
+#[cfg(target_pointer_width = "64")]
+type TaskQueueIndex = u32;
+#[cfg(target_pointer_width = "64")]
+type TaskQueueAtomicIndex = core::sync::atomic::AtomicU32;
+
+#[cfg(target_pointer_width = "32")]
+type TaskQueueIndex = u16;
+#[cfg(target_pointer_width = "32")]
+type TaskQueueAtomicIndex = core::sync::atomic::AtomicU16;
+
+impl TaskQueue {
+    /// The size of the TaskQueue ring buffer
+    pub const SIZE: usize = 256;
+
+    /// Get a reference to the atomic head index of the TaskQueue ring buffer
+    #[inline(always)]
+    pub fn head(&self) -> &TaskQueueAtomicIndex {
+        &self.indices()[0]
+    }
+
+    /// Get a reference to the atomic tail index of the TaskQueue ring buffer
+    #[inline(always)]
+    pub fn tail(&self) -> &TaskQueueAtomicIndex {
+        &self.indices()[1]
+    }
+
+    /// Split the atomic pos field into two for head & tail.
+    /// Safe to do since `pos` acts as a C union.
+    #[inline(always)]
+    fn indices(&self) -> &[TaskQueueAtomicIndex; 2] {
+        unsafe { &*(&self.pos as *const _ as *const _) }
+    }
+
+    /// Convert a head index and a tail index into a single value for `pos`.
+    pub fn to_pos(head: TaskQueueIndex, tail: TaskQueueIndex) -> usize {
+        unsafe { mem::transmute([head, tail]) }
+    }
+
+    /// Load the tail index without any synchronization.
+    /// Safe to do so since it requires ownership and other threads cannot modify the tail.
+    pub fn unsync_load_tail(&mut self) -> TaskQueueIndex {
+        let tail_ref = self.tail() as *const _ as *mut TaskQueueAtomicIndex;
+        unsafe { *(&mut *tail_ref).get_mut() }
+    }
+
+    /// Enqueue a task to the front or back of the ring buffer based on priority.
+    /// Overflows half of the queue into injector when full.
+    pub fn push<P: ThreadParker>(&mut self, task: &mut Task, injector: &RawMutex<TaskInjector, P>) {
+        match task.priority() {
+            TaskPriority::Low | TaskPriority::Normal => self.push_back(task, injector),
+            TaskPriority::High => self.push_front(task, injector),
+        }
+    }
+
+    /// Enqueue a task to the back of the ring buffer task queue
+    fn push_back<P: ThreadParker>(
+        &mut self,
+        task: &mut Task,
+        injector: &RawMutex<TaskInjector, P>,
+    ) {
+        loop {
+            // unsychronized loads for both since:
+            // - the tail is only modified by the queue owner
+            // - needs no write visibility (Acquire) to self.tasks
+            let tail = self.unsync_load_tail();
+            let head = self.head().load(Ordering::Relaxed);
+
+            // queue is not full, use Release to make self.tasks write available to stealers.
+            if (tail.wrapping_sub(head) as usize) < Self::SIZE {
+                self.tasks[(tail as usize) % Self::SIZE] = MaybeUninit::new(task);
+                self.tail().store(tail.wrapping_add(1), Ordering::Release);
+                return;
+            }
+
+            // queue is full, try to overflow into injector
+            if self.push_overflow(task, head, injector) {
+                return;
+            } else {
+                spin_loop_hint();
+            }
+        }
+    }
+
+    /// Enqueue a task to the front of the ring buffer task queue
+    fn push_front<P: ThreadParker>(
+        &mut self,
+        task: &mut Task,
+        injector: &RawMutex<TaskInjector, P>,
+    ) {
+        loop {
+            // unsynchronized load on the tail since only we can modify it,
+            // Relaxed load on the tail since not reading any self.tasks updates from other threads.
+            let tail = self.unsync_load_tail();
+            let head = self.head().load(Ordering::Relaxed);
+
+            // queue is not full, use Release to make self.tasks write available to stealers.
+            if (tail.wrapping_sub(head) as usize) < Self::SIZE {
+                let new_head = head.wrapping_sub(1);
+                self.tasks[(new_head as usize) % Self::SIZE] = MaybeUninit::new(task);
+                match self.head().compare_exchange_weak(
+                    head,
+                    new_head,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return,
+                    Err(_) => {
+                        spin_loop_hint();
+                        continue;
+                    }
+                }
+            }
+
+            // queue is full, try to overflow into injector
+            if self.push_overflow(task, head, injector) {
+                return;
+            } else {
+                spin_loop_hint();
+            }
+        }
+    }
+
+    /// Migrate half of the queue's tasks into the injector to free up local lots.
+    fn push_overflow<P: ThreadParker>(
+        &mut self,
+        task: &mut Task,
+        head: TaskQueueIndex,
+        injector: &RawMutex<TaskInjector, P>,
+    ) -> bool {
+        // the queue was full, try to move half of it to the injector
+        // Relaxed orderings since no changes to self.tasks can be observed
+        // (as we're the only producers).
+        let batch = Self::SIZE / 2;
+        if self
+            .head()
+            .compare_exchange_weak(
+                head,
+                head.wrapping_add(batch.try_into().unwrap()),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            spin_loop_hint();
+            return false;
+        }
+
+        // form a task list of the stolen tasks, prioritizing them internally.
+        let mut batch_list = TaskList::default();
+        batch_list.push(task);
+        for i in 0..batch {
+            let task = self.tasks[(head as usize).wrapping_add(i) % Self::SIZE];
+            batch_list.push(unsafe { &mut *task.assume_init() });
+        }
+
+        // submit them all as a list to the injector
+        injector.lock().push(batch_list);
+        true
+    }
+
+    /// Dequeue a task from the front of the ring buffer
+    pub fn pop<'a>(&mut self) -> Option<&'a mut Task> {
+        loop {
+            // unsynchronized tail load since only we can change it.
+            // Relaxed head load since not observing self.tasks changes as no thread can push.
+            let tail = self.unsync_load_tail();
+            let head = self.head().load(Ordering::Relaxed);
+
+            // the queue is empty
+            if tail.wrapping_sub(head) == 0 {
+                return None;
+            }
+
+            // try to consume & dequeue the task
+            let task = self.tasks[(head as usize) % Self::SIZE];
+            match self.head().compare_exchange_weak(
+                head,
+                head.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(unsafe { &mut *task.assume_init() }),
+                Err(_) => spin_loop_hint(),
+            }
+        }
+    }
+
+    /// Dequeue a task from the back of the ring buffer
+    pub fn pop_back<'a>(&mut self) -> Option<&'a mut Task> {
+        loop {
+            // unsynchronized tail load since only we can change it.
+            // Relaxed head load since no need to view self.tasks changes to head.
+            let tail = self.unsync_load_tail();
+            let head = self.head().load(Ordering::Relaxed);
+
+            // the queue is empty
+            if tail.wrapping_sub(head) == 0 {
+                return None;
+            }
+
+            // try to consume & dequeue the task from the tail
+            let new_tail = tail.wrapping_sub(1);
+            let task = self.tasks[(new_tail as usize) % Self::SIZE];
+            match self.pos.compare_exchange_weak(
+                Self::to_pos(head, tail),
+                Self::to_pos(head, new_tail),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(unsafe { &mut *task.assume_init() }),
+                Err(_) => spin_loop_hint(),
+            }
+        }
+    }
+
+    /// Steal a batch of tasks from the `other` into our own queue,
+    /// returning the first task stolen if any.
+    pub fn steal<'a>(&mut self, other: &Self) -> Option<&'a mut Task> {
+        let our_tail = self.unsync_load_tail();
+        let our_head = self.head().load(Ordering::Relaxed);
+        debug_assert_eq!(
+            our_tail.wrapping_sub(our_head),
+            0,
+            "Should only steal if queue is empty"
+        );
+
+        // Acquire loads to other's head & tail to observe other.task's writes.
+        loop {
+            let tail = other.tail().load(Ordering::Acquire);
+            let head = other.head().load(Ordering::Acquire);
+            let size = tail.wrapping_sub(head);
+            let mut batch = size - (size / 2);
+
+            // other's queue is empty
+            if batch == 0 {
+                return None;
+            }
+
+            // read a batch (half) of other's tasks into ours
+            for i in 0..batch {
+                let task = other.tasks[(head.wrapping_add(i) as usize) % Self::SIZE];
+                self.tasks[(our_tail.wrapping_add(i) as usize) % Self::SIZE] = task;
+            }
+
+            // try to commit the steal, use Relaxed since CAS acts as a release.
+            if other
+                .head()
+                .compare_exchange_weak(
+                    head,
+                    head.wrapping_add(batch),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                spin_loop_hint();
+                continue;
+            }
+
+            // make our stolen tasks available & return the last one
+            batch -= 1;
+            if batch != 0 {
+                self.tail()
+                    .store(our_tail.wrapping_add(batch), Ordering::Release);
+            }
+            let task = self.tasks[(our_tail.wrapping_add(batch) as usize) % Self::SIZE];
+            return Some(unsafe { &mut *task.assume_init() });
+        }
+    }
 }
