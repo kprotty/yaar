@@ -1,5 +1,5 @@
-use super::{CachedFutureTask, Platform, Task, TaskPriority};
-use core::{cell::Cell, future::Future, mem::MaybeUninit, num::NonZeroUsize, ptr::NonNull};
+use super::{CachedFutureTask, Platform, Task, TaskList, TaskInjector, TaskPriority, TaskQueue};
+use core::{cell::{Cell, RefCell}, future::Future, mem::MaybeUninit, num::NonZeroUsize, ptr::NonNull, sync::atomic::{Ordering, AtomicUsize}};
 use yaar_lock::sync::{RawMutex, ThreadParker};
 
 /// Run a future along with any other [`Task`]s it recursively spawns
@@ -63,6 +63,10 @@ where
 {
     platform: &'a P,
     workers: &'a [Worker],
+    stop_parker: P::Parker,
+    workers_idle: AtomicUsize,
+    workers_stealing: AtomicUsize,
+    injector: RawMutex<TaskInjector, P::Parker>,
     worker_pool: RawMutex<WorkerPool<'a, P>, P::Parker>,
 }
 
@@ -80,6 +84,10 @@ where
         let executor = Self {
             platform,
             workers,
+            stop_parker: P::Parker::default(),
+            workers_idle: AtomicUsize::new(0),
+            workers_stealing: AtomicUsize::new(0),
+            injector: RawMutex::new(TaskInjector::default()),
             worker_pool: RawMutex::new(WorkerPool {
                 max_threads: max_threads.get(),
                 free_threads: max_threads.get(),
@@ -104,7 +112,20 @@ where
         let result = {
             let mut future = CachedFutureTask::new(TaskPriority::Normal, future);
             executor.schedule(future.as_mut());
-            // TODO: event loop
+            
+            // prepare the workers & use the main thread to run one.
+            Thread::<'a, P>::run({
+                let mut pool = executor.worker_pool.lock();
+                for worker in executor.workers.iter() {
+                    worker.executor.set(&executor as *const _ as usize);
+                    pool.put_worker(&executor, worker);                    
+                }
+                pool.free_threads -= 1;
+                pool.find_worker(&executor).unwrap() as *const _ as usize
+            });
+
+            // wait for all threads to stop and return the future result
+            executor.stop_parker.park();
             future
                 .into_inner()
                 .expect("The provided future hit a deadlock")
@@ -116,7 +137,31 @@ where
         result
     }
 
-    fn schedule(&self, task: &mut Task) {}
+    fn schedule(&self, task: &mut Task) {
+        // TODO: thread-local worker scheduling
+    }
+
+    fn try_spawn_worker(&self) -> bool {
+        // only spawn a worker if there aren't any stealing workers
+        // already as they would steal the tasks meant for this one
+        if self.workers_stealing.compare_and_swap(0, 1, Ordering::Acquire) != 0 {
+            return false;
+        }
+
+        // try and spawn a new thread for an idle worker
+        let mut pool = self.worker_pool.lock();
+        if let Some(worker) = pool.find_worker(self) {
+            if pool.find_thread_for(self, worker) {
+                return true;
+            } else {
+                pool.put_worker(self, worker);
+            }
+        }
+
+        // failed to find a thread for the worker, fix the stealing count.
+        self.workers_stealing.fetch_sub(1, Ordering::Release);
+        false
+    }
 }
 
 struct WorkerPool<'a, P>
@@ -130,6 +175,61 @@ where
     idle_workers: Option<&'a Worker>,
 }
 
+impl<'a, P> WorkerPool<'a, P>
+where
+    P: Platform,
+    P::Parker: ThreadParker,
+{
+    /// Mark a worker as idle as it has no more work to run.
+    pub fn put_worker(&mut self, executor: &Executor<'a, P>, worker: &'a Worker) {
+        debug_assert!(!worker.has_pending_tasks());
+        let next = self
+            .idle_workers
+            .and_then(|w| NonNull::new(w as *const _ as *mut _));
+        worker.next.set(next);
+        self.idle_workers = Some(worker);
+        executor.workers_idle.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Find a free idle worker to use.
+    pub fn find_worker(&mut self, executor: &Executor<'a, P>) -> Option<&'a Worker> {
+        self.idle_workers.map(|worker| {
+            self.idle_workers = worker.next.get().map(|ptr| unsafe { &*ptr.as_ptr() });
+            executor.workers_idle.fetch_sub(1, Ordering::Relaxed);
+            worker
+        })
+    }
+
+    /// Mark a thread as idle as it lost it's worker and is waiting for work.
+    pub fn put_thread(&mut self, _executor: &Executor<'a, P>, thread: &'a Thread<'a, P>) {
+        thread.next.set(self.idle_threads);
+        self.idle_threads = Some(thread);
+    }
+
+    /// Find an idle thread to use to process work from a given worker.
+    pub fn find_thread_for(&mut self, executor: &Executor<'a, P>, worker: &'a Worker) -> bool {
+        // first, check the idle thread free list
+        if let Some(thread) = self.idle_threads {
+            self.idle_threads = thread.next.get();
+            thread.worker.set(Some(worker));
+            thread.parker.unpark();
+            return true;
+        }
+
+        // then, try to create a new thread using the executor underlying platform
+        if self.free_threads != 0 {
+            let worker = worker as *const Worker as usize;
+            if executor.platform.spawn_thread(worker, Thread::<'a, P>::run) {
+                self.free_threads -= 1;
+                return true;
+            }
+        }
+        
+        // failed to spawn a new thread for the worker
+        false
+    }
+}
+
 struct Thread<'a, P>
 where
     P: Platform,
@@ -137,10 +237,68 @@ where
 {
     next: Cell<Option<&'a Self>>,
     worker: Cell<Option<&'a Worker>>,
+    is_stealing: Cell<bool>,
     parker: P::Parker,
+}
+
+impl<'a, P: 'a> Thread<'a, P> 
+where
+    P: Platform,
+    P::Parker: ThreadParker,
+{
+    /// Run a task scheduling [`Worker`] from a usize pointer on our thread. 
+    pub extern "C" fn run(worker: usize) {
+        let worker = unsafe { &*(worker as *const Worker) };
+        let executor = unsafe { &*(worker.executor.get() as *const Executor<'a, P>) };
+
+        // allocate our thread structure on our stack
+        let this = Self {
+            next: Cell::new(None),
+            worker: Cell::new(Some(worker)),
+            is_stealing: Cell::new(executor.workers_stealing.load(Ordering::Relaxed) != 0),
+            parker: P::Parker::default(),
+        };
+
+        let mut step = 0;
+        while let Some(task) = this.poll(executor, step) {
+            // if we were the last worker thread to come out of spinning,
+            // start up a new spinning worker to eventually maximize distribution.
+            if this.is_stealing.replace(false) {
+                if executor.workers_stealing.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    let _ = executor.try_spawn_worker();
+                }
+            }
+
+            // execute the runnable task
+            step = step.wrapping_add(1);
+            unsafe { task.resume() };
+        }
+
+        // notify the executor that our thread is stopping.
+        // if we're the last thread, set the stop signal to end the executor.
+        let mut pool = executor.worker_pool.lock();
+        pool.free_threads += 1;
+        if pool.free_threads == pool.max_threads {
+            executor.stop_parker.unpark();
+        }
+    }
+
+    fn poll(&self, executor: &Executor<'a, P>, step: usize) -> Option<&'a mut Task> {
+        // TODO
+        None
+    }
 }
 
 #[derive(Default)]
 pub struct Worker {
-    next: usize,
+    next: Cell<Option<NonNull<Self>>>,
+    executor: Cell<usize>,
+    run_queue: RefCell<TaskQueue>,
+}
+
+impl Worker {
+    pub(super) fn has_pending_tasks(&self) -> bool {
+        // TODO: check timers
+        self.run_queue.borrow().len() != 0
+    }
 }

@@ -509,7 +509,16 @@ impl TaskInjector {
 /// of tasks which supports batched stealing.
 pub(super) struct TaskQueue {
     pos: AtomicUsize,
-    tasks: [MaybeUninit<*mut Task>; TaskQueue::SIZE],
+    tasks: [MaybeUninit<*mut Task>; Self::SIZE],
+}
+
+impl Default for TaskQueue {
+    fn default() -> Self {
+        Self {
+            pos: AtomicUsize::new(0),
+            tasks: [MaybeUninit::uninit(); Self::SIZE],
+        }
+    }
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -555,6 +564,13 @@ impl TaskQueue {
     pub fn unsync_load_tail(&mut self) -> TaskQueueIndex {
         let tail_ref = self.tail() as *const _ as *mut TaskQueueAtomicIndex;
         unsafe { *(&mut *tail_ref).get_mut() }
+    }
+
+    /// Returns the number of tasks in the queue
+    pub fn len(&self) -> usize {
+        let tail = self.tail().load(Ordering::Acquire);
+        let head = self.head().load(Ordering::Acquire);
+        tail.wrapping_sub(head) as usize
     }
 
     /// Enqueue a task to the front or back of the ring buffer based on priority.
