@@ -11,12 +11,13 @@ use core::{
 };
 
 macro_rules! field_parent_ptr {
-    ($type:ty, $field:ident, $ptr:expr) => {
+    ($type:ty, $field:ident, $ptr:expr) => ({
+        // TODO: A non-UB way of offsetof() on stable?
         let stub = MaybeUninit::<$type>::zeroed();
         let base = stub.as_ptr() as usize;
         let field = &(*stub.as_ptr()).$field as *const _ as usize;
         &mut *((($ptr) as usize - (field - base)) as *mut $type)
-    };
+    });
 }
 
 /// Importance level of a task used to influence its scheduling delay.
@@ -192,11 +193,7 @@ impl<F: Future> FutureTask<F> {
             future,
             task: Task::new(priority, |task_ptr| unsafe {
                 // To resume: using a ptr to task, find Self via offsetof() and poll() again.
-                // TODO: A non-UB way of offsetof() on stable?
-                let stub = MaybeUninit::<Self>::zeroed();
-                let base = stub.as_ptr() as usize;
-                let field = &(*stub.as_ptr()).task as *const _ as usize;
-                let this = &mut *((task_ptr as usize - (field - base)) as *mut Self);
+                let this = field_parent_ptr!(Self, task, task_ptr);
                 let _ = this.task.poll(Pin::new_unchecked(&mut this.future));
             }),
         }
@@ -271,11 +268,7 @@ impl<F: Future> CachedFutureTask<F> {
             output: None,
             future,
             task: Task::new(priority, |task_ptr| unsafe {
-                // see `FutureTask` above
-                let stub = MaybeUninit::<Self>::zeroed();
-                let base = stub.as_ptr() as usize;
-                let field = &(*stub.as_ptr()).task as *const _ as usize;
-                let this = &mut *((task_ptr as usize - (field - base)) as *mut Self);
+                let this = field_parent_ptr!(Self, task, task_ptr);
                 let _ = (&mut *task_ptr).poll(Pin::new_unchecked(this));
             }),
         }
@@ -324,11 +317,7 @@ pub fn yield_now(priority: TaskPriority) -> impl Future<Output = ()> {
         waker: None,
         yielded: false,
         task: Task::new(priority, |task_ptr| unsafe {
-            // see `FutureTask` above
-            let stub = MaybeUninit::<YieldFuture>::zeroed();
-            let base = stub.as_ptr() as usize;
-            let field = &(*stub.as_ptr()).task as *const _ as usize;
-            let this = &mut *((task_ptr as usize - (field - base)) as *mut YieldFuture);
+            let this = field_parent_ptr!(YieldFuture, task, task_ptr);
             mem::replace(&mut this.waker, None).unwrap().wake();
         }),
     }
