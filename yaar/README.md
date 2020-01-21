@@ -3,7 +3,7 @@ yaar
 [![Documentation](https://docs.rs/yaar/badge.svg)](https://docs.rs/yaar/)
 ====
 
-**Y**et **A**nother **A**synchronous **R**untime (yaar - pronounced "yaare/yah-are")
+**Y**et **A**nother **A**synchronous **R**untime (yaar)
 optimized around configuration and no_std. This crate is currently under development.
 
 ## Usage

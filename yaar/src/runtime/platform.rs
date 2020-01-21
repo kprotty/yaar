@@ -1,9 +1,8 @@
-#[cfg(any(feature = "io", feature = "time"))]
-use core::time::Duration;
 
 /// An interface for the runtime executor
-/// to perform any platform specific tasks.
+/// to interact with the underlying platform/system.
 pub trait Platform {
+    /// A [`yaar_lock::sync::ThreadParker`] used for runtime synchronization.
     type Parker;
 
     /// Each thread has a usize TLS slot associated with it.
@@ -21,25 +20,25 @@ pub trait Platform {
     /// Returns whether spawning thread was successful.
     fn spawn_thread(&self, parameter: usize, f: extern "C" fn(usize)) -> bool;
 
-    /// Get the current timestamp of the internal timer.
+    /// Get the current timestamp of the internal timer in milliseconds.
     ///
     /// Used for measuring elapsed time and waking expired tasks
     /// so it would be best if the underlying timer is monotonic.
     #[cfg(feature = "time")]
-    fn time_now(&self) -> Duration;
+    fn get_current_tick(&self) -> u64;
 
     /// Poll the internal IO service for ready futures,
     /// returning the number of futures that were woken up.
     ///
     /// `timeout` specifies a hint for the maximum amount of time the
     /// thread should spend blocking for futures to become ready.
-    /// 
+    ///
     /// A timeout of 0 indicates that the poll request shoudl strive
     /// to be non-blocking and return immediately. A timeout of `None`
     /// indicates that the poll request is free to blocking forever
     /// or as long as it wants until a future is woken up.
     #[cfg(feature = "io")]
-    fn io_poll(&self, timeout: Option<Duration>) -> usize;
+    fn poll_io(&self, timeout_ticks: Option<u64>) -> usize;
 }
 
 // TODO: OsPlatform
