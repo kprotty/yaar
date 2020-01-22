@@ -255,21 +255,26 @@ impl<'a, T> MutexGuard<'a, T> {
     /// by `lock`, however it can be much more efficient in the case where there
     /// are no waiting threads.
     #[inline]
-    pub fn bump(&'a mut self) -> FutureUnlock<'a, (), Self> {
-        // TODO: replace with self.lock.bump()
-        self.unlocked_fair(|| {})
+    pub fn bump(&'a mut self) -> MutexFutureBump<'a, Self> {
+        let lock = &self.mutex.lock;
+        MutexFutureBump {
+            lock,
+            _guard: self,
+            bumped: Cell::new(false),
+            wait_node: WaitNode::default(),
+        }
     }
 
     /// Temporarily unlocks the mutex to execute the given function.
     ///
     /// This is safe because `&mut` guarantees that there exist no other
     /// references to the data protected by the mutex.
-    pub fn unlocked<R: 'a>(&'a mut self, f: impl FnOnce() -> R + 'a) -> FutureUnlock<'a, R, Self> {
+    pub fn unlocked<R: 'a>(&'a mut self, f: impl FnOnce() -> R + 'a) -> MutexFutureUnlock<'a, R, Self> {
         let lock = &self.mutex.lock;
         if let Some(node) = lock.unlock_unfair() {
             wake_node(node);
         }
-        FutureUnlock {
+        MutexFutureUnlock {
             lock: lock,
             _guard: self,
             wait_node: WaitNode::default(),
@@ -286,12 +291,12 @@ impl<'a, T> MutexGuard<'a, T> {
     pub fn unlocked_fair<R: 'a>(
         &'a mut self,
         f: impl FnOnce() -> R + 'a,
-    ) -> FutureUnlock<'a, R, Self> {
+    ) -> MutexFutureUnlock<'a, R, Self> {
         let lock = &self.mutex.lock;
         if let Some(node) = lock.unlock_unfair() {
             wake_node(node);
         }
-        FutureUnlock {
+        MutexFutureUnlock {
             lock,
             _guard: self,
             wait_node: WaitNode::default(),
@@ -300,18 +305,54 @@ impl<'a, T> MutexGuard<'a, T> {
     }
 }
 
+/// Future used to yield the lock
+/// to another waiting future if any.
+pub struct MutexFutureBump<'a, M> {
+    bumped: Cell<bool>,
+    lock: &'a WordLock,
+    _guard: &'a mut M,
+    wait_node: WaitNode<Waker>,
+}
+
+unsafe impl<'a, M> Send for MutexFutureBump<'a, M> {}
+
+impl<'a, M> Future for MutexFutureBump<'a, M> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.bumped.get() {
+            self.bumped.set(true);
+            if let Some(waiting_node) = self.lock.bump(&self.wait_node, || ctx.waker().clone()) {
+                wake_node(waiting_node);
+                return Poll::Pending;
+            } else {
+                return Poll::Ready(())
+            }
+        }
+
+        if self.lock.lock(0, &self.wait_node, || ctx.waker().clone()) {
+            Poll::Ready(())
+        } else {
+            self.wait_node
+                .flags
+                .set(self.wait_node.flags.get() & !WAIT_NODE_INIT);
+            Poll::Pending
+        }
+    }
+}
+
 /// Future used to re-acquire the mutex
 /// from an `unlocked*` function in `MutexGuard*`
-pub struct FutureUnlock<'a, T, M> {
+pub struct MutexFutureUnlock<'a, T, M> {
     lock: &'a WordLock,
     _guard: &'a mut M,
     wait_node: WaitNode<Waker>,
     output: Cell<MaybeUninit<T>>,
 }
 
-unsafe impl<'a, T, M> Send for FutureUnlock<'a, T, M> {}
+unsafe impl<'a, T, M> Send for MutexFutureUnlock<'a, T, M> {}
 
-impl<'a, T, M> Future for FutureUnlock<'a, T, M> {
+impl<'a, T, M> Future for MutexFutureUnlock<'a, T, M> {
     type Output = T;
 
     // After acquiring the mutex, return the output by consuming it.
