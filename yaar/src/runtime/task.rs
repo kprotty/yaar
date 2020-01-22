@@ -247,7 +247,7 @@ impl<F: Future> AsMut<Task> for CachedFutureTask<F> {
 impl<F: Future> Future for CachedFutureTask<F> {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, _ctx: &mut Context<'_>) -> Poll<Self::Output> {
         // return ready if the output has already been cached/consumed.
         if self.output.is_some() {
             return Poll::Ready(());

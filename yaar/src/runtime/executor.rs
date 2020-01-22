@@ -1,5 +1,12 @@
-use super::{CachedFutureTask, Platform, Task, TaskList, TaskInjector, TaskPriority, TaskQueue};
-use core::{cell::{Cell, RefCell}, future::Future, mem::MaybeUninit, num::NonZeroUsize, ptr::NonNull, sync::atomic::{Ordering, AtomicUsize}};
+use super::{CachedFutureTask, Platform, Task, TaskInjector, TaskList, TaskPriority, TaskQueue};
+use core::{
+    cell::{Cell, RefCell},
+    future::Future,
+    mem::MaybeUninit,
+    num::NonZeroUsize,
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use yaar_lock::sync::{RawMutex, ThreadParker};
 
 /// Run a future along with any other [`Task`]s it recursively spawns
@@ -112,13 +119,13 @@ where
         let result = {
             let mut future = CachedFutureTask::new(TaskPriority::Normal, future);
             executor.schedule(future.as_mut());
-            
+
             // prepare the workers & use the main thread to run one.
             Thread::<'a, P>::run({
                 let mut pool = executor.worker_pool.lock();
                 for worker in executor.workers.iter() {
                     worker.executor.set(&executor as *const _ as usize);
-                    pool.put_worker(&executor, worker);                    
+                    pool.put_worker(&executor, worker);
                 }
                 pool.free_threads -= 1;
                 pool.find_worker(&executor).unwrap() as *const _ as usize
@@ -138,13 +145,31 @@ where
     }
 
     fn schedule(&self, task: &mut Task) {
-        // TODO: thread-local worker scheduling
+        // Try to push to the current worker from thread-local storage
+        NonNull::new(self.platform.get_tls() as *mut Thread<'a, P>)
+            .and_then(|ptr| unsafe { (&*ptr.as_ptr()).worker.get() })
+            .map(|worker| worker.run_queue.borrow_mut().push(task, &self.injector))
+            // No worker available, just push to global queue / injector
+            .unwrap_or_else(|| {
+                let mut list = TaskList::default();
+                list.push(task);
+                self.injector.lock().push(list);
+            });
+
+        // spawn a new worker to potentially handle this new task
+        if self.workers_stealing.load(Ordering::Acquire) == 0 {
+            let _ = self.try_spawn_worker();
+        }
     }
 
     fn try_spawn_worker(&self) -> bool {
         // only spawn a worker if there aren't any stealing workers
         // already as they would steal the tasks meant for this one
-        if self.workers_stealing.compare_and_swap(0, 1, Ordering::Acquire) != 0 {
+        if self
+            .workers_stealing
+            .compare_and_swap(0, 1, Ordering::Acquire)
+            != 0
+        {
             return false;
         }
 
@@ -224,7 +249,7 @@ where
                 return true;
             }
         }
-        
+
         // failed to spawn a new thread for the worker
         false
     }
@@ -241,12 +266,12 @@ where
     parker: P::Parker,
 }
 
-impl<'a, P: 'a> Thread<'a, P> 
+impl<'a, P: 'a> Thread<'a, P>
 where
     P: Platform,
     P::Parker: ThreadParker,
 {
-    /// Run a task scheduling [`Worker`] from a usize pointer on our thread. 
+    /// Run a task scheduling [`Worker`] from a usize pointer on our thread.
     pub extern "C" fn run(worker: usize) {
         let worker = unsafe { &*(worker as *const Worker) };
         let executor = unsafe { &*(worker.executor.get() as *const Executor<'a, P>) };
@@ -260,11 +285,12 @@ where
         };
 
         let mut step = 0;
+        executor.platform.set_tls(&this as *const Self as usize);
         while let Some(task) = this.poll(executor, step) {
             // if we were the last worker thread to come out of spinning,
             // start up a new spinning worker to eventually maximize distribution.
             if this.is_stealing.replace(false) {
-                if executor.workers_stealing.fetch_sub(1, Ordering::Relaxed) == 1 {
+                if executor.workers_stealing.fetch_sub(1, Ordering::Release) == 1 {
                     let _ = executor.try_spawn_worker();
                 }
             }
