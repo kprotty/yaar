@@ -2,8 +2,8 @@ use super::{CachedFutureTask, Platform, Task, TaskInjector, TaskList, TaskPriori
 use core::{
     cell::{Cell, RefCell},
     future::Future,
-    mem::MaybeUninit,
-    num::NonZeroUsize,
+    mem::{drop, MaybeUninit},
+    num::{NonZeroU64, NonZeroUsize},
     ptr::NonNull,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -301,17 +301,160 @@ where
         }
 
         // notify the executor that our thread is stopping.
-        // if we're the last thread, set the stop signal to end the executor.
         let mut pool = executor.worker_pool.lock();
         pool.free_threads += 1;
+
+        // if we're the last thread, wake up any idle threads to
+        // stop them as well then set the stop signal to end the executor.
         if pool.free_threads == pool.max_threads {
+            while let Some(thread) = pool.idle_threads {
+                pool.idle_threads = thread.next.get();
+                thread.worker.set(None);
+                thread.parker.unpark();
+            }
             executor.stop_parker.unpark();
         }
     }
 
-    fn poll(&self, executor: &Executor<'a, P>, step: usize) -> Option<&'a mut Task> {
-        // TODO
-        None
+    /// Poll the entire executor for a new runnable task, returns None if there arent any.
+    fn poll<'t>(&self, executor: &'a Executor<'a, P>, step: usize) -> Option<&'t mut Task> {
+        'poll: loop {
+            // can only poll for work if we have a worker
+            let our_worker = match self.worker.get() {
+                Some(worker) => worker,
+                None => return None,
+            };
+
+            // Try to find a runnable task throughout the system
+            let mut wait_time = None;
+            if let Some(task) = Self::poll_timers(our_worker, &mut wait_time)
+                .or_else(|| Self::poll_local(executor, our_worker, step))
+                .or_else(|| Self::poll_global(executor, our_worker, 1))
+                .or_else(|| Self::poll_io(executor, Some(0), self))
+                .or_else(|| Self::poll_workers(executor, our_worker, self))
+                .or_else(|| Self::poll_global(executor, our_worker, !0))
+            {
+                return Some(task);
+            }
+
+            // Give up our worker since we couldn't find any work in the system
+            self.worker.set(None);
+            executor.worker_pool.lock().put_worker(executor, our_worker);
+
+            // Drop the stealing count with full barrier, then check all run queues again.
+            // Doing it the other way around means a thread could schedule a task after we
+            // checked all run queues but before we stopped stealing; possibly resulting
+            // in no thread being woken up to handle that new task.
+            //
+            // After this point, if a new task is discovered below, we need to restore
+            // our spinning state in order to wake up another worker thread after our
+            // poll() inside Self::run().
+            let was_stealing = self.is_stealing.get();
+            if was_stealing {
+                self.is_stealing.set(false);
+                executor.workers_stealing.fetch_sub(1, Ordering::AcqRel);
+            }
+
+            // Check all run queues again
+            for worker in executor.workers.iter() {
+                if worker.has_pending_tasks() {
+                    if let Some(worker) = executor.worker_pool.lock().find_worker(executor) {
+                        self.worker.set(Some(worker));
+                        if was_stealing {
+                            self.is_stealing.set(true);
+                            executor.workers_stealing.fetch_add(1, Ordering::Release);
+                        }
+                        continue 'poll;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // try to poll for io by blocking (acquires a worker if without one)
+            if let Some(task) = Self::poll_io(executor, wait_time.map(|t| t.get()), self) {
+                if was_stealing {
+                    self.is_stealing.set(true);
+                    executor.workers_stealing.fetch_add(1, Ordering::Release);
+                }
+                return Some(task);
+            }
+
+            // if blocking for poll didnt find any tasks, but theres a wait_time
+            // then a timer may have expired. Grab a worker to try and see.
+            if wait_time.is_some() {
+                if let Some(worker) = executor.worker_pool.lock().find_worker(executor) {
+                    self.worker.set(Some(worker));
+                    if was_stealing {
+                        self.is_stealing.set(true);
+                        executor.workers_stealing.fetch_add(1, Ordering::Release);
+                    }
+                    continue 'poll;
+                }
+            }
+
+            // There is no work in the system and another thread is polling for io.
+            // We lost our worker, so move to the idle queue and wait to be woken up
+            // with a possibly new worker to process tasks again.
+            //
+            // Need to extend our thread's lifetime to that of the executor since
+            // our thread is allocated on our stack and doesnt form a regional heirarchy.
+            let self_ref = unsafe { &*(self as *const Self) };
+            executor.worker_pool.lock().put_thread(executor, self_ref);
+            self.parker.park();
+            self.parker.reset();
+            continue 'poll;
+        }
+    }
+
+    /// Check timers for runnable tasks.
+    /// Updates the wait_time to the amount of ticks until
+    /// a timer expires if any or leaves it as `None`.
+    fn poll_timers<'t>(
+        worker: &'a Worker,
+        wait_time: &mut Option<NonZeroU64>,
+    ) -> Option<&'t mut Task> {
+        None // TODO
+    }
+
+    /// Check the worker's local queue for tasks,
+    /// polling also the global injector for eventual faireness.
+    fn poll_local<'t>(
+        executor: &'a Executor<'a, P>,
+        worker: &'a Worker,
+        step: usize,
+    ) -> Option<&'t mut Task> {
+        None // TODO
+    }
+
+    /// Check the global injector queue for tasks,
+    /// grabbing a batch into the worker's local queue when possible.
+    fn poll_global<'t>(
+        executor: &'a Executor<'a, P>,
+        worker: &'a Worker,
+        max_batch: usize,
+    ) -> Option<&'t mut Task> {
+        None // TODO
+    }
+
+    /// Poll for IO, blocking for `timoeut` ticks until a task is ready'd.
+    /// Passing `None` for timeout blocks indefinitely for a task.
+    /// If a thread has lost its worker, this function attempts to find one for it.
+    fn poll_io<'t>(
+        executor: &'a Executor<'a, P>,
+        timeout: Option<u64>,
+        thread: &Self,
+    ) -> Option<&'t mut Task> {
+        None // TODO
+    }
+
+    /// Check the run queues from other workers and try to steal from them (Work Stealing).
+    fn poll_workers<'t>(
+        executor: &'a Executor<'a, P>,
+        worker: &'a Worker,
+        thread: &Self,
+    ) -> Option<&'t mut Task> {
+        None // TODO
     }
 }
 

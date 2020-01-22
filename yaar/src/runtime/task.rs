@@ -351,7 +351,7 @@ pub fn run_blocking<T>(
     struct Stub<T>(T);
     impl<T> Future for Stub<T> {
         type Output = T;
-        fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        fn poll(self: Pin<&mut Self>, _ctx: &mut Context<'_>) -> Poll<Self::Output> {
             Poll::Pending
         }
     }
