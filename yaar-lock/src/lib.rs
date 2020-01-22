@@ -8,6 +8,8 @@
 //! - `futures`: exposes synchronization primitives backed by futures.
 #![no_std]
 
+mod shared;
+
 #[cfg(feature = "sync")]
 pub mod sync;
 
