@@ -1,6 +1,6 @@
 use super::{CachedFutureTask, Platform, Task, TaskPriority};
 use core::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     convert::TryInto,
     future::Future,
     mem::{transmute, MaybeUninit},
@@ -149,7 +149,7 @@ where
         // Try to push to the current worker from thread-local storage
         NonNull::new(self.platform.get_tls() as *mut Thread<'a, P>)
             .and_then(|ptr| unsafe { (&*ptr.as_ptr()).worker.get() })
-            .map(|worker| worker.run_queue.borrow_mut().push(task, &self.injector))
+            .map(|worker| worker.run_queue.push(task, &self.injector))
             // No worker available, just push to global queue / injector
             .unwrap_or_else(|| {
                 let mut list = TaskList::default();
@@ -164,11 +164,14 @@ where
     }
 
     fn try_spawn_worker(&self) -> bool {
-        // only spawn a worker if there aren't any stealing workers
-        // already as they would steal the tasks meant for this one
+        // Only spawn a worker if there aren't any stealing workers
+        // already as they would steal the tasks meant for this one.
+        // 
+        // AcqRel to observe any task steals from other threads when
+        // bumping the worker stealing count.
         if self
             .workers_stealing
-            .compare_and_swap(0, 1, Ordering::Acquire)
+            .compare_and_swap(0, 1, Ordering::AcqRel)
             != 0
         {
             return false;
@@ -463,13 +466,13 @@ where
 pub struct Worker {
     next: Cell<Option<NonNull<Self>>>,
     executor: Cell<usize>,
-    run_queue: RefCell<TaskQueue>,
+    run_queue: TaskQueue,
 }
 
 impl Worker {
     pub(super) fn has_pending_tasks(&self) -> bool {
         // TODO: check timers
-        self.run_queue.borrow().len() != 0
+        self.run_queue.len() != 0
     }
 }
 
@@ -565,7 +568,7 @@ impl TaskInjector {
 
     pub fn pop<'a>(
         &mut self,
-        queue: &mut TaskQueue,
+        queue: &TaskQueue,
         partitions: NonZeroUsize,
         max: usize,
     ) -> Option<&'a mut Task> {
@@ -584,7 +587,7 @@ impl TaskInjector {
         // push all the other tasks without synchronization.
         size -= 1;
         if size != 0 {
-            let mut tail = queue.unsync_load_tail();
+            let mut tail = queue.tail().load(Ordering::Relaxed);
             let mut head = queue.head().load(Ordering::Relaxed);
             debug_assert_eq!(
                 tail.wrapping_sub(head),
@@ -600,12 +603,12 @@ impl TaskInjector {
                 };
                 match task.priority() {
                     TaskPriority::Low | TaskPriority::Normal => {
-                        queue.tasks[(tail as usize) % TaskQueue::SIZE] = MaybeUninit::new(task);
+                        queue.tasks[(tail as usize) % TaskQueue::SIZE].set(MaybeUninit::new(task));
                         tail = tail.wrapping_add(1);
                     }
                     TaskPriority::High => {
                         head = head.wrapping_sub(1);
-                        queue.tasks[(head as usize) % TaskQueue::SIZE] = MaybeUninit::new(task);
+                        queue.tasks[(head as usize) % TaskQueue::SIZE].set(MaybeUninit::new(task));
                     }
                 }
             }
@@ -624,16 +627,7 @@ impl TaskInjector {
 /// of tasks which supports batched stealing.
 struct TaskQueue {
     pos: AtomicUsize,
-    tasks: [MaybeUninit<*mut Task>; Self::SIZE],
-}
-
-impl Default for TaskQueue {
-    fn default() -> Self {
-        Self {
-            pos: AtomicUsize::new(0),
-            tasks: [MaybeUninit::uninit(); Self::SIZE],
-        }
-    }
+    tasks: [Cell<MaybeUninit<*mut Task>>; Self::SIZE],
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -646,39 +640,47 @@ type TaskQueueIndex = u16;
 #[cfg(target_pointer_width = "32")]
 type TaskQueueAtomicIndex = core::sync::atomic::AtomicU16;
 
+impl Default for TaskQueue {
+    fn default() -> Self {
+        Self {
+            pos: AtomicUsize::new(0),
+            // Cell<MaybeUninit<*mut Task>> doesn't implement Copy & too large for Default::default()
+            tasks: unsafe {
+                let mut tasks = MaybeUninit::<[Cell<MaybeUninit<*mut Task>>; Self::SIZE]>::uninit();
+                for i in 0..Self::SIZE {
+                    (&mut *tasks.as_mut_ptr())[i] = Cell::new(MaybeUninit::uninit());
+                }
+                tasks.assume_init()
+            },
+        }
+    }
+}
+
 impl TaskQueue {
-    /// The size of the TaskQueue ring buffer
+    /// The size of the TaskQueue ring buffer.
     pub const SIZE: usize = 256;
 
-    /// Get a reference to the atomic head index of the TaskQueue ring buffer
+    /// Get a reference to the atomic head index of the TaskQueue ring buffer.
     #[inline(always)]
     pub fn head(&self) -> &TaskQueueAtomicIndex {
-        &self.indices()[0]
+        &self.pos_index()[0]
     }
 
-    /// Get a reference to the atomic tail index of the TaskQueue ring buffer
+    /// Get a reference to the atomic tail index of the TaskQueue ring buffer.
     #[inline(always)]
     pub fn tail(&self) -> &TaskQueueAtomicIndex {
-        &self.indices()[1]
+        &self.pos_index()[1]
     }
 
-    /// Split the atomic pos field into two for head & tail.
-    /// Safe to do since `pos` acts as a C union.
+    /// Split the atomic usize pos into two atomic indexes for head & tail.
     #[inline(always)]
-    fn indices(&self) -> &[TaskQueueAtomicIndex; 2] {
+    fn pos_index(&self) -> &[TaskQueueAtomicIndex; 2] {
         unsafe { &*(&self.pos as *const _ as *const _) }
     }
 
     /// Convert a head index and a tail index into a single value for `pos`.
     pub fn to_pos(head: TaskQueueIndex, tail: TaskQueueIndex) -> usize {
         unsafe { transmute([head, tail]) }
-    }
-
-    /// Load the tail index without any synchronization.
-    /// Safe to do so since it requires ownership and other threads cannot modify the tail.
-    pub fn unsync_load_tail(&mut self) -> TaskQueueIndex {
-        let tail_ref = self.tail() as *const _ as *mut TaskQueueAtomicIndex;
-        unsafe { *(&mut *tail_ref).get_mut() }
     }
 
     /// Returns the number of tasks in the queue
@@ -690,7 +692,9 @@ impl TaskQueue {
 
     /// Enqueue a task to the front or back of the ring buffer based on priority.
     /// Overflows half of the queue into injector when full.
-    pub fn push<P: ThreadParker>(&mut self, task: &mut Task, injector: &RawMutex<TaskInjector, P>) {
+    ///
+    /// Should only be called by the single producer thread.
+    pub fn push<P: ThreadParker>(&self, task: &mut Task, injector: &RawMutex<TaskInjector, P>) {
         match task.priority() {
             TaskPriority::Low | TaskPriority::Normal => self.push_back(task, injector),
             TaskPriority::High => self.push_front(task, injector),
@@ -699,20 +703,20 @@ impl TaskQueue {
 
     /// Enqueue a task to the back of the ring buffer task queue
     fn push_back<P: ThreadParker>(
-        &mut self,
+        &self,
         task: &mut Task,
         injector: &RawMutex<TaskInjector, P>,
     ) {
         loop {
-            // unsychronized loads for both since:
+            // Relaxed loads for both since:
             // - the tail is only modified by the queue owner
             // - needs no write visibility (Acquire) to self.tasks
-            let tail = self.unsync_load_tail();
+            let tail = self.tail().load(Ordering::Relaxed);
             let head = self.head().load(Ordering::Relaxed);
 
             // queue is not full, use Release to make self.tasks write available to stealers.
             if (tail.wrapping_sub(head) as usize) < Self::SIZE {
-                self.tasks[(tail as usize) % Self::SIZE] = MaybeUninit::new(task);
+                self.tasks[(tail as usize) % Self::SIZE].set(MaybeUninit::new(task));
                 self.tail().store(tail.wrapping_add(1), Ordering::Release);
                 return;
             }
@@ -728,20 +732,20 @@ impl TaskQueue {
 
     /// Enqueue a task to the front of the ring buffer task queue
     fn push_front<P: ThreadParker>(
-        &mut self,
+        &self,
         task: &mut Task,
         injector: &RawMutex<TaskInjector, P>,
     ) {
         loop {
-            // unsynchronized load on the tail since only we can modify it,
+            // Relaxed load on the tail since only we can modify it,
             // Relaxed load on the tail since not reading any self.tasks updates from other threads.
-            let tail = self.unsync_load_tail();
+            let tail = self.tail().load(Ordering::Relaxed);
             let head = self.head().load(Ordering::Relaxed);
 
             // queue is not full, use Release to make self.tasks write available to stealers.
             if (tail.wrapping_sub(head) as usize) < Self::SIZE {
                 let new_head = head.wrapping_sub(1);
-                self.tasks[(new_head as usize) % Self::SIZE] = MaybeUninit::new(task);
+                self.tasks[(new_head as usize) % Self::SIZE].set(MaybeUninit::new(task));
                 match self.head().compare_exchange_weak(
                     head,
                     new_head,
@@ -767,7 +771,7 @@ impl TaskQueue {
 
     /// Migrate half of the queue's tasks into the injector to free up local lots.
     fn push_overflow<P: ThreadParker>(
-        &mut self,
+        &self,
         task: &mut Task,
         head: TaskQueueIndex,
         injector: &RawMutex<TaskInjector, P>,
@@ -794,7 +798,7 @@ impl TaskQueue {
         let mut batch_list = TaskList::default();
         batch_list.push(task);
         for i in 0..batch {
-            let task = self.tasks[(head as usize).wrapping_add(i) % Self::SIZE];
+            let task = self.tasks[(head as usize).wrapping_add(i) % Self::SIZE].get();
             batch_list.push(unsafe { &mut *task.assume_init() });
         }
 
@@ -804,11 +808,13 @@ impl TaskQueue {
     }
 
     /// Dequeue a task from the front of the ring buffer
-    pub fn pop<'a>(&mut self) -> Option<&'a mut Task> {
+    ///
+    /// Should only be called by the single producer thread.
+    pub fn pop<'a>(&self) -> Option<&'a mut Task> {
         loop {
-            // unsynchronized tail load since only we can change it.
+            // Relaxed tail load since only we can change it.
             // Relaxed head load since not observing self.tasks changes as no thread can push.
-            let tail = self.unsync_load_tail();
+            let tail = self.tail().load(Ordering::Relaxed);
             let head = self.head().load(Ordering::Relaxed);
 
             // the queue is empty
@@ -817,7 +823,7 @@ impl TaskQueue {
             }
 
             // try to consume & dequeue the task
-            let task = self.tasks[(head as usize) % Self::SIZE];
+            let task = self.tasks[(head as usize) % Self::SIZE].get();
             match self.head().compare_exchange_weak(
                 head,
                 head.wrapping_add(1),
@@ -831,11 +837,13 @@ impl TaskQueue {
     }
 
     /// Dequeue a task from the back of the ring buffer
-    pub fn pop_back<'a>(&mut self) -> Option<&'a mut Task> {
+    ///
+    /// Should only be called by the single producer thread.
+    pub fn pop_back<'a>(&self) -> Option<&'a mut Task> {
         loop {
-            // unsynchronized tail load since only we can change it.
+            // Relaxed tail load since only we can change it.
             // Relaxed head load since no need to view self.tasks changes to head.
-            let tail = self.unsync_load_tail();
+            let tail = self.tail().load(Ordering::Relaxed);
             let head = self.head().load(Ordering::Relaxed);
 
             // the queue is empty
@@ -845,7 +853,7 @@ impl TaskQueue {
 
             // try to consume & dequeue the task from the tail
             let new_tail = tail.wrapping_sub(1);
-            let task = self.tasks[(new_tail as usize) % Self::SIZE];
+            let task = self.tasks[(new_tail as usize) % Self::SIZE].get();
             match self.pos.compare_exchange_weak(
                 Self::to_pos(head, tail),
                 Self::to_pos(head, new_tail),
@@ -860,8 +868,8 @@ impl TaskQueue {
 
     /// Steal a batch of tasks from the `other` into our own queue,
     /// returning the first task stolen if any.
-    pub fn steal<'a>(&mut self, other: &Self) -> Option<&'a mut Task> {
-        let our_tail = self.unsync_load_tail();
+    pub fn steal<'a>(&self, other: &Self) -> Option<&'a mut Task> {
+        let our_tail = self.tail().load(Ordering::Relaxed);
         let our_head = self.head().load(Ordering::Relaxed);
         debug_assert_eq!(
             our_tail.wrapping_sub(our_head),
@@ -883,8 +891,8 @@ impl TaskQueue {
 
             // read a batch (half) of other's tasks into ours
             for i in 0..batch {
-                let task = other.tasks[(head.wrapping_add(i) as usize) % Self::SIZE];
-                self.tasks[(our_tail.wrapping_add(i) as usize) % Self::SIZE] = task;
+                let task = other.tasks[(head.wrapping_add(i) as usize) % Self::SIZE].get();
+                self.tasks[(our_tail.wrapping_add(i) as usize) % Self::SIZE].set(task);
             }
 
             // try to commit the steal, use Relaxed since CAS acts as a release.
@@ -908,7 +916,7 @@ impl TaskQueue {
                 self.tail()
                     .store(our_tail.wrapping_add(batch), Ordering::Release);
             }
-            let task = self.tasks[(our_tail.wrapping_add(batch) as usize) % Self::SIZE];
+            let task = self.tasks[(our_tail.wrapping_add(batch) as usize) % Self::SIZE].get();
             return Some(unsafe { &mut *task.assume_init() });
         }
     }

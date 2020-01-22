@@ -5,13 +5,13 @@ use core::{
     hint::unreachable_unchecked,
     marker::PhantomPinned,
     mem::{self, align_of, MaybeUninit},
-    num::{NonZeroU64, NonZeroUsize},
+    num::NonZeroU64,
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
-use yaar_lock::sync::{RawMutex, ThreadParker};
 
+/// Given a pointer to the field, get the parent struct pointer.
 macro_rules! field_parent_ptr {
     ($type:ty, $field:ident, $ptr:expr) => {{
         // TODO: A non-UB way of offsetof() on stable?
