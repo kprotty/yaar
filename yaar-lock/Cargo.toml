@@ -14,9 +14,14 @@ Fast, no_std synchronization primitives.
 
 [features]
 default = ["os", "sync", "futures"]
-os = ["libc", "winapi"]
 sync = ["lock_api"]
 futures = []
+os = [
+    "libc",
+    "winapi/winbase",
+    "winapi/handleapi",
+    "winapi/libloaderapi",
+]
 
 [dependencies.lock_api]
 optional = true
@@ -31,11 +36,6 @@ default-features = false
 optional = true
 version = "0.3"
 default-features = false
-features = [
-    "winbase",
-    "handleapi",
-    "libloaderapi",
-]
 
 [lib]
 name = "yaar_lock"

@@ -6,9 +6,15 @@ use core::{
     sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
 };
 
+/// Flag on WaitNode indicating that the waker was initialized.
 pub const WAIT_NODE_INIT: u8 = 1 << 0;
+
+/// Flag on WaitNode indicating that the previous lock holder
+/// moved ownership of the lock to our node.
 pub const WAIT_NODE_HANDOFF: u8 = 1 << 2;
 
+/// Intrusive linked list node representing a suspended
+/// unit of execution waiting for a lock to be released.
 pub struct WaitNode<Waker> {
     pub prev: Cell<MaybeUninit<*const Self>>,
     pub next: Cell<MaybeUninit<*const Self>>,
@@ -18,6 +24,19 @@ pub struct WaitNode<Waker> {
     _pinned: PhantomPinned,
 }
 
+/// Make sure to drop the waker if it
+/// somehow remains alive after being waken.
+impl<Waker> Drop for WaitNode<Waker> {
+    fn drop(&mut self) {
+        if self.flags.get() & WAIT_NODE_INIT != 0 {
+            let waker = self.waker.replace(MaybeUninit::uninit());
+            mem::drop(unsafe { waker.assume_init() });
+        }
+    }
+}
+
+/// Use `MaybeUninit::uninit()` to initialize the fields
+/// as it optimizes away the memory writes for fast paths.
 impl<Waker> Default for WaitNode<Waker> {
     fn default() -> Self {
         Self {
@@ -32,6 +51,18 @@ impl<Waker> Default for WaitNode<Waker> {
 }
 
 impl<Waker> WaitNode<Waker> {
+    /// Given the head of the queue of waiting nodes, find the tail node.
+    ///
+    /// The first node to enter the queue will set its tail to itself.
+    /// Later node entries in the queue then set their tail to null.
+    ///
+    /// By starting from the head pointer and following the next links,
+    /// we can eventually find the tail of the queue while settting the
+    /// previous links of nodes we pass to form a doubly-linked list.
+    ///
+    /// The tail of the queue is then cached on the head so that subsequent
+    /// tail lookups dont have to scan through as many nodes since the head
+    /// node will be reached much earlier.
     fn find_tail<'a>(&self) -> &'a Self {
         unsafe {
             let mut current = self;
@@ -54,6 +85,9 @@ const MUTEX_LOCK: usize = 1 << 0;
 const QUEUE_LOCK: usize = 1 << 1;
 const QUEUE_MASK: usize = !(MUTEX_LOCK | QUEUE_LOCK);
 
+/// Adapted [`WordLock`] algorithm from parking_lot.
+///
+/// [`WordLock`]: https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
 pub struct WordLock {
     state: AtomicUsize,
 }
@@ -65,6 +99,7 @@ impl WordLock {
         }
     }
 
+    /// Fast-path acquire of the lock.
     #[inline]
     pub fn try_lock(&self) -> bool {
         self.state
@@ -85,14 +120,14 @@ impl WordLock {
         let flags = wait_node.flags.get();
         (flags & WAIT_NODE_HANDOFF != 0)
             || self.try_lock()
-            || self.lock_slow(
-                flags,
-                max_spin_doubling,
-                wait_node,
-                MaybeUninit::new(new_waker),
-            )
+            || self.lock_slow(flags, max_spin_doubling, wait_node, MaybeUninit::new(new_waker))
     }
 
+    /// Slow path for mutex locking.
+    ///
+    /// Returns true if acquiring the mutex succeeded.
+    /// Returns false if it failed to acquire the mutex
+    /// and the wait_node is in the wait queue.
     #[cold]
     fn lock_slow<F, Parker>(
         &self,
@@ -104,10 +139,13 @@ impl WordLock {
     where
         F: FnOnce() -> Parker,
     {
+        // spin on the state, trying to either acquire the lock
+        // or enqueue ourselves into the waiting queue.
         let mut spin = 0;
         let is_waiting = flags & WAIT_NODE_INIT != 0;
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
+            // try to acquire the lock if its unlocked
             if state & MUTEX_LOCK == 0 {
                 match self.state.compare_exchange_weak(
                     state,
@@ -121,10 +159,13 @@ impl WordLock {
                 continue;
             }
 
+            // should park since its already in the queue (for futures).
             if is_waiting {
                 return false;
             }
 
+            // try to spin checking for the lock
+            // if theres no wait queue and if we haven't spun too much.
             let head = (state & QUEUE_MASK) as *const WaitNode<Parker>;
             if head.is_null() && spin < max_spin_doubling {
                 spin += 1;
@@ -133,6 +174,10 @@ impl WordLock {
                 continue;
             }
 
+            // lazy initialize the wait node.
+            // this is to memoize the waker as it
+            // may be an owned resource (core::task::Waker)
+            // or be relatively expensive to create (crate::sync::ThreadParker).
             if flags & WAIT_NODE_INIT == 0 {
                 flags |= WAIT_NODE_INIT;
                 wait_node.flags.set(flags);
@@ -142,6 +187,7 @@ impl WordLock {
                 }));
             }
 
+            // prepare the node to be added to the queue.
             wait_node.next.set(MaybeUninit::new(head));
             if head.is_null() {
                 wait_node.tail.set(MaybeUninit::new(wait_node));
@@ -149,6 +195,7 @@ impl WordLock {
                 wait_node.tail.set(MaybeUninit::new(null()));
             }
 
+            // Try to add the node to the wait queue.
             debug_assert!(mem::align_of::<WaitNode<Parker>>() > !QUEUE_MASK);
             match self.state.compare_exchange_weak(
                 state,
@@ -162,8 +209,13 @@ impl WordLock {
         }
     }
 
+    /// Fast-path for unlocking the mutex.
+    /// Returns a wait node that was dequeued and should be woken up if any.
     #[inline]
     pub fn unlock_unfair<'a, Waker>(&self) -> Option<&'a WaitNode<Waker>> {
+        // Use fetch_sub(1) to release the lock instead of fetch_and(!1)
+        // as the former is implemented more efficiently on common platforms.
+        // (e.g. for x86: `lock xadd` vs `lock cmpxchg` loop)
         let state = self.state.fetch_sub(MUTEX_LOCK, Ordering::Release);
         if (state & QUEUE_MASK != 0) && (state & QUEUE_LOCK == 0) {
             self.unlock_unfair_slow()
@@ -172,14 +224,21 @@ impl WordLock {
         }
     }
 
+    /// Slow path for unlocking the mutex.
+    /// Returns a wait node that was dequeued and should be woken up if any.
     #[cold]
     fn unlock_unfair_slow<'a, Waker>(&self) -> Option<&'a WaitNode<Waker>> {
+        // first need to acquire the queue lock in order to dequeue a node.
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
+            // stop trying if someone else already has thte lock or if
+            // there are no nodes in the queue to consume.
             if (state & QUEUE_MASK == 0) || (state & QUEUE_LOCK != 0) {
                 return None;
             }
 
+            // Use an acquire barrier when grapping the QUEUE_LOCK,
+            // since the state in the loop below will be dereferenced.
             match self.state.compare_exchange_weak(
                 state,
                 state | QUEUE_LOCK,
@@ -191,10 +250,14 @@ impl WordLock {
             }
         }
 
+        // When re-iterating, need an Acquire barrier to observe
+        // the node updates to the head Release'd from other threads.
         'outer: loop {
             let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<Waker>) };
             let tail = head.find_tail();
 
+            // if the mutex is currently locked,
+            // let the lock holder take care of dequeuing & waking a node.
             if state & MUTEX_LOCK != 0 {
                 match self.state.compare_exchange_weak(
                     state,
@@ -209,9 +272,11 @@ impl WordLock {
                 continue;
             }
 
+            // pop the tail from the wait queue
             let new_tail = unsafe { tail.prev.get().assume_init() };
             if new_tail.is_null() {
                 loop {
+                    // zero out the queue node + unlock the queue if next is null
                     match self.state.compare_exchange_weak(
                         state,
                         state & MUTEX_LOCK,
@@ -221,6 +286,8 @@ impl WordLock {
                         Ok(_) => break,
                         Err(s) => state = s,
                     }
+
+                    // a new node was added to the queue, reprocess from the head.
                     if state & QUEUE_MASK != 0 {
                         fence(Ordering::Acquire);
                         continue 'outer;
@@ -231,13 +298,21 @@ impl WordLock {
                 self.state.fetch_and(!QUEUE_LOCK, Ordering::Release);
             }
 
+            // return the dequeued tail to then wake.
             return Some(tail);
         }
     }
 
+    /// Similar to unlock, but directly hands off the lock
+    /// to a waiting thread if any to prevent the current thread
+    /// from re-acquring the lock multiple times if it could have.
+    ///
+    /// Returns a wait node that was dequeued and should be woken up if any.
     pub fn unlock_fair<'a, Waker>(&self) -> Option<&'a WaitNode<Waker>> {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
+            // if the last node, consume it while releasing
+            // the mutex & queue locks at the same time.
             let head = (state & QUEUE_MASK) as *const WaitNode<Waker>;
             if head.is_null() {
                 match self.state.compare_exchange_weak(
@@ -257,6 +332,8 @@ impl WordLock {
             let tail = head.find_tail();
             let new_tail = unsafe { tail.prev.get().assume_init() };
 
+            // consume the tail node while keeping
+            // the mutex locked for a direct handoff.
             if new_tail.is_null() {
                 if let Err(s) = self.state.compare_exchange_weak(
                     state,
@@ -272,6 +349,8 @@ impl WordLock {
                 head.tail.set(MaybeUninit::new(new_tail));
             }
 
+            // dont unlock the mutex, but instead transfer lock
+            // ownership to the queue node we just dequeued.
             tail.flags.set(tail.flags.get() | WAIT_NODE_HANDOFF);
             return Some(tail);
         }
@@ -286,6 +365,8 @@ impl WordLock {
     where
         F: FnOnce() -> Parker,
     {
+        // Acquire to observe head node changes,
+        // but fast-path do nothing if no waiting queue nodes.
         let state = self.state.load(Ordering::Acquire);
         let head = (state & QUEUE_MASK) as *const WaitNode<Parker>;
         if head.is_null() {
@@ -295,12 +376,15 @@ impl WordLock {
         let head = unsafe { &*head };
         let tail = head.find_tail();
 
+        // replace the tail of the queue with our wait_node
         wait_node.flags.set(WAIT_NODE_INIT);
         wait_node.prev.set(tail.prev.get());
         wait_node.next.set(MaybeUninit::new(null()));
         wait_node.waker.set(MaybeUninit::new(new_waker()));
         wait_node.tail.set(MaybeUninit::new(wait_node));
+        head.tail.set(MaybeUninit::new(wait_node));
 
+        // directly handoff the mutex lock to the old tail, now dequeued.
         tail.flags.set(tail.flags.get() | WAIT_NODE_HANDOFF);
         Some(tail)
     }

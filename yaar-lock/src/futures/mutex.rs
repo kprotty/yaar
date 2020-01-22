@@ -128,9 +128,6 @@ impl<'a, T> Future for FutureLock<'a, T> {
         {
             Poll::Ready(MutexGuard { mutex: self.mutex })
         } else {
-            self.wait_node
-                .flags
-                .set(self.wait_node.flags.get() & !WAIT_NODE_INIT);
             Poll::Pending
         }
     }
@@ -148,6 +145,7 @@ pub struct MutexGuard<'a, T> {
 #[inline]
 fn wake_node(node: &WaitNode<Waker>) {
     unsafe {
+        node.flags.set(node.flags.get() & !WAIT_NODE_INIT);
         node.waker
             .replace(MaybeUninit::uninit())
             .assume_init()
@@ -269,7 +267,10 @@ impl<'a, T> MutexGuard<'a, T> {
     ///
     /// This is safe because `&mut` guarantees that there exist no other
     /// references to the data protected by the mutex.
-    pub fn unlocked<R: 'a>(&'a mut self, f: impl FnOnce() -> R + 'a) -> MutexFutureUnlock<'a, R, Self> {
+    pub fn unlocked<R: 'a>(
+        &'a mut self,
+        f: impl FnOnce() -> R + 'a,
+    ) -> MutexFutureUnlock<'a, R, Self> {
         let lock = &self.mutex.lock;
         if let Some(node) = lock.unlock_unfair() {
             wake_node(node);
@@ -326,16 +327,13 @@ impl<'a, M> Future for MutexFutureBump<'a, M> {
                 wake_node(waiting_node);
                 return Poll::Pending;
             } else {
-                return Poll::Ready(())
+                return Poll::Ready(());
             }
         }
 
         if self.lock.lock(0, &self.wait_node, || ctx.waker().clone()) {
             Poll::Ready(())
         } else {
-            self.wait_node
-                .flags
-                .set(self.wait_node.flags.get() & !WAIT_NODE_INIT);
             Poll::Pending
         }
     }
@@ -364,9 +362,6 @@ impl<'a, T, M> Future for MutexFutureUnlock<'a, T, M> {
                 mem::replace(&mut *self.output.as_ptr(), MaybeUninit::uninit()).assume_init()
             })
         } else {
-            self.wait_node
-                .flags
-                .set(self.wait_node.flags.get() & !WAIT_NODE_INIT);
             Poll::Pending
         }
     }

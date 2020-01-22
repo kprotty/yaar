@@ -49,7 +49,6 @@ impl<Parker: ThreadParker> WordMutex<Parker> {
             } else {
                 let parker = Self::get_parker(node);
                 parker.park();
-                node.flags.set(node.flags.get() & !WAIT_NODE_INIT);
                 parker.reset();
             }
         }
@@ -58,6 +57,12 @@ impl<Parker: ThreadParker> WordMutex<Parker> {
     #[inline]
     fn get_parker(node: &WaitNode<Parker>) -> &mut Parker {
         unsafe { &mut *(&mut *node.waker.as_ptr()).as_mut_ptr() }
+    }
+
+    #[inline]
+    fn wake_node(node: &WaitNode<Parker>) {
+        node.flags.set(node.flags.get() & !WAIT_NODE_INIT);
+        Self::get_parker(node).unpark();
     }
 }
 
@@ -77,7 +82,7 @@ unsafe impl<Parker: ThreadParker> lock_api::RawMutex for WordMutex<Parker> {
 
     fn unlock(&self) {
         if let Some(node) = self.lock.unlock_unfair() {
-            Self::get_parker(node).unpark();
+            Self::wake_node(node);
         }
     }
 }
@@ -85,14 +90,14 @@ unsafe impl<Parker: ThreadParker> lock_api::RawMutex for WordMutex<Parker> {
 unsafe impl<Parker: ThreadParker> lock_api::RawMutexFair for WordMutex<Parker> {
     fn unlock_fair(&self) {
         if let Some(node) = self.lock.unlock_fair() {
-            Self::get_parker(node).unpark();
+            Self::wake_node(node);
         }
     }
 
     fn bump(&self) {
         let node = WaitNode::<Parker>::default();
         if let Some(waiting_node) = self.lock.bump(&node, || Parker::default()) {
-            Self::get_parker(waiting_node).unpark();
+            Self::wake_node(waiting_node);
             self.acquire(&node);
         }
     }

@@ -229,17 +229,17 @@ criterion_group! {
     config = Criterion::default().measurement_time(Duration::from_secs(TEST_SECS));
     targets =
         // tokio
-        tokio_rt_intrusive_fair,
-        tokio_rt_intrusive_unfair,
         tokio_rt_yaar_fair,
+        tokio_rt_intrusive_fair,
         tokio_rt_yaar_unfair,
+        tokio_rt_intrusive_unfair,
         tokio_rt_async_std,
         tokio_rt_tokio,
         // async-std
-        async_std_intrusive_fair,
-        async_std_intrusive_unfair,
         async_std_yaar_fair,
+        async_std_intrusive_fair,
         async_std_yaar_unfair,
+        async_std_intrusive_unfair,
         async_std_async_std,
         async_std_tokio
 }
