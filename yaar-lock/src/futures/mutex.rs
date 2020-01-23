@@ -1,7 +1,7 @@
 // Contains lots of code lifted from futures-intrusive, parking_lot, and lock_api.
 // Major credit to those crates for influencing this one.
 
-use crate::shared::mutex::{WaitNode, WordLock, WAIT_NODE_INIT};
+use crate::shared::{WaitNode, WordLock, WAIT_NODE_INIT};
 use core::{
     cell::{Cell, UnsafeCell},
     fmt,

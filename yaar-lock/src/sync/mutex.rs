@@ -1,5 +1,5 @@
 use super::ThreadParker;
-use crate::shared::mutex::{WaitNode, WordLock, WAIT_NODE_INIT};
+use crate::shared::{WaitNode, WordLock, WAIT_NODE_INIT};
 use core::marker::PhantomData;
 
 /// RawMutex implementation which uses the default OS implementation for thread parking
