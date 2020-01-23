@@ -6,7 +6,7 @@ use core::{
     cell::{Cell, UnsafeCell},
     fmt,
     future::Future,
-    mem::{self, MaybeUninit},
+    mem::{forget, MaybeUninit},
     ops::{Deref, DerefMut},
     pin::Pin,
     task::{Context, Poll, Waker},
@@ -101,7 +101,7 @@ impl<T> Mutex<T> {
     /// This method returns a future that will resolve once the mutex has been
     /// successfully acquired.
     #[inline]
-    pub fn lock(&self) -> FutureLock<'_, T> {
+    pub fn lock(&self) -> MutexFutureLock<'a, T> {
         FutureLock {
             mutex: self,
             wait_node: WaitNode::default(),
@@ -109,15 +109,14 @@ impl<T> Mutex<T> {
     }
 }
 
-/// Future used to acquire a guard to a Mutex.
-pub struct FutureLock<'a, T> {
+pub struct MutexFutureLock<'a, T> {
     mutex: &'a Mutex<T>,
     wait_node: WaitNode<Waker>,
 }
 
-unsafe impl<'a, T> Send for FutureLock<'a, T> {}
+unsafe impl<'a, T> Send for MutexFutureLock<'a, T> {}
 
-impl<'a, T> Future for FutureLock<'a, T> {
+impl<'a, T> Future for MutexFutureLock<'a, T> {
     type Output = MutexGuard<'a, T>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -202,7 +201,7 @@ impl<'a, T> MutexGuard<'a, T> {
     pub fn map<U>(this: Self, f: impl FnOnce(&mut T) -> &mut U) -> MappedMutexGuard<'a, U> {
         let lock = &this.mutex.lock;
         let value = f(unsafe { &mut *this.mutex.value.get() });
-        mem::forget(this);
+        forget(this);
         MappedMutexGuard { lock, value }
     }
 
@@ -223,7 +222,7 @@ impl<'a, T> MutexGuard<'a, T> {
             None => Err(this),
             Some(value) => {
                 let lock = &this.mutex.lock;
-                mem::forget(this);
+                forget(this);
                 Ok(MappedMutexGuard { lock, value })
             }
         }
@@ -244,7 +243,7 @@ impl<'a, T> MutexGuard<'a, T> {
         if let Some(node) = self.mutex.lock.unlock_fair() {
             wake_node(node);
         }
-        mem::forget(self);
+        forget(self);
     }
 
     /// Temporarily yields the mutex to a waiting thread if there is one.
@@ -253,10 +252,42 @@ impl<'a, T> MutexGuard<'a, T> {
     /// by `lock`, however it can be much more efficient in the case where there
     /// are no waiting threads.
     #[inline]
-    pub fn bump(&'a mut self) -> MutexFutureBump<'a, Self> {
-        let lock = &self.mutex.lock;
-        MutexFutureBump {
-            lock,
+    pub fn bump(&'a mut self) -> impl Future<Output = ()> + 'a + Send {
+        struct FutureBump<'a, M> {
+            bumped: Cell<bool>,
+            lock: &'a WordLock,
+            _guard: &'a mut M,
+            wait_node: WaitNode<Waker>,
+        }
+
+        unsafe impl<'a, M> Send for FutureBump<'a, M> {}
+
+        impl<'a, M> Future for FutureBump<'a, M> {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+                // First poll should bump the mutex, waking a sleeping node if any.
+                if !self.bumped.get() {
+                    self.bumped.set(true);
+                    if let Some(waiting_node) = self.lock.bump(&self.wait_node, || ctx.waker().clone()) {
+                        wake_node(waiting_node);
+                        return Poll::Pending;
+                    } else {
+                        return Poll::Ready(());
+                    }
+                }
+                
+                // after bumping and replacing the tail, try to acquire the mutex again.
+                if self.lock.lock(0, &self.wait_node, || ctx.waker().clone()) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        FutureBump {
+            lock: &self.mutex.lock,
             _guard: self,
             bumped: Cell::new(false),
             wait_node: WaitNode::default(),
@@ -270,13 +301,13 @@ impl<'a, T> MutexGuard<'a, T> {
     pub fn unlocked<R: 'a>(
         &'a mut self,
         f: impl FnOnce() -> R + 'a,
-    ) -> MutexFutureUnlock<'a, R, Self> {
-        let lock = &self.mutex.lock;
-        if let Some(node) = lock.unlock_unfair() {
+    ) -> impl Future<Output = R> + 'a + Send {
+        if let Some(node) = self.mutex.lock.unlock_unfair() {
             wake_node(node);
         }
-        MutexFutureUnlock {
-            lock: lock,
+
+        FutureUnlock {
+            lock: &self.mutex.lock,
             _guard: self,
             wait_node: WaitNode::default(),
             output: Cell::new(MaybeUninit::new(f())),
@@ -292,13 +323,13 @@ impl<'a, T> MutexGuard<'a, T> {
     pub fn unlocked_fair<R: 'a>(
         &'a mut self,
         f: impl FnOnce() -> R + 'a,
-    ) -> MutexFutureUnlock<'a, R, Self> {
-        let lock = &self.mutex.lock;
-        if let Some(node) = lock.unlock_unfair() {
+    ) -> impl Future<Output = R> + 'a + Send {
+        if let Some(node) = self.mutex.lock.unlock_fair() {
             wake_node(node);
         }
-        MutexFutureUnlock {
-            lock,
+
+        FutureUnlock {
+            lock: &self.mutex.lock,
             _guard: self,
             wait_node: WaitNode::default(),
             output: Cell::new(MaybeUninit::new(f())),
@@ -306,61 +337,23 @@ impl<'a, T> MutexGuard<'a, T> {
     }
 }
 
-/// Future used to yield the lock
-/// to another waiting future if any.
-pub struct MutexFutureBump<'a, M> {
-    bumped: Cell<bool>,
-    lock: &'a WordLock,
-    _guard: &'a mut M,
-    wait_node: WaitNode<Waker>,
-}
-
-unsafe impl<'a, M> Send for MutexFutureBump<'a, M> {}
-
-impl<'a, M> Future for MutexFutureBump<'a, M> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.bumped.get() {
-            self.bumped.set(true);
-            if let Some(waiting_node) = self.lock.bump(&self.wait_node, || ctx.waker().clone()) {
-                wake_node(waiting_node);
-                return Poll::Pending;
-            } else {
-                return Poll::Ready(());
-            }
-        }
-
-        if self.lock.lock(0, &self.wait_node, || ctx.waker().clone()) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
 /// Future used to re-acquire the mutex
 /// from an `unlocked*` function in `MutexGuard*`
-pub struct MutexFutureUnlock<'a, T, M> {
+pub struct FutureUnlock<'a, T, M> {
     lock: &'a WordLock,
     _guard: &'a mut M,
     wait_node: WaitNode<Waker>,
     output: Cell<MaybeUninit<T>>,
 }
 
-unsafe impl<'a, T, M> Send for MutexFutureUnlock<'a, T, M> {}
+unsafe impl<'a, T, M> Send for FutureUnlock<'a, T, M> {}
 
-impl<'a, T, M> Future for MutexFutureUnlock<'a, T, M> {
+impl<'a, T, M> Future for FutureUnlock<'a, T, M> {
     type Output = T;
 
-    // After acquiring the mutex, return the output by consuming it.
-    // Subsequent calls to poll after returning `Poll::Ready()` is UB
-    // as it calls `MaybeUninit::assume_init()` on a `MaybeUninit::uninit()`.
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.lock.lock(0, &self.wait_node, || ctx.waker().clone()) {
-            Poll::Ready(unsafe {
-                mem::replace(&mut *self.output.as_ptr(), MaybeUninit::uninit()).assume_init()
-            })
+            Poll::Ready(unsafe { self.output.replace(MaybeUninit::uninit()).assume_init() })
         } else {
             Poll::Pending
         }
@@ -428,7 +421,7 @@ impl<'a, T: 'a> MappedMutexGuard<'a, T> {
     pub fn map<U>(this: Self, f: impl FnOnce(&mut T) -> &mut U) -> MappedMutexGuard<'a, U> {
         let lock = this.lock;
         let value = f(unsafe { &mut *this.value });
-        mem::forget(this);
+        forget(this);
         MappedMutexGuard { lock, value }
     }
 
@@ -449,7 +442,7 @@ impl<'a, T: 'a> MappedMutexGuard<'a, T> {
             None => Err(this),
             Some(value) => {
                 let lock = this.lock;
-                mem::forget(this);
+                forget(this);
                 Ok(MappedMutexGuard { lock, value })
             }
         }
@@ -470,6 +463,6 @@ impl<'a, T: 'a> MappedMutexGuard<'a, T> {
         if let Some(node) = self.lock.unlock_fair() {
             wake_node(node);
         }
-        mem::forget(self);
+        forget(self);
     }
 }

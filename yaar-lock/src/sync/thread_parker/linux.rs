@@ -23,6 +23,7 @@ impl Parker {
 }
 
 unsafe impl Sync for Parker {}
+unsafe impl Send for Parker {}
 
 impl Default for Parker {
     fn default() -> Self {

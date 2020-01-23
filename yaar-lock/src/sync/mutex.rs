@@ -55,8 +55,8 @@ impl<Parker: ThreadParker> WordMutex<Parker> {
     }
 
     #[inline]
-    fn get_parker(node: &WaitNode<Parker>) -> &mut Parker {
-        unsafe { &mut *(&mut *node.waker.as_ptr()).as_mut_ptr() }
+    fn get_parker(node: &WaitNode<Parker>) -> &Parker {
+        unsafe { &*(&*node.waker.as_ptr()).as_ptr() }
     }
 
     #[inline]

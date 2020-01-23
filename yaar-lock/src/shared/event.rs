@@ -12,9 +12,9 @@ pub struct WordEvent {
 }
 
 impl WordEvent {
-    pub const fn new() -> Self {
+    pub const fn new(is_set: bool) -> Self {
         Self {
-            state: AtomicUsize::new(0),
+            state: AtomicUsize::new(if is_set { IS_SET } else { 0 }),
         }
     }
 

@@ -4,7 +4,7 @@ mod lock;
 pub use self::event::WordEvent;
 pub use self::lock::WordLock;
 
-use core::{cell::Cell, mem::{self, MaybeUninit}};
+use core::{cell::Cell, mem::{self, MaybeUninit}, marker::PhantomPinned};
 
 /// Flag on WaitNode indicating that the waker was initialized.
 pub const WAIT_NODE_INIT: u8 = 1 << 0;
@@ -21,6 +21,7 @@ pub struct WaitNode<Waker> {
     pub tail: Cell<MaybeUninit<*const Self>>,
     pub waker: Cell<MaybeUninit<Waker>>,
     pub flags: Cell<u8>,
+    _pin: PhantomPinned,
 }
 
 /// Make sure to drop the waker if it
@@ -44,6 +45,7 @@ impl<Waker> Default for WaitNode<Waker> {
             tail: Cell::new(MaybeUninit::uninit()),
             waker: Cell::new(MaybeUninit::uninit()),
             flags: Cell::new(0),
+            _pin: PhantomPinned,
         }
     }
 }

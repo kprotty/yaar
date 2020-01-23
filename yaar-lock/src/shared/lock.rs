@@ -1,7 +1,8 @@
 use super::{WaitNode, WAIT_NODE_HANDOFF, WAIT_NODE_INIT};
 use core::{
-    mem::{self, MaybeUninit},
+    mem::{align_of, MaybeUninit},
     ptr::null,
+    cell::Cell,
     sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
 };
 
@@ -48,7 +49,7 @@ impl WordLock {
                 flags,
                 max_spin_doubling,
                 wait_node,
-                MaybeUninit::new(new_waker),
+                Cell::new(MaybeUninit::new(new_waker)),
             )
     }
 
@@ -63,7 +64,7 @@ impl WordLock {
         mut flags: u8,
         max_spin_doubling: usize,
         wait_node: &WaitNode<Parker>,
-        mut new_waker: MaybeUninit<F>,
+        mut new_waker: Cell<MaybeUninit<F>>,
     ) -> bool
     where
         F: FnOnce() -> Parker,
@@ -112,7 +113,7 @@ impl WordLock {
                 wait_node.flags.set(flags);
                 wait_node.prev.set(MaybeUninit::new(null()));
                 wait_node.waker.set(MaybeUninit::new(unsafe {
-                    (mem::replace(&mut new_waker, MaybeUninit::uninit()).assume_init())()
+                    (new_waker.replace(MaybeUninit::uninit()).assume_init())()
                 }));
             }
 
@@ -125,7 +126,7 @@ impl WordLock {
             }
 
             // Try to add the node to the wait queue.
-            debug_assert!(mem::align_of::<WaitNode<Parker>>() > !QUEUE_MASK);
+            debug_assert!(align_of::<WaitNode<Parker>>() > !QUEUE_MASK);
             match self.state.compare_exchange_weak(
                 state,
                 (wait_node as *const _ as usize) | (state & !QUEUE_MASK),
