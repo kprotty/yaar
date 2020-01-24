@@ -4,14 +4,17 @@ mod lock;
 pub use self::event::WordEvent;
 pub use self::lock::WordLock;
 
-use core::{cell::Cell, mem::{self, MaybeUninit}, marker::PhantomPinned};
+use core::{
+    cell::Cell,
+    marker::PhantomPinned,
+    mem::{self, MaybeUninit},
+};
 
 /// Flag on WaitNode indicating that the waker was initialized.
 pub const WAIT_NODE_INIT: u8 = 1 << 0;
 
-/// Flag on WaitNode indicating that the previous lock holder
-/// moved ownership of the lock to our node.
-pub const WAIT_NODE_HANDOFF: u8 = 1 << 2;
+/// Flag on WaitNode indicating that the waiter acquired the resource.
+pub const WAIT_NODE_ACQUIRE: u8 = 1 << 0;
 
 /// Intrusive linked list node representing a suspended
 /// unit of execution waiting for a lock to be released.

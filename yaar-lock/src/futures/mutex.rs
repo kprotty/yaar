@@ -1,7 +1,7 @@
 // Contains lots of code lifted from futures-intrusive, parking_lot, and lock_api.
 // Major credit to those crates for influencing this one.
 
-use crate::shared::{WaitNode, WordLock, WAIT_NODE_INIT};
+use crate::shared::{WaitNode, WordLock, WAIT_NODE_ACQUIRE, WAIT_NODE_INIT};
 use core::{
     cell::{Cell, UnsafeCell},
     fmt,
@@ -9,8 +9,10 @@ use core::{
     mem::{forget, MaybeUninit},
     ops::{Deref, DerefMut},
     pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll, Waker},
 };
+use futures::future::FusedFuture;
 
 /// A mutual exclusion primitive useful for protecting shared data
 ///
@@ -104,6 +106,7 @@ impl<T> Mutex<T> {
     pub fn lock(&self) -> MutexFutureLock<'_, T> {
         MutexFutureLock {
             mutex: self,
+            is_acquired: AtomicBool::new(false),
             wait_node: WaitNode::default(),
         }
     }
@@ -111,20 +114,38 @@ impl<T> Mutex<T> {
 
 pub struct MutexFutureLock<'a, T> {
     mutex: &'a Mutex<T>,
+    is_acquired: AtomicBool,
     wait_node: WaitNode<Waker>,
 }
 
 unsafe impl<'a, T> Send for MutexFutureLock<'a, T> {}
 
+impl<'a, T> FusedFuture for MutexFutureLock<'a, T> {
+    fn is_terminated(&self) -> bool {
+        self.is_acquired.load(Ordering::Relaxed)
+    }
+}
+
+impl<'a, T> Drop for MutexFutureLock<'a, T> {
+    fn drop(&mut self) {
+        if !self.is_terminated() {
+            self.mutex.lock.remove_waiter(&self.wait_node);
+        }
+    }
+}
+
 impl<'a, T> Future for MutexFutureLock<'a, T> {
     type Output = MutexGuard<'a, T>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        debug_assert!(!self.is_acquired.load(Ordering::Relaxed));
+
         if self
             .mutex
             .lock
             .lock(0, &self.wait_node, || ctx.waker().clone())
         {
+            self.is_acquired.store(true, Ordering::Relaxed);
             Poll::Ready(MutexGuard { mutex: self.mutex })
         } else {
             Poll::Pending
@@ -252,44 +273,12 @@ impl<'a, T> MutexGuard<'a, T> {
     /// by `lock`, however it can be much more efficient in the case where there
     /// are no waiting threads.
     #[inline]
-    pub fn bump(&'a mut self) -> impl Future<Output = ()> + 'a + Send {
-        struct FutureBump<'a, M> {
-            bumped: Cell<bool>,
-            lock: &'a WordLock,
-            _guard: &'a mut M,
-            wait_node: WaitNode<Waker>,
-        }
-
-        unsafe impl<'a, M> Send for FutureBump<'a, M> {}
-
-        impl<'a, M> Future for FutureBump<'a, M> {
-            type Output = ();
-
-            fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-                // First poll should bump the mutex, waking a sleeping node if any.
-                if !self.bumped.get() {
-                    self.bumped.set(true);
-                    if let Some(waiting_node) = self.lock.bump(&self.wait_node, || ctx.waker().clone()) {
-                        wake_node(waiting_node);
-                        return Poll::Pending;
-                    } else {
-                        return Poll::Ready(());
-                    }
-                }
-                
-                // after bumping and replacing the tail, try to acquire the mutex again.
-                if self.lock.lock(0, &self.wait_node, || ctx.waker().clone()) {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
-
-        FutureBump {
+    pub fn bump(&'a mut self) -> MutexFutureBump<'a, Self> {
+        MutexFutureBump {
             lock: &self.mutex.lock,
             _guard: self,
             bumped: Cell::new(false),
+            is_acquired: AtomicBool::new(false),
             wait_node: WaitNode::default(),
         }
     }
@@ -301,12 +290,12 @@ impl<'a, T> MutexGuard<'a, T> {
     pub fn unlocked<R: 'a>(
         &'a mut self,
         f: impl FnOnce() -> R + 'a,
-    ) -> impl Future<Output = R> + 'a + Send {
+    ) -> MutexFutureUnlock<'a, R, Self> {
         if let Some(node) = self.mutex.lock.unlock_unfair() {
             wake_node(node);
         }
 
-        FutureUnlock {
+        MutexFutureUnlock {
             lock: &self.mutex.lock,
             _guard: self,
             wait_node: WaitNode::default(),
@@ -323,12 +312,12 @@ impl<'a, T> MutexGuard<'a, T> {
     pub fn unlocked_fair<R: 'a>(
         &'a mut self,
         f: impl FnOnce() -> R + 'a,
-    ) -> impl Future<Output = R> + 'a + Send {
+    ) -> MutexFutureUnlock<'a, R, Self> {
         if let Some(node) = self.mutex.lock.unlock_fair() {
             wake_node(node);
         }
 
-        FutureUnlock {
+        MutexFutureUnlock {
             lock: &self.mutex.lock,
             _guard: self,
             wait_node: WaitNode::default(),
@@ -337,18 +326,72 @@ impl<'a, T> MutexGuard<'a, T> {
     }
 }
 
+/// Future used to allow another future to acquire
+/// the lock and then re-acquire it right after.
+pub struct MutexFutureBump<'a, M> {
+    bumped: Cell<bool>,
+    lock: &'a WordLock,
+    _guard: &'a mut M,
+    is_acquired: AtomicBool,
+    wait_node: WaitNode<Waker>,
+}
+
+unsafe impl<'a, M> Send for MutexFutureBump<'a, M> {}
+
+impl<'a, T> FusedFuture for MutexFutureBump<'a, T> {
+    fn is_terminated(&self) -> bool {
+        self.is_acquired.load(Ordering::Relaxed)
+    }
+}
+
+impl<'a, T> Drop for MutexFutureBump<'a, T> {
+    fn drop(&mut self) {
+        if !self.is_terminated() {
+            self.lock.remove_waiter(&self.wait_node);
+        }
+    }
+}
+
+impl<'a, M> Future for MutexFutureBump<'a, M> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        debug_assert!(!self.is_acquired.load(Ordering::Relaxed));
+
+        // First poll should bump the mutex, waking a sleeping node if any.
+        if !self.bumped.get() {
+            self.bumped.set(true);
+            if let Some(waiting_node) = self.lock.bump(&self.wait_node, || ctx.waker().clone()) {
+                wake_node(waiting_node);
+                return Poll::Pending;
+            } else {
+                self.is_acquired.store(true, Ordering::Relaxed);
+                return Poll::Ready(());
+            }
+        }
+
+        // after bumping and replacing the tail, try to acquire the mutex again.
+        if self.lock.lock(0, &self.wait_node, || ctx.waker().clone()) {
+            self.is_acquired.store(true, Ordering::Relaxed);
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 /// Future used to re-acquire the mutex
 /// from an `unlocked*` function in `MutexGuard*`
-pub struct FutureUnlock<'a, T, M> {
+pub struct MutexFutureUnlock<'a, T, M> {
     lock: &'a WordLock,
     _guard: &'a mut M,
     wait_node: WaitNode<Waker>,
     output: Cell<MaybeUninit<T>>,
 }
 
-unsafe impl<'a, T, M> Send for FutureUnlock<'a, T, M> {}
+unsafe impl<'a, T, M> Send for MutexFutureUnlock<'a, T, M> {}
 
-impl<'a, T, M> Future for FutureUnlock<'a, T, M> {
+impl<'a, T, M> Future for MutexFutureUnlock<'a, T, M> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {

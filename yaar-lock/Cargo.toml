@@ -13,9 +13,9 @@ Fast, no_std synchronization primitives.
 """
 
 [features]
-default = ["os", "sync", "futures"]
+default = ["os", "sync", "async"]
 sync = ["lock_api"]
-futures = []
+async = ["futures"]
 os = [
     "libc",
     "winapi/winbase",
@@ -26,6 +26,11 @@ os = [
 [dependencies.lock_api]
 optional = true
 version = "0.3"
+
+[dependencies.futures]
+optional = true
+version = "0.3"
+default-features = false
 
 [target.'cfg(unix)'.dependencies.libc]
 optional = true

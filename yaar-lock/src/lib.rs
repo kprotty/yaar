@@ -5,7 +5,7 @@
 //!
 //! - `os`: exposes operating system primitives which implement thread parking.
 //! - `sync`: exposes synchronization primitives backed by thread parking.
-//! - `futures`: exposes synchronization primitives backed by futures.
+//! - `async`: exposes synchronization primitives backed by futures.
 #![no_std]
 
 mod shared;
@@ -13,5 +13,5 @@ mod shared;
 #[cfg(feature = "sync")]
 pub mod sync;
 
-#[cfg(feature = "futures")]
+#[cfg(feature = "async")]
 pub mod futures;
