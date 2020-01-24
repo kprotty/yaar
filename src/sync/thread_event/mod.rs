@@ -11,10 +11,17 @@ pub trait ThreadEvent: Default + Sync {
     fn reset(&self);
 
     /// Wait for the event to be signaled by blocking the current thread.
+    /// A [`Acquire`] memory ordering is assumed.
+    ///
+    /// [`Acquire`]: [`core::sync::atomic::Ordering::Acquire`]
     fn wait(&self);
 
     /// Transition to a signaled state, unblocking any threads waiting on the
     /// event.
+    ///
+    /// A [`Release`] memory ordering is assumed.
+    ///
+    /// [`Release`]: [`core::sync::atomic::Ordering::Release`]
     fn notify(&self);
 }
 
