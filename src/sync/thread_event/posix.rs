@@ -1,4 +1,3 @@
-
 use core::cell::{Cell, UnsafeCell};
 use libc::{
     pthread_cond_destroy, pthread_cond_signal, pthread_cond_t, pthread_cond_wait,
@@ -45,17 +44,19 @@ impl Drop for Event {
 }
 
 impl Event {
-    fn reset(&self) {
-        let r = pthread_mutex_lock(self.mutex.get());
-        debug_assert_eq!(r, 0);
+    pub fn reset(&self) {
+        unsafe {
+            let r = pthread_mutex_lock(self.mutex.get());
+            debug_assert_eq!(r, 0);
 
-        self.is_set.set(false);
+            self.is_set.set(false);
 
-        let r = pthread_mutex_unlock(self.mutex.get());
-        debug_assert_eq!(r, 0);
+            let r = pthread_mutex_unlock(self.mutex.get());
+            debug_assert_eq!(r, 0);
+        }
     }
 
-    fn notify(&self) {
+    pub fn notify(&self) {
         unsafe {
             let r = pthread_mutex_lock(self.mutex.get());
             debug_assert_eq!(r, 0);
@@ -71,7 +72,7 @@ impl Event {
         }
     }
 
-    fn wait(&self) {
+    pub fn wait(&self) {
         unsafe {
             let r = pthread_mutex_lock(self.mutex.get());
             debug_assert_eq!(r, 0);

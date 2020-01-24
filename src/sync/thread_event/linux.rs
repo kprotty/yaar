@@ -13,11 +13,11 @@ pub struct Event {
 }
 
 impl Event {
-    fn reset(&self) {
+    pub fn reset(&self) {
         self.state.store(IS_RESET, Ordering::Relaxed);
     }
 
-    fn notify(&self) {
+    pub fn notify(&self) {
         // Check if theres a thread waiting to avoid an unnecessary FUTEX_WAKE if
         // possible.
         if self.state.swap(IS_SET, Ordering::Release) == IS_WAITING {
@@ -27,11 +27,11 @@ impl Event {
         }
     }
 
-    fn wait(&self) {
+    pub fn wait(&self) {
         // try to set the state to WAIT for the setter, exit if already set.
         let mut state = self.state.load(Ordering::Acquire);
         loop {
-            if state == SET {
+            if state == IS_SET {
                 return;
             }
             match self.state.compare_exchange_weak(

@@ -20,12 +20,12 @@ pub trait ThreadEvent: Default + Sync {
 
 #[cfg(all(feature = "os", windows))]
 mod windows;
-#[cfg(windows)]
+#[cfg(all(feature = "os", windows))]
 use windows::Event as SystemEvent;
 
 #[cfg(all(feature = "os", target_os = "linux"))]
 mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "os", target_os = "linux"))]
 use linux::Event as SystemEvent;
 
 #[cfg(all(feature = "os", unix, not(target_os = "linux")))]
