@@ -101,8 +101,8 @@ impl<T> Mutex<T> {
     /// This method returns a future that will resolve once the mutex has been
     /// successfully acquired.
     #[inline]
-    pub fn lock(&self) -> MutexFutureLock<'a, T> {
-        FutureLock {
+    pub fn lock(&self) -> MutexFutureLock<'_, T> {
+        MutexFutureLock {
             mutex: self,
             wait_node: WaitNode::default(),
         }

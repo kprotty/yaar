@@ -11,7 +11,7 @@ use std::{
 use tokio::sync::Mutex as TokioMutex;
 use yaar_lock::futures::Mutex as YaarMutex;
 
-const TEST_SECS: u64 = 20;
+const TEST_SECS: u64 = 10;
 const ITERATIONS: usize = 50;
 const NUM_YIELDS: usize = 10;
 const YIELD_CHANCE: usize = 25;

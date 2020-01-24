@@ -18,9 +18,9 @@ impl<Parker> fmt::Debug for RawResetEvent<Parker> {
 
 impl<Parker> RawResetEvent<Parker> {
     /// Creates a new ResetEvent usingthe given state.
-    pub const fn new(is_set: bool) -> Self {
+    pub const fn new() -> Self {
         Self {
-            event: WordEvent::new(is_set),
+            event: WordEvent::new(),
             phantom: PhantomData,
         }
     }
