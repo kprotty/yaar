@@ -3,9 +3,9 @@ name = "yaar"
 version = "0.2.0"
 authors = ["kprotty"]
 edition = "2018"
-license = "Apache-2.0/MIT"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/kprotty/yaar/tree/master/yaar"
+repository = "https://github.com/kprotty/yaar/"
 categories = ["network-programming", "asynchronous", "concurrency", "no-std"]
 keywords = ["io", "async", "await", "non-blocking", "futures", "no-std", "thread", "mutex"]
 description = """
@@ -14,15 +14,31 @@ optimized around configuration and no_std.
 """
 
 [features]
-default = []
-nightly = []
+default = ["full"]
+full = ["os", "future", "sync"]
 
-[target.'cfg(unix)'.dependencies.libc]
-optional = true
-version = "0.2"
-default-features = false
+sync = ["lock_api"]
 
-[target.'cfg(windows)'.dependencies.winapi]
-optional = true
-version = "0.3"
-default-features = false
+future = ["futures-core"]
+os = [
+    "libc",
+    "winapi/winbase",
+    "winapi/handleapi",
+    "winapi/libloaderapi",
+]
+
+[dependencies]
+lock_api = { version = "0.3", optional = true }
+futures-core = { version = "0.3", optional = true, default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true, default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", optional = true, default-features = false }
+
+[package.metadata.playground]
+features = ["full"]
+
+[package.metadata.docs.rs]
+all-features = true

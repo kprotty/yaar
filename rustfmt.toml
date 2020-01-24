@@ -1,0 +1,5 @@
+format_code_in_doc_comments = true
+normalize_doc_attributes = true
+normalize_comments = true
+wrap_comments = true
+max_width = 100
