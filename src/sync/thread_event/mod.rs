@@ -13,7 +13,7 @@ pub trait ThreadEvent: Default + Sync {
     /// Wait for the event to be signaled by blocking the current thread.
     /// A [`Acquire`] memory ordering is assumed.
     ///
-    /// [`Acquire`]: [`core::sync::atomic::Ordering::Acquire`]
+    /// [`Acquire`]: https://doc.rust-lang.org/core/sync/atomic/enum.Ordering.html#variant.Acquire
     fn wait(&self);
 
     /// Transition to a signaled state, unblocking any threads waiting on the
@@ -21,7 +21,7 @@ pub trait ThreadEvent: Default + Sync {
     ///
     /// A [`Release`] memory ordering is assumed.
     ///
-    /// [`Release`]: [`core::sync::atomic::Ordering::Release`]
+    /// [`Release`]: https://doc.rust-lang.org/core/sync/atomic/enum.Ordering.html#variant.Release
     fn notify(&self);
 }
 

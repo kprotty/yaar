@@ -61,6 +61,7 @@ impl Event {
             let r = pthread_mutex_lock(self.mutex.get());
             debug_assert_eq!(r, 0);
 
+            // Only notify if the event isnt set
             if !self.is_set.get() {
                 self.is_set.set(true);
                 let r = pthread_cond_signal(self.cond.get());

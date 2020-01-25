@@ -1,5 +1,3 @@
-
-
 #[cfg(feature = "future")]
 #[cfg_attr(feature = "nightly", doc(cfg(feature = "future")))]
 pub mod future;
