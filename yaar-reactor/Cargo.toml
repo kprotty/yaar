@@ -16,13 +16,13 @@ Non-blocking IO abstractions for futures.
 default = ["os"]
 os = ["libc", "winapi"]
 
-[target.'cfg(unix)'.dependencies.libc]
-optional = true
-version = "0.2"
-default-features = false
+[dependencies]
 
-[target.'cfg(windows)'.dependencies.winapi]
-optional = true
-version = "0.3"
-default-features = false
-features = []
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true, default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", optional = true, default-features = false }
+
+[package.metadata.docs.rs]
+all-features = true
