@@ -155,10 +155,10 @@ impl<Event: ThreadEvent> WordLock<Event> {
         // Anytime reiterating, make sure to use an Acquire barrier in order to
         // see any WaitNode memory writes to the head of the queue.
         'outer: loop {
-            let (head, tail, new_tail) = unsafe {
+            let (head, tail) = unsafe {
                 let head = &*((state & QUEUE_MASK) as *const WaitNode<Event>);
                 let tail = &*head.get_tail();
-                (head, tail, tail.get_prev())
+                (head, tail)
             };
 
             // If the mutex is locked, let the lock holder handle doing the node dequeue and
@@ -179,6 +179,7 @@ impl<Event: ThreadEvent> WordLock<Event> {
 
             // Release the queue lock & zero out the QUEUE_MASK if the tail was the last
             // node.
+            let new_tail = unsafe { tail.get_prev() };
             if new_tail.is_null() {
                 loop {
                     match self.state.compare_exchange_weak(

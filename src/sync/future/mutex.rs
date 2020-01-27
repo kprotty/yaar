@@ -1,14 +1,24 @@
 use crate::sync::{ThreadEvent, RawMutex as RawMutexSync};
 use futures_core::future::{Future, FusedFuture};
+use super::WaitNode;
 use core::{
     pin::Pin,
     cell::UnsafeCell,
     task::{Poll, Context},
 };
 
+#[cfg(feature = "os")]
+#[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
+
 pub struct RawMutex<T, Event: ThreadEvent> {
     state: RawMutexSync<usize, Event>,
     value: UnsafeCell<T>,
+}
+
+impl<T, Event: ThreadEvent> From<T> for RawMutex<T, Event> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
 }
 
 impl<T: Default, Event: ThreadEvent> Default for RawMutex<T, Event> {
@@ -27,6 +37,10 @@ impl<T, Event: ThreadEvent> RawMutex<T, Event> {
 
     pub fn into_inner(self) -> T {
         self.value.into_inner()
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.value.get() }
     }
 
     pub fn try_lock(&self) -> Option<RawMutexGuard<'_, T, Event>> {
@@ -57,7 +71,8 @@ pub struct RawMutexLockFuture<'a, T, Event: ThreadEvent> {
 
 impl<'a, T, Event: ThreadEvent> FusedFuture for RawMutexLockFuture<'a, T, Event> {
     fn is_terminated(&self) -> bool {
-        wait_node.state.load(Ordering::Acquire) == NOTIFIED
+        let _ = self.mutex.state.lock();
+        
     }
 }
 
