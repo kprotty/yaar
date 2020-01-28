@@ -26,9 +26,9 @@ mod linux;
 #[cfg(all(feature = "os", target_os = "linux"))]
 use linux::Event as SystemThreadEvent;
 
-#[cfg(all(feature = "os", not(target_os = "linux")))]
+#[cfg(all(feature = "os", unix, not(target_os = "linux")))]
 mod posix;
-#[cfg(all(feature = "os", not(target_os = "linux")))]
+#[cfg(all(feature = "os", unix, not(target_os = "linux")))]
 use posix::Event as SystemThreadEvent;
 
 #[cfg(feature = "os")]

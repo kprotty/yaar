@@ -38,10 +38,11 @@ impl<E: Default> WaitNode<E> {
                 self.event.set(MaybeUninit::new(E::default()));
             }
             WaitNodeState::Waiting => {}
+            #[cfg_attr(not(debug_assertions), allow(unused_variables))]
             unexpected => {
                 #[cfg(not(debug_assertions))]
                 unsafe {
-                    core::hint::unreachabled_unchecked()
+                    core::hint::unreachable_unchecked()
                 }
                 #[cfg(debug_assertions)]
                 unreachable!(
@@ -121,10 +122,11 @@ impl<E: ThreadEvent> WaitNode<E> {
         match self.state.get() {
             WaitNodeState::Notified => false,
             WaitNodeState::DirectNotified => true,
+            #[cfg_attr(not(debug_assertions), allow(unused_variables))]
             unexpected => {
                 #[cfg(not(debug_assertions))]
                 unsafe {
-                    core::hint::unreachabled_unchecked()
+                    core::hint::unreachable_unchecked()
                 }
                 #[cfg(debug_assertions)]
                 unreachable!(

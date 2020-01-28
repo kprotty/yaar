@@ -40,6 +40,7 @@ parking_lot = "0.10"
 futures-intrusive = "0.2"
 criterion = "0.3"
 async-std = "1.4"
+crossbeam-utils = "0.7" 
 tokio = { version = "0.2", features = ["sync", "rt-threaded"] }
 
 [lib]
@@ -47,6 +48,10 @@ name = "yaar_lock"
 
 [[bench]]
 name = "async_mutex"
+harness = false
+
+[[bench]]
+name = "sync_mutex"
 harness = false
 
 [package.metadata.docs.rs]

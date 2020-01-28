@@ -1,9 +1,20 @@
-use crate::ThreadEvent;
 use super::WaitNode;
+use crate::ThreadEvent;
 use core::{
     marker::PhantomData,
     sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
 };
+
+#[cfg(feature = "os")]
+#[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
+pub type Mutex<T> = RawMutex<T, crate::OsThreadEvent>;
+
+#[cfg(feature = "os")]
+#[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
+pub type MutexGuard<'a, T> = RawMutexGuard<'a, T, crate::OsThreadEvent>;
+
+pub type RawMutex<T, E> = lock_api::Mutex<WordLock<E>, T>;
+pub type RawMutexGuard<'a, T, E> = lock_api::MutexGuard<'a, WordLock<E>, T>;
 
 const MUTEX_LOCK: usize = 1;
 const QUEUE_LOCK: usize = 2;
@@ -165,7 +176,68 @@ impl<E: ThreadEvent> WordLock<E> {
 }
 
 unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for WordLock<E> {
-    fn unlock_fair(&self) {}
+    fn unlock_fair(&self) {
+        let mut state = self.state.load(Ordering::Relaxed);
+        loop {
+            // there aren't any nodes to dequeue or the queue is locked.
+            // try to unlock the mutex normally without dequeued a node.
+            if (state & QUEUE_MASK == 0) || (state & QUEUE_LOCK != 0) {
+                match self.state.compare_exchange_weak(
+                    state,
+                    state & QUEUE_LOCK,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return,
+                    Err(s) => state = s,
+                }
+            // The queue is unlocked and theres a node to remove.
+            // try to lock the queue in order to dequeue & wake the node.
+            } else {
+                match self.state.compare_exchange_weak(
+                    state,
+                    state | QUEUE_LOCK,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(s) => state = s,
+                }
+            }
+        }
 
-    fn bump(&self) {}
+        'outer: loop {
+            let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<E>) };
+            let (new_tail, tail) = head.dequeue();
+
+            if new_tail.is_null() {
+                loop {
+                    // unlock the queue while zeroing the head since tail is last node
+                    match self.state.compare_exchange_weak(
+                        state,
+                        MUTEX_LOCK,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(s) => state = s,
+                    }
+
+                    // re process the queue if a new node comes in
+                    if state & QUEUE_MASK != 0 {
+                        fence(Ordering::Acquire);
+                        continue 'outer;
+                    }
+                }
+            } else {
+                self.state.fetch_and(!QUEUE_LOCK, Ordering::Release);
+            }
+
+            // wake up the node with the mutex still locked (direct handoff)
+            tail.notify(true);
+            return;
+        }
+    }
+
+    // TODO: bump()
 }
