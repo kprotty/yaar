@@ -11,7 +11,7 @@ pub trait ThreadEvent: Sync + Default {
     /// If the event is already signaled, this returns without blocking.
     fn wait(&self);
 
-    /// Transition the event to a signaled state, 
+    /// Transition the event to a signaled state,
     /// unblocking any threads that were waiting on it.
     fn notify(&self);
 }
@@ -35,8 +35,8 @@ use posix::Event as SystemThreadEvent;
 pub use self::if_os::*;
 #[cfg(feature = "os")]
 mod if_os {
+    use super::{SystemThreadEvent, ThreadEvent};
     use core::fmt;
-    use super::{ThreadEvent, SystemThreadEvent};
 
     /// The default ThreadEvent which uses the platform's blocking primitives.
     #[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
