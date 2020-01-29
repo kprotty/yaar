@@ -1,6 +1,33 @@
-[workspace]
-members = [
-    "yaar",
-    "yaar-lock",
-    "yaar-reactor",
-]
+[package]
+name = "yaar"
+version = "0.2.0"
+authors = ["kprotty"]
+edition = "2018"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/kprotty/yaar/"
+categories = ["network-programming", "asynchronous", "concurrency", "no-std"]
+keywords = ["io", "async", "await", "non-blocking", "futures", "no-std", "thread", "mutex"]
+description = """
+Yet another asynchronous runtime 
+optimized around configuration and no_std.
+"""
+
+[features]
+default = ["full"]
+full = []
+
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true, default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", optional = true, default-features = false }
+
+[package.metadata.playground]
+features = ["full"]
+
+[package.metadata.docs.rs]
+all-features = true
+
