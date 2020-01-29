@@ -7,9 +7,16 @@ const IS_RESET: i32 = 0;
 const IS_WAITING: i32 = 1;
 const IS_SET: i32 = 2;
 
-#[derive(Default)]
 pub struct Event {
     state: AtomicI32,
+}
+
+impl Default for Event {
+    fn default() -> Self {
+        Self {
+            state: AtomicI32::new(IS_RESET),
+        }
+    }
 }
 
 impl Event {

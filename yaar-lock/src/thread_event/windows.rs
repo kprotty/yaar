@@ -27,9 +27,16 @@ const IS_RESET: u32 = 0;
 const IS_WAITING: u32 = 1;
 const IS_SET: u32 = 2;
 
-#[derive(Default)]
 pub struct Event {
     state: AtomicU32,
+}
+
+impl Default for Event {
+    fn default() -> Self {
+        Self {
+            state: AtomicU32::new(IS_RESET),
+        }
+    }
 }
 
 impl Event {
@@ -70,7 +77,7 @@ impl Event {
             match self.state.compare_exchange_weak(
                 IS_RESET,
                 IS_WAITING,
-                Ordering::Relaxed,
+                Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,

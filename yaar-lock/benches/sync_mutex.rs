@@ -25,6 +25,7 @@ fn run_mutex<M: Mutex>(num_locks: usize, is_fair: bool) {
         .collect::<Vec<_>>();
 
     let num_threads = num_cpus::get();
+    let stop_barrier = &Barrier::new(num_threads + 1);
     let start_barrier = &Barrier::new(num_threads + 1);
 
     scope(|scope| {
@@ -42,10 +43,17 @@ fn run_mutex<M: Mutex>(num_locks: usize, is_fair: bool) {
                         .take(NUM_OPS)
                         .for_each(|index| {
                             locks[index].with_lock(is_fair, |c| *c += 1)
-                        })
+                        });
+                    stop_barrier.wait();
                 });
             });
-        start_barrier.wait();  
+
+        start_barrier.wait();
+        stop_barrier.wait();
+
+        let mut total = 0;
+        locks.iter().for_each(|lock| lock.with_lock(is_fair, |c| total += *c));
+        assert_eq!(num_threads * NUM_OPS, total);
     }).unwrap();
 }
 

@@ -34,10 +34,11 @@ impl<E: Default> WaitNode<E> {
         // lazy initialize a node before prepending to the head
         match self.state.get() {
             WaitNodeState::Uninit => {
+                self.state.set(WaitNodeState::Waiting);
                 self.prev.set(MaybeUninit::new(null()));
                 self.event.set(MaybeUninit::new(E::default()));
-            }
-            WaitNodeState::Waiting => {}
+            },
+            WaitNodeState::Waiting => {},
             #[cfg_attr(not(debug_assertions), allow(unused_variables))]
             unexpected => {
                 #[cfg(not(debug_assertions))]
@@ -50,7 +51,7 @@ impl<E: Default> WaitNode<E> {
                     WaitNodeState::Waiting,
                     unexpected,
                 );
-            }
+            },
         }
 
         // prepare a node to be the new head of the queue
@@ -104,6 +105,8 @@ impl<E: ThreadEvent> WaitNode<E> {
 
     pub fn reset(&self) {
         self.get_event().reset();
+        self.state.set(WaitNodeState::Waiting);
+        self.prev.set(MaybeUninit::new(null()));
     }
 
     pub fn notify(&self, is_direct: bool) {
@@ -135,7 +138,7 @@ impl<E: ThreadEvent> WaitNode<E> {
                     WaitNodeState::DirectNotified,
                     unexpected,
                 );
-            }
+            },
         }
     }
 }

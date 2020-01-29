@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Mutex as TokioMutex;
-use yaar_lock::futures::Mutex as YaarMutex;
+use yaar_lock::future::Mutex as YaarMutex;
 
 const TEST_SECS: u64 = 20;
 const ITERATIONS: usize = 50;
