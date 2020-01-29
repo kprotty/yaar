@@ -1,14 +1,20 @@
 use crate::ThreadEvent;
 use core::{cell::Cell, mem::MaybeUninit, ptr::null};
 
+/// The state of a WaitNode in relation to the wait queue.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum WaitNodeState {
+    /// The node is uninitialized so reading from the fields is UB
     Uninit,
+    /// The node is initialized and probably waiting in the wait queue.
     Waiting,
+    /// The node was dequeued and should check a resource again.
     Notified,
+    /// The node was dequeued and was given ownership of a resource.
     DirectNotified,
 }
 
+/// An intrusive, doubly linked list node used to track blocked threads.
 pub struct WaitNode<E> {
     state: Cell<WaitNodeState>,
     event: Cell<MaybeUninit<E>>,
@@ -17,6 +23,7 @@ pub struct WaitNode<E> {
     tail: Cell<MaybeUninit<*const Self>>,
 }
 
+/// Lazy initialize WaitNode as it improves performance in the fast path.
 impl<E> Default for WaitNode<E> {
     fn default() -> Self {
         Self {
