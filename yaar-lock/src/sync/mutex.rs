@@ -152,7 +152,7 @@ impl<E: ThreadEvent> WordLock<E> {
                 continue;
             }
 
-            // The head is safe to deref since its confirmed when queue locking above.
+            // The head is safe to deref since its confirmed to be non-null with the queue locking above.
             let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<E>) };
             let (new_tail, tail) = head.dequeue();
             if new_tail.is_null() {
@@ -217,7 +217,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for WordLock<E> {
         }
         
         'outer: loop {
-            // The head is safe to deref since its confirmed when queue locking above.
+            // The head is safe to deref since its confirmed non-null with the queue locking above.
             let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<E>) };
             let (new_tail, tail) = head.dequeue();
 
@@ -261,11 +261,14 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for WordLock<E> {
 fn test_mutex() {
     use std::{thread, sync::{Arc, Mutex, Barrier, atomic::AtomicBool}};
     const NUM_THREADS: usize = 10;
-    const NUM_ITERS: usize = 100_000;
+    const NUM_ITERS: usize = 10_000;
 
     #[derive(Debug)]
     struct Context {
+        /// Used to check if the critical section is really accessed by one thread
         is_exclusive: AtomicBool,
+        /// Counter which is verified after running. 
+        /// u128 since most cpus cannot operate on it with one instruction. 
         count: u128,
     }
 

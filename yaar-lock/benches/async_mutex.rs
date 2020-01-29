@@ -11,7 +11,7 @@ use std::{
 use tokio::sync::Mutex as TokioMutex;
 use yaar_lock::future::Mutex as YaarMutex;
 
-const TEST_SECS: u64 = 20;
+const TEST_SECS: u64 = 10;
 const ITERATIONS: usize = 50;
 const NUM_YIELDS: usize = 10;
 const YIELD_CHANCE: usize = 25;
@@ -121,7 +121,7 @@ fn tokio_rt_yaar_fair(c: &mut Criterion) {
         tokio::spawn,
         "tokio/yaar(fair)",
         YaarMutex::new(()),
-        |m: yaar_lock::futures::MutexGuard<'_, ()>| m.unlock_fair(),
+        |m| yaar_lock::future::MutexGuard::unlock_fair(m),
     );
 }
 
@@ -187,7 +187,7 @@ fn async_std_yaar_fair(c: &mut Criterion) {
         task::spawn,
         "async_std/yaar(fair)",
         YaarMutex::new(()),
-        |m: yaar_lock::futures::MutexGuard<'_, ()>| m.unlock_fair(),
+        |m| yaar_lock::future::MutexGuard::unlock_fair(m),
     );
 }
 
@@ -226,20 +226,22 @@ fn async_std_tokio(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().measurement_time(Duration::from_secs(TEST_SECS));
+    config = Criterion::default()
+        .sample_size(20)
+        .measurement_time(Duration::from_secs(TEST_SECS));
     targets =
         // tokio
-        tokio_rt_yaar_fair,
-        tokio_rt_intrusive_fair,
         tokio_rt_yaar_unfair,
         tokio_rt_intrusive_unfair,
+        tokio_rt_yaar_fair,
+        tokio_rt_intrusive_fair,
         tokio_rt_async_std,
         tokio_rt_tokio,
         // async-std
-        async_std_yaar_fair,
-        async_std_intrusive_fair,
         async_std_yaar_unfair,
         async_std_intrusive_unfair,
+        async_std_yaar_fair,
+        async_std_intrusive_fair,
         async_std_async_std,
         async_std_tokio
 }
