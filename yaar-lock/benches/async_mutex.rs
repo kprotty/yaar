@@ -47,7 +47,7 @@ impl Future for Yield {
 }
 
 macro_rules! run_mutex {
-    ($b:ident, $setup:expr, $spawn:expr, $new:expr, $iters:expr, $threads:expr, $drop:expr) => {
+    ($b:ident, $setup:expr, $spawn:expr, $new:expr, $iters:expr, $threads:expr,) => {
         #[allow(unused_mut)]
         let mut rt = $setup;
         $b.iter(|| {
@@ -62,11 +62,10 @@ macro_rules! run_mutex {
                     let sema = sema.clone();
                     tasks.push($spawn(async move {
                         for count in 0..$iters {
-                            let guard = mutex.lock().await;
+                            let _guard = mutex.lock().await;
                             if YIELD_CHANCE != 0 && (count % (100 / YIELD_CHANCE) == 0) {
                                 Yield { iter: NUM_YIELDS }.await;
                             }
-                            $drop(guard);
                         }
                         sema.release(1);
                     }));
@@ -79,14 +78,14 @@ macro_rules! run_mutex {
 }
 
 macro_rules! benchmarks {
-    ($c:ident, $setup:expr, $spawn:expr, $name:literal, $new:expr, $drop:expr,) => {
+    ($c:ident, $setup:expr, $spawn:expr, $name:literal, $new:expr,) => {
         $c.bench(
             $name,
             Benchmark::new("contention", |b| {
-                run_mutex!(b, $setup, $spawn, $new, ITERATIONS, num_cpus::get(), $drop);
+                run_mutex!(b, $setup, $spawn, $new, ITERATIONS, num_cpus::get(),);
             })
             .with_function("no_contention", |b| {
-                run_mutex!(b, $setup, $spawn, $new, ITERATIONS, 1, $drop);
+                run_mutex!(b, $setup, $spawn, $new, ITERATIONS, 1,);
             }),
         );
     };
@@ -99,7 +98,6 @@ fn tokio_rt_intrusive_fair(c: &mut Criterion) {
         tokio::spawn,
         "tokio/futures_intrusive(fair)",
         IntrusiveMutex::new((), true),
-        |m| std::mem::drop(m),
     );
 }
 
@@ -110,7 +108,6 @@ fn tokio_rt_intrusive_unfair(c: &mut Criterion) {
         tokio::spawn,
         "tokio/futures_intrusive(unfair)",
         IntrusiveMutex::new((), false),
-        |m| std::mem::drop(m),
     );
 }
 
@@ -120,8 +117,7 @@ fn tokio_rt_yaar_fair(c: &mut Criterion) {
         tokio::runtime::Runtime::new().unwrap(),
         tokio::spawn,
         "tokio/yaar(fair)",
-        YaarMutex::new(()),
-        |m| yaar_lock::future::MutexGuard::unlock_fair(m),
+        YaarMutex::new((), true),
     );
 }
 
@@ -131,8 +127,7 @@ fn tokio_rt_yaar_unfair(c: &mut Criterion) {
         tokio::runtime::Runtime::new().unwrap(),
         tokio::spawn,
         "tokio/yaar(unfair)",
-        YaarMutex::new(()),
-        |m| std::mem::drop(m),
+        YaarMutex::new((), false),
     );
 }
 
@@ -143,7 +138,6 @@ fn tokio_rt_async_std(c: &mut Criterion) {
         tokio::spawn,
         "tokio/async_std",
         AsyncStdMutex::new(()),
-        |m| std::mem::drop(m),
     );
 }
 
@@ -154,7 +148,6 @@ fn tokio_rt_tokio(c: &mut Criterion) {
         tokio::spawn,
         "tokio/tokio",
         TokioMutex::new(()),
-        |m| std::mem::drop(m),
     );
 }
 
@@ -165,7 +158,6 @@ fn async_std_intrusive_fair(c: &mut Criterion) {
         task::spawn,
         "async_std/futures_intrusive(fair)",
         IntrusiveMutex::new((), true),
-        |m| std::mem::drop(m),
     );
 }
 
@@ -176,7 +168,6 @@ fn async_std_intrusive_unfair(c: &mut Criterion) {
         task::spawn,
         "async_std/futures_intrusive(unfair)",
         IntrusiveMutex::new((), false),
-        |m| std::mem::drop(m),
     );
 }
 
@@ -186,8 +177,7 @@ fn async_std_yaar_fair(c: &mut Criterion) {
         FakeAsyncStdRuntime {},
         task::spawn,
         "async_std/yaar(fair)",
-        YaarMutex::new(()),
-        |m| yaar_lock::future::MutexGuard::unlock_fair(m),
+        YaarMutex::new((), true),
     );
 }
 
@@ -197,8 +187,7 @@ fn async_std_yaar_unfair(c: &mut Criterion) {
         FakeAsyncStdRuntime {},
         task::spawn,
         "async_std/yaar(unfair)",
-        YaarMutex::new(()),
-        |m| std::mem::drop(m),
+        YaarMutex::new((), false),
     );
 }
 
@@ -209,7 +198,6 @@ fn async_std_async_std(c: &mut Criterion) {
         task::spawn,
         "async_std/async_std",
         AsyncStdMutex::new(()),
-        |m| std::mem::drop(m),
     );
 }
 
@@ -220,7 +208,6 @@ fn async_std_tokio(c: &mut Criterion) {
         task::spawn,
         "async_std/tokio",
         TokioMutex::new(()),
-        |m| std::mem::drop(m),
     );
 }
 

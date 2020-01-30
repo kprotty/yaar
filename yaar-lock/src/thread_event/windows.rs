@@ -48,7 +48,7 @@ impl Event {
         self.state.store(IS_RESET, Ordering::Relaxed);
     }
 
-    pub fn notify(&self) {
+    pub fn set(&self) {
         let waiting = self.state.swap(IS_SET, Ordering::Release) >> 1;
         if waiting != 0 {
             let void_ptr = &self.state as *const _ as PVOID;

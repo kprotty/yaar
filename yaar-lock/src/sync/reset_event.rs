@@ -6,36 +6,37 @@ use core::{
     sync::atomic::{fence, AtomicUsize, Ordering},
 };
 
+#[cfg(feature = "os")]
+pub use self::if_os::*;
+#[cfg(feature = "os")]
+mod if_os {
+    use super::*;
+    use crate::OsThreadEvent;
+
+    /// A [`WordEvent`] backed by [`OsThreadEvent`] for thread blocking.
+    #[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
+    pub type ResetEvent = WordEvent<OsThreadEvent>;
+}
+
 const IS_SET: usize = 0b1;
 
-#[cfg(feature = "os")]
-#[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
-pub type ResetEvent = RawResetEvent<crate::OsThreadEvent>;
-
-pub struct RawResetEvent<E> {
+/// A word (`usize`) sized [`ThreadEvent`] implementation.
+pub struct WordEvent<E> {
     state: AtomicUsize,
     phantom: PhantomData<E>,
 }
 
-impl<E> Default for RawResetEvent<E> {
+unsafe impl<E: Send> Send for WordEvent<E> {}
+
+unsafe impl<E: Sync> Sync for WordEvent<E> {}
+
+impl<E> Default for WordEvent<E> {
     fn default() -> Self {
         Self::new(false)
     }
 }
 
-unsafe impl<E: Send> Send for RawResetEvent<E> {}
-
-unsafe impl<E: Sync> Sync for RawResetEvent<E> {}
-
-impl<E> fmt::Debug for RawResetEvent<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ResetEvent")
-            .field("is_set", &self.is_set())
-            .finish()
-    }
-}
-
-impl<E> RawResetEvent<E> {
+impl<E> WordEvent<E> {
     #[inline]
     pub fn new(is_set: bool) -> Self {
         Self {
@@ -43,21 +44,29 @@ impl<E> RawResetEvent<E> {
             phantom: PhantomData,
         }
     }
+}
 
+impl<E: ThreadEvent> fmt::Debug for WordEvent<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WordEvent")
+            .field("is_set", &self.is_set())
+            .finish()
+    }
+}
+
+impl<E: ThreadEvent> ThreadEvent for WordEvent<E> {
     #[inline]
-    pub fn is_set(&self) -> bool {
+    fn is_set(&self) -> bool {
         self.state.load(Ordering::Acquire) == IS_SET
     }
 
     #[inline]
-    pub fn reset(&self) {
+    fn reset(&self) {
         self.state.store(0, Ordering::Relaxed);
     }
-}
 
-impl<E: ThreadEvent> RawResetEvent<E> {
     #[inline]
-    pub fn set(&self) {
+    fn set(&self) {
         let state = self.state.swap(IS_SET, Ordering::Release);
         let head = (state & !IS_SET) as *const WaitNode<E>;
         if !head.is_null() {
@@ -66,12 +75,14 @@ impl<E: ThreadEvent> RawResetEvent<E> {
     }
 
     #[inline]
-    pub fn wait(&self) {
+    fn wait(&self) {
         if !self.is_set() {
             self.wait_slow();
         }
     }
+}
 
+impl<E: ThreadEvent> WordEvent<E> {
     #[cold]
     fn wake_slow(&self, head: &WaitNode<E>) {
         loop {
@@ -118,7 +129,7 @@ impl<E: ThreadEvent> RawResetEvent<E> {
 fn test_reset_event() {
     use std::{cell::Cell, sync::Arc, thread};
 
-    let event = ResetEvent::new(false);
+    let event = ResetEvent::default();
     assert_eq!(event.is_set(), false);
 
     event.set();
@@ -137,8 +148,8 @@ fn test_reset_event() {
 
     let context = Arc::new(Context {
         value: Cell::new(0),
-        input: ResetEvent::new(false),
-        output: ResetEvent::new(false),
+        input: ResetEvent::default(),
+        output: ResetEvent::default(),
     });
 
     let receiver = {

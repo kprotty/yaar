@@ -6,25 +6,47 @@ use core::{
 };
 
 #[cfg(feature = "os")]
-#[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
-pub type Mutex<T> = RawMutex<T, crate::OsThreadEvent>;
-
+pub use self::if_os::*;
 #[cfg(feature = "os")]
-#[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
-pub type MutexGuard<'a, T> = RawMutexGuard<'a, T, crate::OsThreadEvent>;
+mod if_os {
+    use super::*;
+    use crate::OsThreadEvent;
 
+    /// A [`WordLock`] backed by [`OsThreadEvent`].
+    #[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
+    pub type Mutex<T> = RawMutex<T, OsThreadEvent>;
+
+    /// A [`RawMutexGuard`] for [`Mutex`].
+    #[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
+    pub type MutexGuard<'a, T> = RawMutexGuard<'a, T, OsThreadEvent>;
+}
+
+/// A mutual exclusion primitive useful for protecting shared data using
+/// [`ThreadEvent`] for thread blocking.
 pub type RawMutex<T, E> = lock_api::Mutex<WordLock<E>, T>;
+
+/// An RAII implementation of a "scoped lock" of a [`RawMutex`].
+/// When this structure is dropped (falls out of scope), the lock will be
+/// unlocked.
+///
+/// The data protected by the mutex can be accessed through this guard via its
+/// `Deref` and `DerefMut` implementations.
 pub type RawMutexGuard<'a, T, E> = lock_api::MutexGuard<'a, WordLock<E>, T>;
 
 const MUTEX_LOCK: usize = 1;
 const QUEUE_LOCK: usize = 2;
 const QUEUE_MASK: usize = !(QUEUE_LOCK | MUTEX_LOCK);
 
-#[doc(hidden)]
+/// [`lock_api::RawMutex`] implementation of parking_lot's [`WordLock`].
+///
+/// [`WordLock`]: https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
 pub struct WordLock<E> {
     state: AtomicUsize,
     phantom: PhantomData<E>,
 }
+
+unsafe impl<E: Send> Send for WordLock<E> {}
+unsafe impl<E: Sync> Sync for WordLock<E> {}
 
 unsafe impl<E: ThreadEvent> lock_api::RawMutex for WordLock<E> {
     const INIT: Self = Self {

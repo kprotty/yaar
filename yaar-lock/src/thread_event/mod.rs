@@ -13,7 +13,7 @@ pub trait ThreadEvent: Sync + Default {
 
     /// Transition the event to a signaled state,
     /// unblocking any threads that were waiting on it.
-    fn notify(&self);
+    fn set(&self);
 }
 
 #[cfg(all(feature = "os", windows))]
@@ -63,8 +63,8 @@ mod if_os {
             self.0.reset()
         }
 
-        fn notify(&self) {
-            self.0.notify()
+        fn set(&self) {
+            self.0.set()
         }
 
         fn wait(&self) {

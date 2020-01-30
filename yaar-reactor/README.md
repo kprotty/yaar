@@ -10,8 +10,12 @@ This crate is currently under development.
 Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
-yaar-reactor = "0.1"
+yaar-reactor = { version = "0.1", features = ["full"] }
 ```
+
+`yaar-reactor` has features enabled by defualt and requires them to be set explicitely.
+As a shorthand, the `full` feature enables all components.
+See the [Documentation](https://docs.rs/yaar-reactor/badge.svg) for more on the available features.
 
 ## License
 

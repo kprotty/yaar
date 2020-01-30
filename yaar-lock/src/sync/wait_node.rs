@@ -3,7 +3,7 @@ use core::{cell::Cell, mem::MaybeUninit, ptr::null};
 
 /// The state of a WaitNode in relation to the wait queue.
 #[derive(Debug, Copy, Clone, PartialEq)]
-pub enum WaitNodeState {
+pub(crate) enum WaitNodeState {
     /// The node is uninitialized so reading from the fields is UB
     Uninit,
     /// The node is initialized and probably waiting in the wait queue.
@@ -15,7 +15,7 @@ pub enum WaitNodeState {
 }
 
 /// An intrusive, doubly linked list node used to track blocked threads.
-pub struct WaitNode<E> {
+pub(crate) struct WaitNode<E> {
     state: Cell<WaitNodeState>,
     event: Cell<MaybeUninit<E>>,
     prev: Cell<MaybeUninit<*const Self>>,
@@ -138,7 +138,7 @@ impl<E: ThreadEvent> WaitNode<E> {
         } else {
             WaitNodeState::Notified
         });
-        event.notify();
+        event.set();
     }
 
     /// Block this node, waiting to be notified by another WaitNode.

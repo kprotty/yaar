@@ -28,12 +28,19 @@ impl Event {
         self.state.store(IS_RESET, Ordering::Relaxed);
     }
 
-    pub fn notify(&self) {
+    pub fn set(&self) {
         // Check if theres a thread waiting to avoid an unnecessary FUTEX_WAKE if
         // possible.
         if self.state.swap(IS_SET, Ordering::Release) == IS_WAITING {
             let ptr = &self.state as *const _ as *const i32;
-            let r = unsafe { syscall(SYS_futex, ptr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, i32::max_value()) };
+            let r = unsafe {
+                syscall(
+                    SYS_futex,
+                    ptr,
+                    FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+                    i32::max_value(),
+                )
+            };
             debug_assert!(r >= 0);
         }
     }
