@@ -3,7 +3,7 @@
 use core::{
     mem::{size_of, transmute, MaybeUninit},
     ptr::null_mut,
-    sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{spin_loop_hint, AtomicU32, AtomicUsize, Ordering},
 };
 use winapi::{
     shared::{
@@ -24,8 +24,8 @@ use winapi::{
 };
 
 const IS_RESET: u32 = 0;
-const IS_WAITING: u32 = 1;
-const IS_SET: u32 = 2;
+const IS_SET: u32 = 1;
+const IS_WAITING: u32 = 2;
 
 pub struct Event {
     state: AtomicU32,
@@ -49,18 +49,21 @@ impl Event {
     }
 
     pub fn notify(&self) {
-        if self.state.swap(IS_SET, Ordering::Release) == IS_WAITING {
+        let waiting = self.state.swap(IS_SET, Ordering::Release) >> 1;
+        if waiting != 0 {
             let void_ptr = &self.state as *const _ as PVOID;
             match get_backend() {
                 Backend::KeyedEvent(handle) => unsafe {
                     let notify = _NtReleaseKeyedEvent.load(Ordering::Relaxed);
                     let notify = transmute::<_, NtInvokeKeyedEvent>(notify);
-                    let status = notify(handle, void_ptr, FALSE, null_mut());
-                    debug_assert_eq!(status, STATUS_SUCCESS, "Error in NtReleaseKeyedEvent()");
+                    for _ in 0..waiting {
+                        let status = notify(handle, void_ptr, FALSE, null_mut());
+                        debug_assert_eq!(status, STATUS_SUCCESS, "Error in NtReleaseKeyedEvent()");
+                    }
                 },
                 Backend::WaitOnAddress => unsafe {
-                    let notify = _WakeByAddressSingle.load(Ordering::Relaxed);
-                    let notify = transmute::<_, WakeByAddressSingle>(notify);
+                    let notify = _WakeByAddressAll.load(Ordering::Relaxed);
+                    let notify = transmute::<_, WakeByAddressAll>(notify);
                     notify(void_ptr);
                 },
             }
@@ -69,22 +72,19 @@ impl Event {
 
     pub fn wait(&self) {
         // Try to transition into the waiting state, returning if already signaled.
-        let mut state = self.state.load(Ordering::Acquire);
         loop {
+            let state = self.state.load(Ordering::Acquire);
             if state == IS_SET {
                 return;
             }
             match self.state.compare_exchange_weak(
-                IS_RESET,
-                IS_WAITING,
+                state,
+                state + IS_WAITING,
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
-                Err(s) => {
-                    fence(Ordering::Acquire);
-                    state = s;
-                }
+                Err(_) => spin_loop_hint(),
             }
         }
 
@@ -136,8 +136,8 @@ fn get_backend() -> Backend {
     }
 }
 
-static _WakeByAddressSingle: AtomicUsize = AtomicUsize::new(0);
-type WakeByAddressSingle = extern "stdcall" fn(Address: PVOID);
+static _WakeByAddressAll: AtomicUsize = AtomicUsize::new(0);
+type WakeByAddressAll = extern "stdcall" fn(Address: PVOID);
 
 static _WaitOnAddress: AtomicUsize = AtomicUsize::new(0);
 type WaitOnAddress = extern "stdcall" fn(
@@ -163,11 +163,11 @@ unsafe fn load_wait_on_address() -> bool {
         _WaitOnAddress.store(wait as usize, Ordering::Relaxed);
     }
 
-    let notify = GetProcAddress(dll, b"WakeByAddressSingle\0".as_ptr() as LPCSTR);
+    let notify = GetProcAddress(dll, b"WakeByAddressAll\0".as_ptr() as LPCSTR);
     if notify.is_null() {
         return false;
     } else {
-        _WakeByAddressSingle.store(notify as usize, Ordering::Relaxed);
+        _WakeByAddressAll.store(notify as usize, Ordering::Relaxed);
     }
 
     debug_assert_eq!(

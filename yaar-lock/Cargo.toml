@@ -37,7 +37,7 @@ winapi = { version = "0.3", optional = true, default-features = false }
 [dev-dependencies]
 num_cpus = "1.11"
 parking_lot = "0.10"
-futures-intrusive = "0.2"
+futures-intrusive = "0.3"
 criterion = "0.3"
 async-std = "1.4"
 crossbeam-utils = "0.7" 

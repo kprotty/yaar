@@ -1,6 +1,6 @@
 use core::cell::{Cell, UnsafeCell};
 use libc::{
-    pthread_cond_destroy, pthread_cond_signal, pthread_cond_t, pthread_cond_wait,
+    pthread_cond_destroy, pthread_cond_signal, pthread_cond_t, pthread_cond_broadcast,
     pthread_mutex_destroy, pthread_mutex_lock, pthread_mutex_t, pthread_mutex_unlock,
     PTHREAD_COND_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
 };
@@ -78,7 +78,7 @@ impl Event {
             // Only notify if the event isnt set
             if !self.is_set.get() {
                 self.is_set.set(true);
-                let r = pthread_cond_signal(self.cond.get());
+                let r = pthread_cond_broadcast(self.cond.get());
                 debug_assert_eq!(r, 0);
             }
 

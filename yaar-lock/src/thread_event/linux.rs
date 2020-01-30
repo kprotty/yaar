@@ -33,8 +33,8 @@ impl Event {
         // possible.
         if self.state.swap(IS_SET, Ordering::Release) == IS_WAITING {
             let ptr = &self.state as *const _ as *const i32;
-            let r = unsafe { syscall(SYS_futex, ptr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1) };
-            debug_assert!(r == 0 || r == 1);
+            let r = unsafe { syscall(SYS_futex, ptr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, i32::max_value()) };
+            debug_assert!(r >= 0);
         }
     }
 
