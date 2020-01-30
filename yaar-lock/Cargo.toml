@@ -80,7 +80,7 @@ harness = false
 required-features = ["bench_sync"]
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["full", "nightly"]
 
 [package.metadata.playground]
 features = ["full"]
