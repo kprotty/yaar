@@ -15,7 +15,7 @@ yaar = { version = "0.1", features = ["full"] }
 
 `yaar` has features enabled by defualt and requires them to be set explicitely.
 As a shorthand, the `full` feature enables all components.
-See the [Documentation](https://docs.rs/yaar/badge.svg) for more on the available features.
+See the [Documentation](https://docs.rs/yaar/) for more on the available features.
 
 ## License
 

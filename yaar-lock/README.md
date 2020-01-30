@@ -14,7 +14,7 @@ yaar_lock = { version = "0.2", features = ["full"] }
 
 `yaar-lock` has features enabled by defualt and requires them to be set explicitely.
 As a shorthand, the `full` feature enables all components.
-See the [Documentation](https://docs.rs/yaar-lock/badge.svg) for more on the available features.
+See the [Documentation](https://docs.rs/yaar-lock/) for more on the available features.
 
 ## License
 

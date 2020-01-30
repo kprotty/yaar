@@ -15,7 +15,7 @@ yaar-reactor = { version = "0.1", features = ["full"] }
 
 `yaar-reactor` has features enabled by defualt and requires them to be set explicitely.
 As a shorthand, the `full` feature enables all components.
-See the [Documentation](https://docs.rs/yaar-reactor/badge.svg) for more on the available features.
+See the [Documentation](https://docs.rs/yaar-reactor/) for more on the available features.
 
 ## License
 
