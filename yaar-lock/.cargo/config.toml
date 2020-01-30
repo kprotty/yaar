@@ -1,4 +1,3 @@
 [alias]
-c = ["check", "--features=full"]
 bench_sync_mutex = ["bench", "--bench", "sync_mutex", "--features=bench_sync"]
 bench_async_mutex = ["bench", "--bench", "async_mutex", "--features=bench_async"]
