@@ -47,10 +47,11 @@ impl<E: Default> WaitNode<E> {
                 self.state.set(WaitNodeState::Waiting);
                 self.prev.set(MaybeUninit::new(null()));
                 self.event.set(MaybeUninit::new(E::default()));
-            },
+            }
             // node is already initialized, only change the links volatile to the head below.
-            WaitNodeState::Waiting => {},
-            // node is in an unknown state, unchecked in release for performance (less so than in notify())
+            WaitNodeState::Waiting => {}
+            // node is in an unknown state, unchecked in release for performance (less so than in
+            // notify())
             #[cfg(not(debug_assertions))]
             _ => unsafe { core::hint::unreachable_unchecked() },
             // In debug mode, this fault should still be caught and reported
@@ -111,15 +112,16 @@ impl<E: Default> WaitNode<E> {
 }
 
 impl<E: ThreadEvent> WaitNode<E> {
-    /// Get a reference to the thread event, assuming the WaitNode is initialized.
+    /// Get a reference to the thread event, assuming the WaitNode is
+    /// initialized.
     #[inline]
     fn get_event(&self) -> &E {
-        debug_assert_eq!(self.state.get(), WaitNodeState::Waiting);
         unsafe { &*(&*self.event.as_ptr()).as_ptr() }
     }
 
     /// Reset the wait node without uninitializing it.
-    /// Less expensive than re-initialization, especially for larger ThreadEvent's.
+    /// Less expensive than re-initialization, especially for larger
+    /// ThreadEvent's.
     pub fn reset(&self) {
         self.get_event().reset();
         self.state.set(WaitNodeState::Waiting);

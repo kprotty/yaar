@@ -1,6 +1,6 @@
-use std::{time::Duration, iter, sync::Barrier};
-use crossbeam_utils::{CachePadded, thread::scope};
 use criterion::{criterion_group, criterion_main, Benchmark, Criterion};
+use crossbeam_utils::{thread::scope, CachePadded};
+use std::{iter, sync::Barrier, time::Duration};
 
 const NUM_OPS: usize = 100;
 const TEST_SECS: u64 = 10;
@@ -41,9 +41,7 @@ fn run_mutex<M: Mutex>(num_locks: usize, is_fair: bool) {
                     random_numbers(thread_seed)
                         .map(|it| it % num_locks)
                         .take(NUM_OPS)
-                        .for_each(|index| {
-                            locks[index].with_lock(is_fair, |c| *c += 1)
-                        });
+                        .for_each(|index| locks[index].with_lock(is_fair, |c| *c += 1));
                     stop_barrier.wait();
                 });
             });
@@ -52,9 +50,12 @@ fn run_mutex<M: Mutex>(num_locks: usize, is_fair: bool) {
         stop_barrier.wait();
 
         let mut total = 0;
-        locks.iter().for_each(|lock| lock.with_lock(is_fair, |c| total += *c));
+        locks
+            .iter()
+            .for_each(|lock| lock.with_lock(is_fair, |c| total += *c));
         assert_eq!(num_threads * NUM_OPS, total);
-    }).unwrap();
+    })
+    .unwrap();
 }
 
 type Std = std::sync::Mutex<usize>;

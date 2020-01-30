@@ -1,15 +1,15 @@
 // Documentation lifted from futures-intrusive and lock_api
 
 use super::{WaitNode, WaitNodeState};
-use futures_core::future::FusedFuture;
 use core::{
-    fmt,
-    pin::Pin,
-    future::Future,
     cell::UnsafeCell,
+    fmt,
+    future::Future,
     ops::{Deref, DerefMut},
-    task::{Poll, Context},
+    pin::Pin,
+    task::{Context, Poll},
 };
+use futures_core::future::FusedFuture;
 
 const LOCK_BIT: usize = 0b1;
 
@@ -26,11 +26,12 @@ pub type MutexGuard<'a, T> = RawMutexGuard<'a, T, crate::sync::WordLock<crate::O
 /// A futures-aware mutex backed by os blocking.
 #[cfg(feature = "os")]
 #[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
-pub type MutexLockFuture<'a, T> = RawMutexLockFuture<'a, T, crate::sync::WordLock<crate::OsThreadEvent>>;
+pub type MutexLockFuture<'a, T> =
+    RawMutexLockFuture<'a, T, crate::sync::WordLock<crate::OsThreadEvent>>;
 
 /// A futures-aware mutex.
 pub struct RawMutex<T, Raw: lock_api::RawMutex> {
-    state: lock_api::Mutex<Raw, usize>, 
+    state: lock_api::Mutex<Raw, usize>,
     value: UnsafeCell<T>,
 }
 
@@ -141,7 +142,8 @@ impl<T, Raw: lock_api::RawMutex> RawMutex<T, Raw> {
     }
 }
 
-/// A future which resolves when the target mutex has been successfully acquired.
+/// A future which resolves when the target mutex has been successfully
+/// acquired.
 #[must_use = "futures do nothing unless polled"]
 pub struct RawMutexLockFuture<'a, T, Raw: lock_api::RawMutex> {
     mutex: Option<&'a RawMutex<T, Raw>>,
@@ -161,7 +163,7 @@ impl<'a, T: fmt::Debug, Raw: lock_api::RawMutex> fmt::Debug for RawMutexLockFutu
 
 impl<'a, T, Raw: lock_api::RawMutex> FusedFuture for RawMutexLockFuture<'a, T, Raw> {
     fn is_terminated(&self) -> bool {
-        self.mutex.is_none() 
+        self.mutex.is_none()
     }
 }
 
@@ -183,9 +185,11 @@ impl<'a, T, Raw: lock_api::RawMutex> Future for RawMutexLockFuture<'a, T, Raw> {
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         // Safe as RawMutexLockFuture is !Unpin because of the WaitNode
-        // and the address of the future wont change since its pinned. 
+        // and the address of the future wont change since its pinned.
         let mut_self = unsafe { self.get_unchecked_mut() };
-        let mutex = mut_self.mutex.expect("polled MutexLockFuture after completion");
+        let mutex = mut_self
+            .mutex
+            .expect("polled MutexLockFuture after completion");
         let mut state = mutex.state.lock();
 
         match mut_self.wait_node.state.get() {
@@ -200,7 +204,7 @@ impl<'a, T, Raw: lock_api::RawMutex> Future for RawMutexLockFuture<'a, T, Raw> {
                     *state = (new_head as usize) | LOCK_BIT;
                     Poll::Pending
                 }
-            },
+            }
             WaitNodeState::Waiting => Poll::Pending,
             WaitNodeState::Notified => {
                 mut_self.mutex = None;

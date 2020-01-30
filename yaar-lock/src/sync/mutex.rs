@@ -134,7 +134,8 @@ impl<E: ThreadEvent> WordLock<E> {
 
         // A Acquire barrier is required when looping back with a new state
         // since it will be dereferenced and read from as the head of the queue
-        // and updates to its fields need to be visible from the Release store in `lock_slow()`.
+        // and updates to its fields need to be visible from the Release store in
+        // `lock_slow()`.
         'outer: loop {
             // If the mutex is locked, let the under dequeue the node.
             // Safe to use Relaxed on success since not making any memory writes visible.
@@ -152,7 +153,8 @@ impl<E: ThreadEvent> WordLock<E> {
                 continue;
             }
 
-            // The head is safe to deref since its confirmed to be non-null with the queue locking above.
+            // The head is safe to deref since its confirmed to be non-null with the queue
+            // locking above.
             let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<E>) };
             let (new_tail, tail) = head.dequeue();
             if new_tail.is_null() {
@@ -215,13 +217,14 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for WordLock<E> {
                 }
             }
         }
-        
+
         'outer: loop {
-            // The head is safe to deref since its confirmed non-null with the queue locking above.
+            // The head is safe to deref since its confirmed non-null with the queue locking
+            // above.
             let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<E>) };
             let (new_tail, tail) = head.dequeue();
 
-            // update the state to dequeue with a Release ordering which 
+            // update the state to dequeue with a Release ordering which
             // publishes the writes done by `.dequeue()` to other threads.
             if new_tail.is_null() {
                 loop {
@@ -259,16 +262,20 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for WordLock<E> {
 #[cfg(test)]
 #[test]
 fn test_mutex() {
-    use std::{thread, sync::{Arc, Mutex, Barrier, atomic::AtomicBool}};
+    use std::{
+        sync::{atomic::AtomicBool, Arc, Barrier, Mutex},
+        thread,
+    };
     const NUM_THREADS: usize = 10;
     const NUM_ITERS: usize = 10_000;
 
     #[derive(Debug)]
     struct Context {
-        /// Used to check if the critical section is really accessed by one thread
+        /// Used to check if the critical section is really accessed by one
+        /// thread
         is_exclusive: AtomicBool,
-        /// Counter which is verified after running. 
-        /// u128 since most cpus cannot operate on it with one instruction. 
+        /// Counter which is verified after running.
+        /// u128 since most cpus cannot operate on it with one instruction.
         count: u128,
     }
 
@@ -295,5 +302,8 @@ fn test_mutex() {
         .collect::<Vec<_>>();
     start_barrier.wait();
     workers.into_iter().for_each(|t| t.join().unwrap());
-    assert_eq!(context.lock().unwrap().count, (NUM_ITERS * NUM_THREADS) as u128);
+    assert_eq!(
+        context.lock().unwrap().count,
+        (NUM_ITERS * NUM_THREADS) as u128
+    );
 }

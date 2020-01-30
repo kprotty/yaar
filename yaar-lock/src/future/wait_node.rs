@@ -1,9 +1,4 @@
-use core::{
-    ptr::null,
-    cell::Cell,
-    task::Waker,
-    marker::PhantomPinned,
-};
+use core::{cell::Cell, marker::PhantomPinned, ptr::null, task::Waker};
 
 /// The state of a waiting node in relation to the wait queue.
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -52,7 +47,7 @@ impl WaitNode {
         debug_assert_eq!(self.state.get(), WaitNodeState::Reset);
         self.next.set(head);
         self.prev.set(null());
-        
+
         if head.is_null() {
             self.tail.set(self);
         } else {
