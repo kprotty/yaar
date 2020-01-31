@@ -3,7 +3,7 @@ use core::{cell::Cell, fmt::Debug};
 
 pub trait Executor: Sync + Debug {
     /// Schedule the task to be eventually executed.
-    fn submit(&self, task: &mut Task);
+    fn schedule(&self, task: &Task);
 }
 
 /// Reference to the current running executor.
@@ -26,18 +26,12 @@ pub fn with_executor_as<E: Executor + 'static, T>(executor: &E, f: impl FnOnce(&
     let our_ref = unsafe { &*(executor as *const E) };
     let old_ref = EXECUTOR_REF.0.replace(Some(our_ref));
     let result = f(executor);
-    assert_eq!(
-        Some(our_ref as *const _),
-        EXECUTOR_REF
-            .0
-            .replace(old_ref)
-            .map(|ptr| ptr as *const _ as *const E),
-        "The executor stack was somehow malformed",
-    );
+    EXECUTOR_REF.0.set(old_ref);
     result
 }
 
 /// Run the provided function with a referece to the global executor.
+/// Returns `None` if not called in the scope of [`with_executor_as`].
 ///
 /// # Safety
 ///
@@ -45,9 +39,6 @@ pub fn with_executor_as<E: Executor + 'static, T>(executor: &E, f: impl FnOnce(&
 /// the static lifetime serves only as a placebo to indicate that the reference
 /// is global meaning there are no guarantees on its validity after the function
 /// ends.
-pub(crate) fn with_executor<T>(f: impl FnOnce(&'static dyn Executor) -> T) -> T {
-    f(EXECUTOR_REF
-        .0
-        .get()
-        .expect("Tried to get the executor without being in the scope of `with_executor_as`"))
+pub(crate) fn with_executor<T>(f: impl FnOnce(&'static dyn Executor) -> T) -> Option<T> {
+    EXECUTOR_REF.0.get().map(f)
 }

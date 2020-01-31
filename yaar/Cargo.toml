@@ -19,6 +19,7 @@ nightly = []
 full = []
 
 [dependencies]
+lock_api = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true, default-features = false }
