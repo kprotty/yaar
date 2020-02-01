@@ -19,19 +19,21 @@ const PTR_TAG_MASK: usize = 0b11;
 pub enum Priority {
     /// For tasks that should attempt to be executed only after everything else.
     Low = 0b00,
-    /// The default priority; Should try to result in FIFO scheduling across the runtime.
+    /// The default priority; Should try to result in FIFO scheduling across the
+    /// runtime.
     Normal = 0b01,
-    /// For tasks which should be processed soon (LIFO), usually for resource or caching reasons.
+    /// For tasks which should be processed soon (LIFO), usually for resource or
+    /// caching reasons.
     High = 0b10,
-    /// A reserved priority which may be used in the future for runtime level tasks.
+    /// A reserved priority which may be used in the future for runtime level
+    /// tasks.
     Critical = 0b11,
 }
 
-
 pub struct Task {
+    _pin: PhantomPinned,
     next: Cell<usize>,
     state: AtomicUsize,
-    _pin: PhantomPinned,
 }
 
 unsafe impl Sync for Task {}
@@ -46,6 +48,7 @@ impl Task {
     pub fn new(priority: Priority, resume: unsafe fn(*const Self)) -> Self {
         assert!(align_of::<Self>() > PTR_TAG_MASK);
         Self {
+            _pin: PhantomPinned,
             next: Cell::new(priority as usize),
             state: AtomicUsize::new(resume as usize),
         }
@@ -90,11 +93,27 @@ impl Task {
         resume_fn(self)
     }
 
+    /// Schedules the task to be eventually [`resume`]'d on the current
+    /// executor.
+    ///
+    /// [`resume`]: struct.Task.html#method.resume
     #[inline]
-    pub fn schedule(&self) {
+    pub fn schedule(&self) -> Result<(), ScheduleErr> {
         let resume_fn = self.state.load(Ordering::Relaxed) & !PTR_TAG_MASK;
         if self.state.swap(resume_fn | 1, Ordering::Relaxed) == resume_fn {
-            with_executor(|e| e.schedule(self));
+            with_executor(|e| e.schedule(self)).ok_or(ScheduleErr::NoExecutor)
+        } else {
+            Err(ScheduleErr::AlreadyScheduled)
         }
     }
+}
+
+/// An error reason when scheduling a task fails.
+pub enum ScheduleErr {
+    /// There is no currently running executor. See [`with_executor_as`].
+    ///
+    /// [`with_executor_as`]: fn.with_executor_as.html
+    NoExecutor,
+    /// The task was already scheduled into the executor.
+    AlreadyScheduled,
 }

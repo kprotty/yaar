@@ -20,6 +20,7 @@ full = []
 
 [dependencies]
 lock_api = "0.3"
+yaar-lock = { path = "../yaar-lock", features = ["sync"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true, default-features = false }

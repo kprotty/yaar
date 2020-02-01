@@ -1,4 +1,5 @@
 use super::{LinkedList, List, Priority, Task};
+use crate::util::CachePadded;
 use core::{
     cell::Cell,
     convert::TryInto,
@@ -10,10 +11,18 @@ use core::{
 use lock_api::{Mutex, RawMutex};
 
 /// A FIFO, mutex protected, queue of [`Task`] pointers.
-#[derive(Default)]
 pub struct GlobalQueue<R: RawMutex> {
     size: AtomicUsize,
     list: Mutex<R, LinkedList>,
+}
+
+impl<R: RawMutex> Default for GlobalQueue<R> {
+    fn default() -> Self {
+        Self {
+            size: AtomicUsize::new(0),
+            list: Mutex::new(LinkedList::default()),
+        }
+    }
 }
 
 impl<R: RawMutex> fmt::Debug for GlobalQueue<R> {
@@ -61,7 +70,7 @@ mod atomic_index {
 
 /// A bound, single-producer, multi-consumer queue which supports stealing.
 pub struct LocalQueue {
-    pos: [AtomicIndex; 2],
+    pos: CachePadded<[AtomicIndex; 2]>,
     tasks: [Cell<MaybeUninit<*const Task>>; Self::SIZE],
 }
 
@@ -79,7 +88,7 @@ impl fmt::Debug for LocalQueue {
 impl Default for LocalQueue {
     fn default() -> Self {
         Self {
-            pos: [AtomicIndex::new(0), AtomicIndex::new(0)],
+            pos: CachePadded::new([AtomicIndex::new(0), AtomicIndex::new(0)]),
             // Safety: assume_init() safe as all the array elements end up initialized.
             tasks: unsafe {
                 let mut tasks = MaybeUninit::uninit();
