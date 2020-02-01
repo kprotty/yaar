@@ -1,145 +1,15 @@
-use super::with_executor;
+use super::{LinkedList, List, Priority, Task};
 use core::{
     cell::Cell,
     convert::TryInto,
     fmt,
-    mem::{align_of, size_of, transmute, MaybeUninit},
-    ptr::{null_mut, NonNull},
+    mem::{size_of, transmute, MaybeUninit},
+    ptr::NonNull,
     sync::atomic::{spin_loop_hint, AtomicUsize, Ordering},
 };
 use lock_api::{Mutex, RawMutex};
 
-const PTR_TAG_MASK: usize = 0b11;
-
-pub enum Priority {
-    Low = 0b00,
-    Normal = 0b01,
-    High = 0b10,
-    Critical = 0b11,
-}
-
-pub struct Task {
-    next: Cell<usize>,
-    state: AtomicUsize,
-}
-
-unsafe impl Sync for Task {}
-
-impl Task {
-    #[inline]
-    pub fn new(priority: Priority, resume: unsafe fn(*const Self)) -> Self {
-        assert!(align_of::<Self>() > PTR_TAG_MASK);
-        Self {
-            next: Cell::new(priority as usize),
-            state: AtomicUsize::new(resume as usize),
-        }
-    }
-
-    pub(super) fn next(&self) -> Option<NonNull<Self>> {
-        NonNull::new((self.next.get() & !PTR_TAG_MASK) as *mut Self)
-    }
-
-    pub(super) fn set_next(&self, ptr: Option<NonNull<Self>>) {
-        let ptr = ptr.map(|p| p.as_ptr()).unwrap_or(null_mut());
-        self.next
-            .set((self.next.get() & PTR_TAG_MASK) | (ptr as usize));
-    }
-
-    #[inline]
-    pub fn priority(&self) -> Priority {
-        match self.next.get() & PTR_TAG_MASK {
-            0 => Priority::Low,
-            1 => Priority::Normal,
-            2 => Priority::High,
-            3 => Priority::Critical,
-            _ => unreachable!(),
-        }
-    }
-
-    #[inline]
-    pub unsafe fn resume(&self) {
-        let state = self.state.load(Ordering::Relaxed);
-        let resume_fn: unsafe fn(*const Self) = transmute(state & !PTR_TAG_MASK);
-        self.state.store(resume_fn as usize, Ordering::Relaxed);
-        resume_fn(self)
-    }
-
-    #[inline]
-    pub fn schedule(&self) {
-        let resume_fn = self.state.load(Ordering::Relaxed) & !PTR_TAG_MASK;
-        if self.state.swap(resume_fn | 1, Ordering::Relaxed) == resume_fn {
-            with_executor(|e| e.schedule(self));
-        }
-    }
-}
-
-#[derive(Default)]
-struct LinkedList {
-    head: Option<NonNull<Task>>,
-    tail: Option<NonNull<Task>>,
-}
-
-impl LinkedList {
-    pub fn push_front(&mut self, list: Self) {
-        if let Some(mut tail) = self.tail {
-            unsafe { tail.as_mut().set_next(list.head) }
-        }
-        if self.head.is_none() {
-            self.head = list.head;
-        }
-        self.tail = list.tail;
-    }
-
-    pub fn push_back(&mut self, list: Self) {
-        if let Some(tail) = list.tail {
-            unsafe { tail.as_ref().set_next(self.head) }
-        }
-        if self.tail.is_none() {
-            self.tail = list.tail;
-        }
-        self.head = list.head;
-    }
-
-    pub fn pop(&mut self) -> Option<NonNull<Task>> {
-        self.head.map(|task| {
-            self.head = unsafe { task.as_ref().next() };
-            if self.head.is_none() {
-                self.tail = None;
-            }
-            task
-        })
-    }
-}
-
-#[derive(Default)]
-pub struct List {
-    front: LinkedList,
-    back: LinkedList,
-    size: usize,
-}
-
-impl List {
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.size
-    }
-
-    pub fn push(&mut self, task: *const Task) {
-        let task = unsafe { &*task };
-        task.set_next(None);
-        let list = LinkedList {
-            head: NonNull::new(task as *const _ as *mut _),
-            tail: NonNull::new(task as *const _ as *mut _),
-        };
-
-        self.size += 1;
-        match task.priority() {
-            Priority::Low | Priority::Normal => self.back.push_back(list),
-            Priority::High | Priority::Critical => self.front.push_back(list),
-        }
-    }
-}
-
+/// A FIFO, mutex protected, queue of [`Task`] pointers.
 #[derive(Default)]
 pub struct GlobalQueue<R: RawMutex> {
     size: AtomicUsize,
@@ -155,11 +25,13 @@ impl<R: RawMutex> fmt::Debug for GlobalQueue<R> {
 }
 
 impl<R: RawMutex> GlobalQueue<R> {
+    /// Get an approximation of the global queue size.
     #[inline]
     pub fn len(&self) -> usize {
         self.size.load(Ordering::Relaxed)
     }
 
+    /// Push a list of tasks all at once to the global queue.
     pub fn push(&self, list: List) {
         let List { front, back, size } = list;
         if size == 0 {
@@ -193,6 +65,7 @@ pub struct LocalQueue {
     tasks: [Cell<MaybeUninit<*const Task>>; Self::SIZE],
 }
 
+/// Supports other threads calling [`LocalQueue::steal`].
 unsafe impl Sync for LocalQueue {}
 
 impl fmt::Debug for LocalQueue {
