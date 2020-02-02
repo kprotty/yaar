@@ -22,6 +22,7 @@ sync = ["lock_api"]
 future = ["sync", "futures-intrusive"]
 os = [
     "libc",
+    "wchar",
     "winapi/winbase",
     "winapi/handleapi",
     "winapi/libloaderapi",
@@ -51,6 +52,7 @@ bench_async = [
 libc = { version = "0.2", optional = true, default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+wchar = { version = "0.6", optional = true }
 winapi = { version = "0.3", optional = true, default-features = false }
 
 [dependencies]

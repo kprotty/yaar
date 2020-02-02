@@ -5,6 +5,7 @@ use core::{
     ptr::null_mut,
     sync::atomic::{spin_loop_hint, AtomicU32, AtomicUsize, Ordering},
 };
+use wchar::wch_c;
 use winapi::{
     shared::{
         basetsd::SIZE_T,
@@ -14,10 +15,10 @@ use winapi::{
     },
     um::{
         handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
-        libloaderapi::{GetModuleHandleA, GetProcAddress},
+        libloaderapi::{GetModuleHandleW, GetProcAddress},
         winbase::INFINITE,
         winnt::{
-            ACCESS_MASK, BOOLEAN, GENERIC_READ, GENERIC_WRITE, HANDLE, LPCSTR, PHANDLE,
+            ACCESS_MASK, BOOLEAN, GENERIC_READ, GENERIC_WRITE, HANDLE, LPCSTR, LPCWSTR, PHANDLE,
             PLARGE_INTEGER, PVOID,
         },
     },
@@ -150,8 +151,7 @@ type WaitOnAddress = extern "stdcall" fn(
 /// Try to load the WaitOnAddress api into the process.
 /// On success, sets the necessary functions and returns true.
 unsafe fn load_wait_on_address() -> bool {
-    // TODO: switch to GetModuleHandleW() for more compatibility
-    let dll = GetModuleHandleA(b"api-ms-win-core-synch-l1-2-0.dll\0".as_ptr() as LPCSTR);
+    let dll = GetModuleHandleW(wch_c!("api-ms-win-core-synch-l1-2-0.dll").as_ptr() as LPCWSTR);
     if dll.is_null() {
         return false;
     }
@@ -192,8 +192,7 @@ type NtInvokeKeyedEvent = extern "stdcall" fn(
 /// Try to load NT Keyed Events api into the process.
 /// On success, stores the event handle in BACKEND_HANDLE and returns true.
 unsafe fn load_keyed_events() -> bool {
-    // TODO: switch to GetModuleHandleW() for more compatibility
-    let dll = GetModuleHandleA(b"ntdll.dll\0".as_ptr() as LPCSTR);
+    let dll = GetModuleHandleW(wch_c!("ntdll.dll").as_ptr() as LPCWSTR);
     if dll.is_null() {
         return false;
     }
