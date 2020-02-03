@@ -1,7 +1,10 @@
+//! Numa-Aware, Multithreaded Scheduler based on
+//! https://docs.google.com/document/u/0/d/1d3iI2QWURgDIsSR6G2275vMeQ_X7w-qxM2Vp7iGwwuM/pub.
+
 use super::{
     super::{
-        task::{GlobalQueue, LocalQueue, Task},
         platform::Platform,
+        task::{GlobalQueue, LocalQueue, Task},
     },
     with_executor_as, Executor,
 };
@@ -14,14 +17,19 @@ use core::{
     slice::from_raw_parts,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use yaar_lock::sync::{WordLock, RawMutex};
+use yaar_lock::sync::{RawMutex, WordLock};
 
-pub fn run<T, P: Platform>(
+pub fn run_using<T, P: Platform>(
     platform: &P,
+    start_node: usize,
     nodes: &[NonNull<Node<P>>],
     future: impl Future<Output = T>,
 ) -> T {
-    unreachable!()
+    if nodes.len() == 0 {
+        panic!("Empty `nodes` (serial execution) isn't currently supported");
+    }
+
+    let start_node = nodes[start_node.min(nodes.len() - 1)]
 }
 
 pub struct Node<P: Platform> {

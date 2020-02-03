@@ -1,4 +1,3 @@
-
 macro_rules! field_parent_ptr {
     ($Type:ty, $field:literal, $field_ptr:expr) => {{
         let stub = core::mem::MaybeUninit::<$Type>::zeroed();

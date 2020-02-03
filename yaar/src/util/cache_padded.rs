@@ -8,12 +8,8 @@ pub struct CachePadded<T> {
 }
 
 impl<T> CachePadded<T> {
-    pub fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         Self { value }
-    }
-
-    pub fn into_inner(self) -> T {
-        self.value
     }
 }
 

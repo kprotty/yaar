@@ -13,7 +13,9 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-const PTR_TAG_MASK: usize = 0b11;
+const IS_ROOT_BIT: usize = 1 << 1;
+const IS_SCHEDULED_BIT: usize = 1 << 1;
+const PTR_MASK: usize = !(IS_SCHEDULED_BIT | IS_ROOT_BIT);
 
 /// Scheduling importance which controls when the task is scheduled.
 pub enum Priority {
@@ -29,6 +31,11 @@ pub enum Priority {
     /// tasks.
     Critical = 0b11,
 }
+
+pub enum Type {
+    Child = 0,
+    Parent = IS_ROOT_BIT,
+};
 
 pub struct Task {
     _pin: PhantomPinned,

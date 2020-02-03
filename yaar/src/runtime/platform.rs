@@ -5,7 +5,7 @@ pub trait Platform: Sync {
     type CpuAffinity;
     type ThreadLocal: ThreadLocal;
     type ThreadEvent: ThreadEvent;
-    
+
     fn spawn_thread(
         &self,
         node_id: usize,
