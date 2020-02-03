@@ -3,7 +3,7 @@ macro_rules! field_parent_ptr {
         let stub = core::mem::MaybeUninit::<$Type>::zeroed();
         let base = stub.as_ptr() as usize;
         let field = &(*stub.as_ptr()).$field as *const _ as usize;
-        (($field_ptr) - (field - base)) as *const $Type
+        (($field_ptr) - (field - base)) as *mut $Type
     }};
 }
 

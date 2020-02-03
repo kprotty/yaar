@@ -4,7 +4,9 @@ pub use self::list::*;
 mod queue;
 pub use self::queue::*;
 
-use super::with_executor;
+mod future;
+pub use self::future::*;
+
 use core::{
     cell::Cell,
     marker::PhantomPinned,

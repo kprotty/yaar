@@ -14,6 +14,7 @@ use core::{
     future::Future,
     num::NonZeroUsize,
     ptr::NonNull,
+    marker::PhantomData,
     slice::from_raw_parts,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -29,34 +30,37 @@ pub fn run_using<T, P: Platform + 'static>(
     nodes: &[NonNull<Node<P>>],
     future: impl Future<Output = T>,
 ) -> Result<T, RunError> {
+    let nodes: &[&Node<P>] = unsafe { from_raw_parts(nodes.as_ptr() as *const _, nodes.len()) };
     if nodes.len() == 0 {
         return Err(RunError::NoNode);
     }
 
     let executor = NodeExecutor {
         pending_tasks: AtomicUsize::new(0),
-        node_ptr: &nodes[0] as *const _ as usize,
-        node_len: nodes.len(),
         platform: NonNull::new(platform as *const P as *mut P).unwrap(),
+        nodes_ptr: &nodes,
     };
+
+    for node in nodes {
+
+    }
     
     with_executor_as(&executor, |_| {
-        /*
-        let node = unsafe { nodes[0].as_ref() };
-        let main_worker = match node.pool.lock().find_worker() {
-            Some(worker) => worker,
+        let node = nodes[0];
+        let mut pool = node.pool.lock();
+        pool.free_threads -= 1;
+        Thread::run(match pool.find_worker() {
+            Some(worker) => worker as usize,
             None => return Err(RunError::NoWorker),
-        };
-        */
-        Err(RunError::NoWorker)
+        });
+        
     })
 }
 
 struct NodeExecutor<P: Platform> {
     pending_tasks: AtomicUsize,
-    node_ptr: usize,
-    node_len: usize,
     platform: NonNull<P>,
+    nodes_ptr: usize,
 }
 
 unsafe impl<P: Platform> Sync for NodeExecutor<P> {}
@@ -67,7 +71,7 @@ impl<P: Platform> NodeExecutor<P> {
     }
 
     fn nodes(&self) -> &[&Node<P>] {
-        unsafe { from_raw_parts(self.node_ptr as *const _, self.node_len) }
+        unsafe { &*(self.nodes_ptr as *const _) }
     }
 }
 
@@ -78,7 +82,7 @@ impl<P: Platform> Executor for NodeExecutor<P> {
 }
 
 pub struct Node<P: Platform> {
-    platform: *const P,
+    executor: Cell<Option<NonNull<NodeExecutor<P>>>>,
     cpu_affinity: P::CpuAffinity,
     worker_ptr: *const Worker,
     worker_len: usize,
@@ -92,13 +96,12 @@ unsafe impl<P: Platform> Sync for Node<P> {}
 
 impl<P: Platform> Node<P> {
     pub fn new(
-        platform: &P,
         workers: &[Worker],
         max_threads: NonZeroUsize,
         cpu_affinity: P::CpuAffinity,
     ) -> Self {
         Self {
-            platform,
+            executor: Cell::new(None),
             cpu_affinity,
             worker_ptr: workers.as_ptr(),
             worker_len: workers.len(),
@@ -113,18 +116,25 @@ impl<P: Platform> Node<P> {
     pub fn workers(&self) -> &[Worker] {
         unsafe { from_raw_parts(self.worker_ptr, self.worker_len) }
     }
+
+    #[inline]
+    pub fn executor(&self) -> &NodeExecutor<P> {
+        unsafe { &*self.executor.get().expect("No executor is set").as_ptr() }
+    }
 }
 
-struct WorkerPool {
+struct WorkerPool<P: Platform> {
+    phantom: PhantomData<P>,
     max_threads: usize,
     free_threads: usize,
     idle_threads: Option<NonNull<Thread>>,
     idle_workers: Option<NonNull<Worker>>,
 }
 
-impl WorkerPool {
+impl<P: Platform> WorkerPool<P> {
     pub fn new(max_threads: NonZeroUsize) -> Self {
         Self {
+            phantom: PhantomData,
             max_threads: max_threads.get(),
             free_threads: max_threads.get(),
             idle_threads: None,
@@ -132,22 +142,33 @@ impl WorkerPool {
         }
     }
 
-    pub fn put_worker<P: Platform>(&mut self, node: &Node<P>, worker: &Worker) {
+    pub fn put_worker(&mut self, node: &Node<P>, worker: &Worker) {
         let workers_idle = node.workers_idle.load(Ordering::Relaxed);
         assert!(workers_idle <= node.workers().len());
         worker.next.set(self.idle_workers);
         self.idle_workers = NonNull::new(worker as *const _ as *mut _);
         node.workers_idle.store(workers_idle + 1, Ordering::Release);
     }
+
+    pub fn find_worker(&mut self, node: &Node<P>) -> Option<&Worker> {
+        self.idle_workers.map(|worker_ptr| {
+            let workers_idle =  node.workers_idle.load(Ordering::Relaxed);
+            assert!(workers_idle > 0 && workers_idle < node.workers().len());
+            let worker = unsafe { &*worker_ptr.as_ptr() };
+            self.idle_workers = worker.next.get();
+            node.workers_idle.store(workers_idle - 1, Ordering::Release);
+            worker
+        })
+    }
 }
 
-struct Thread {
-    next: Option<NonNull<Self>>,
+struct Thread<P: Platform> {
+    next: Cell<Option<NonNull<Self>>>,
 }
 
 #[derive(Default)]
 pub struct Worker {
     next: Cell<Option<NonNull<Self>>>,
-    node: usize,
+    node_ptr: usize,
     run_queue: LocalQueue,
 }

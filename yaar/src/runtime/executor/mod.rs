@@ -1,4 +1,4 @@
-pub mod node;
+pub mod scheduler;
 
 use super::task::{Task, Kind, Priority};
 use core::cell::Cell;
