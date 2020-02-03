@@ -19,17 +19,62 @@ use core::{
 };
 use yaar_lock::sync::{RawMutex, WordLock};
 
-pub fn run_using<T, P: Platform>(
+pub enum RunError {
+    NoNode,
+    NoWorker,
+}
+
+pub fn run_using<T, P: Platform + 'static>(
     platform: &P,
-    start_node: usize,
     nodes: &[NonNull<Node<P>>],
     future: impl Future<Output = T>,
-) -> T {
+) -> Result<T, RunError> {
     if nodes.len() == 0 {
-        panic!("Empty `nodes` (serial execution) isn't currently supported");
+        return Err(RunError::NoNode);
     }
 
-    let start_node = nodes[start_node.min(nodes.len() - 1)]
+    let executor = NodeExecutor {
+        pending_tasks: AtomicUsize::new(0),
+        node_ptr: &nodes[0] as *const _ as usize,
+        node_len: nodes.len(),
+        platform: NonNull::new(platform as *const P as *mut P).unwrap(),
+    };
+    
+    with_executor_as(&executor, |_| {
+        /*
+        let node = unsafe { nodes[0].as_ref() };
+        let main_worker = match node.pool.lock().find_worker() {
+            Some(worker) => worker,
+            None => return Err(RunError::NoWorker),
+        };
+        */
+        Err(RunError::NoWorker)
+    })
+}
+
+struct NodeExecutor<P: Platform> {
+    pending_tasks: AtomicUsize,
+    node_ptr: usize,
+    node_len: usize,
+    platform: NonNull<P>,
+}
+
+unsafe impl<P: Platform> Sync for NodeExecutor<P> {}
+
+impl<P: Platform> NodeExecutor<P> {
+    fn platform(&self) -> &P {
+        unsafe { self.platform.as_ref() }
+    }
+
+    fn nodes(&self) -> &[&Node<P>] {
+        unsafe { from_raw_parts(self.node_ptr as *const _, self.node_len) }
+    }
+}
+
+impl<P: Platform> Executor for NodeExecutor<P> {
+    fn schedule(&self, task: &Task) {
+        // TODO
+    }
 }
 
 pub struct Node<P: Platform> {

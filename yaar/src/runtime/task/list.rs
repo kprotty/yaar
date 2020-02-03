@@ -62,8 +62,10 @@ impl List {
     /// This takes a pointer instead of a reference since the task should live
     /// at least until it is popped from the list or the list is consumed.
     pub fn push(&mut self, task: *const Task) {
-        let task = unsafe { &*task };
-        task.set_next(None);
+        let task = unsafe {
+            (&*task).set_next(None);
+            &*task
+        };
         let list = LinkedList {
             head: NonNull::new(task as *const _ as *mut _),
             tail: NonNull::new(task as *const _ as *mut _),

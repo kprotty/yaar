@@ -1,19 +1,16 @@
 pub mod node;
 
-use super::task::Task;
-use core::{cell::Cell, fmt::Debug};
+use super::task::{Task, Kind, Priority};
+use core::cell::Cell;
 
-pub trait Executor: Sync + Debug {
+pub trait Executor: Sync {
     /// Schedule the task to be eventually executed.
     fn schedule(&self, task: &Task);
 }
 
 /// Reference to the current running executor.
 static EXECUTOR_REF: ExecutorRef = ExecutorRef(Cell::new(None));
-
-#[derive(Debug)]
 struct ExecutorRef(Cell<Option<&'static dyn Executor>>);
-
 unsafe impl Sync for ExecutorRef {}
 
 /// For the duration of the function provided, use the given executor as the

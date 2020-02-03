@@ -13,9 +13,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-const IS_ROOT_BIT: usize = 1 << 1;
-const IS_SCHEDULED_BIT: usize = 1 << 1;
-const PTR_MASK: usize = !(IS_SCHEDULED_BIT | IS_ROOT_BIT);
+const PTR_MASK: usize = !0b11;
 
 /// Scheduling importance which controls when the task is scheduled.
 pub enum Priority {
@@ -32,57 +30,96 @@ pub enum Priority {
     Critical = 0b11,
 }
 
-pub enum Type {
-    Child = 0,
-    Parent = IS_ROOT_BIT,
-};
+pub enum Kind {
+    Child = 0b00,
+    Parent = 0b01,
+}
 
 pub struct Task {
     _pin: PhantomPinned,
     next: Cell<usize>,
-    state: AtomicUsize,
+    state: Cell<usize>,
 }
 
 unsafe impl Sync for Task {}
 
 impl Task {
-    /// Create a new task using the priority and a given resume function.
+    /// Create a new task using the given resume function.
     ///
-    /// The priority is used to control the scheduling behavior of the task
-    /// while the resume function is called when the task is executed after
+    /// The resume function is called when the task is executed after
     /// being scheduled.
     #[inline]
-    pub fn new(priority: Priority, resume: unsafe fn(*const Self)) -> Self {
-        assert!(align_of::<Self>() > PTR_TAG_MASK);
+    pub fn new(resume: unsafe fn(*const Self)) -> Self {
+        assert!(align_of::<Self>() > !PTR_MASK);
         Self {
             _pin: PhantomPinned,
-            next: Cell::new(priority as usize),
-            state: AtomicUsize::new(resume as usize),
+            next: Cell::new(Priority::Normal as usize),
+            state: Cell::new((resume as usize) | (Kind::Parent as usize)),
         }
     }
 
     /// Get the linked list pointer of the task.
-    pub(super) fn next(&self) -> Option<NonNull<Self>> {
-        NonNull::new((self.next.get() & !PTR_TAG_MASK) as *mut Self)
+    #[inline]
+    pub fn next(&self) -> Option<NonNull<Self>> {
+        NonNull::new((self.next.get() & PTR_MASK) as *mut Self)
     }
 
     /// Set the linked list pointer of the task.
-    pub(super) fn set_next(&self, ptr: Option<NonNull<Self>>) {
+    /// 
+    /// # Safety
+    ///
+    /// This uses an immutable references but modifies the Task.
+    /// No synchronization is done therefor the caller must ensure
+    /// that it is not called in parallel.
+    pub unsafe fn set_next(&self, ptr: Option<NonNull<Self>>) {
         let ptr = ptr.map(|p| p.as_ptr()).unwrap_or(null_mut());
         self.next
-            .set((self.next.get() & PTR_TAG_MASK) | (ptr as usize));
+            .set((self.next.get() & !PTR_MASK) | (ptr as usize));
     }
 
-    /// Get the task priority set on creation.
+    /// Get the task priority.
     #[inline]
     pub fn priority(&self) -> Priority {
-        match self.next.get() & PTR_TAG_MASK {
+        match self.next.get() & !PTR_MASK {
             0 => Priority::Low,
             1 => Priority::Normal,
             2 => Priority::High,
             3 => Priority::Critical,
             _ => unreachable!(),
         }
+    }
+
+    /// Set the priority of the task.
+    /// 
+    /// # Safety
+    ///
+    /// This uses an immutable references but modifies the Task.
+    /// No synchronization is done therefor the caller must ensure
+    /// that it is not called in parallel.
+    #[inline]
+    pub unsafe fn set_priority(&self, priority: Priority) {
+        self.next.set((self.next.get() & PTR_MASK) | (priority as usize));
+    }
+
+    // Get the task kind.
+    #[inline]
+    pub fn kind(&self) -> Kind {
+        match self.state.get() & 1 {
+            0 => Kind::Child,
+            1 => Kind::Parent,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Set the task kind.
+    /// 
+    /// # Safety
+    ///
+    /// This uses an immutable references but modifies the Task.
+    /// No synchronization is done therefor the caller must ensure
+    /// that it is not called in parallel.
+    pub unsafe fn set_kind(&self, kind: Kind) {
+        self.state.set((self.state.get() & PTR_MASK) | (kind as usize));
     }
 
     /// Call the resume function that was passed in on creation.
@@ -94,33 +131,7 @@ impl Task {
     /// threads.
     #[inline]
     pub unsafe fn resume(&self) {
-        let state = self.state.load(Ordering::Relaxed);
-        let resume_fn: unsafe fn(*const Self) = transmute(state & !PTR_TAG_MASK);
-        self.state.store(resume_fn as usize, Ordering::Relaxed);
+        let resume_fn: unsafe fn(*const Self) = transmute(self.state.get());
         resume_fn(self)
     }
-
-    /// Schedules the task to be eventually [`resume`]'d on the current
-    /// executor.
-    ///
-    /// [`resume`]: struct.Task.html#method.resume
-    #[inline]
-    pub fn schedule(&self) -> Result<(), ScheduleErr> {
-        let resume_fn = self.state.load(Ordering::Relaxed) & !PTR_TAG_MASK;
-        if self.state.swap(resume_fn | 1, Ordering::Relaxed) == resume_fn {
-            with_executor(|e| e.schedule(self)).ok_or(ScheduleErr::NoExecutor)
-        } else {
-            Err(ScheduleErr::AlreadyScheduled)
-        }
-    }
-}
-
-/// An error reason when scheduling a task fails.
-pub enum ScheduleErr {
-    /// There is no currently running executor. See [`with_executor_as`].
-    ///
-    /// [`with_executor_as`]: fn.with_executor_as.html
-    NoExecutor,
-    /// The task was already scheduled into the executor.
-    AlreadyScheduled,
 }
