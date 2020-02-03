@@ -12,7 +12,6 @@ use core::{
     marker::PhantomPinned,
     mem::{align_of, transmute},
     ptr::{null_mut, NonNull},
-    sync::atomic::{AtomicUsize, Ordering},
 };
 
 const PTR_MASK: usize = !0b11;
@@ -67,7 +66,7 @@ impl Task {
     }
 
     /// Set the linked list pointer of the task.
-    /// 
+    ///
     /// # Safety
     ///
     /// This uses an immutable references but modifies the Task.
@@ -92,7 +91,7 @@ impl Task {
     }
 
     /// Set the priority of the task.
-    /// 
+    ///
     /// # Safety
     ///
     /// This uses an immutable references but modifies the Task.
@@ -100,7 +99,8 @@ impl Task {
     /// that it is not called in parallel.
     #[inline]
     pub unsafe fn set_priority(&self, priority: Priority) {
-        self.next.set((self.next.get() & PTR_MASK) | (priority as usize));
+        self.next
+            .set((self.next.get() & PTR_MASK) | (priority as usize));
     }
 
     // Get the task kind.
@@ -114,14 +114,15 @@ impl Task {
     }
 
     /// Set the task kind.
-    /// 
+    ///
     /// # Safety
     ///
     /// This uses an immutable references but modifies the Task.
     /// No synchronization is done therefor the caller must ensure
     /// that it is not called in parallel.
     pub unsafe fn set_kind(&self, kind: Kind) {
-        self.state.set((self.state.get() & PTR_MASK) | (kind as usize));
+        self.state
+            .set((self.state.get() & PTR_MASK) | (kind as usize));
     }
 
     /// Call the resume function that was passed in on creation.

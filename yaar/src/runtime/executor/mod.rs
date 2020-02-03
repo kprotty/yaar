@@ -1,6 +1,6 @@
 pub mod scheduler;
 
-use super::task::{Task, Kind, Priority};
+use super::task::Task;
 use core::cell::Cell;
 
 pub trait Executor: Sync {
