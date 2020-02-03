@@ -22,6 +22,8 @@ impl<F: Future> TaskFuture<F> {
         }
     }
 
+    /// Polls the inner future using a stack-allocated waker which re-schedules
+    /// the inner task to re-poll the future on the current executor.
     pub fn resume(&mut self) -> Poll<F::Output> {
         const WAKE_FN: unsafe fn(ptr: *const ()) = |ptr| unsafe {
             let task = &*(ptr as *const Task);
