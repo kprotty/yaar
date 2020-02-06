@@ -12,7 +12,7 @@ mod if_os {
     use super::*;
     use crate::OsThreadEvent;
 
-    /// A [`WordLock`] backed by [`OsThreadEvent`].
+    /// A [`CoreMutex`] backed by [`OsThreadEvent`].
     #[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
     pub type Mutex<T> = RawMutex<T, OsThreadEvent>;
 
@@ -23,7 +23,7 @@ mod if_os {
 
 /// A mutual exclusion primitive useful for protecting shared data using
 /// [`ThreadEvent`] for thread blocking.
-pub type RawMutex<T, E> = lock_api::Mutex<WordLock<E>, T>;
+pub type RawMutex<T, E> = lock_api::Mutex<CoreMutex<E>, T>;
 
 /// An RAII implementation of a "scoped lock" of a [`RawMutex`].
 /// When this structure is dropped (falls out of scope), the lock will be
@@ -31,7 +31,7 @@ pub type RawMutex<T, E> = lock_api::Mutex<WordLock<E>, T>;
 ///
 /// The data protected by the mutex can be accessed through this guard via its
 /// `Deref` and `DerefMut` implementations.
-pub type RawMutexGuard<'a, T, E> = lock_api::MutexGuard<'a, WordLock<E>, T>;
+pub type RawMutexGuard<'a, T, E> = lock_api::MutexGuard<'a, CoreMutex<E>, T>;
 
 const MUTEX_LOCK: usize = 1;
 const QUEUE_LOCK: usize = 2;
@@ -40,15 +40,15 @@ const QUEUE_MASK: usize = !(QUEUE_LOCK | MUTEX_LOCK);
 /// [`lock_api::RawMutex`] implementation of parking_lot's [`WordLock`].
 ///
 /// [`WordLock`]: https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
-pub struct WordLock<E> {
+pub struct CoreMutex<E> {
     state: AtomicUsize,
     phantom: PhantomData<E>,
 }
 
-unsafe impl<E: Send> Send for WordLock<E> {}
-unsafe impl<E: Sync> Sync for WordLock<E> {}
+unsafe impl<E: Send> Send for CoreMutex<E> {}
+unsafe impl<E: Sync> Sync for CoreMutex<E> {}
 
-unsafe impl<E: ThreadEvent> lock_api::RawMutex for WordLock<E> {
+unsafe impl<E: ThreadEvent> lock_api::RawMutex for CoreMutex<E> {
     const INIT: Self = Self {
         state: AtomicUsize::new(0),
         phantom: PhantomData,
@@ -77,7 +77,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutex for WordLock<E> {
     }
 }
 
-impl<E: ThreadEvent> WordLock<E> {
+impl<E: ThreadEvent> CoreMutex<E> {
     #[cold]
     fn lock_slow(&self, wait_node: &WaitNode<E>) {
         const MAX_SPIN_DOUBLING: usize = 4;
@@ -209,7 +209,7 @@ impl<E: ThreadEvent> WordLock<E> {
     }
 }
 
-unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for WordLock<E> {
+unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for CoreMutex<E> {
     fn unlock_fair(&self) {
         let mut state = self.state.load(Ordering::Relaxed);
         loop {

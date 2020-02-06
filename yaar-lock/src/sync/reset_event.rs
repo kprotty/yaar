@@ -13,30 +13,30 @@ mod if_os {
     use super::*;
     use crate::OsThreadEvent;
 
-    /// A [`WordEvent`] backed by [`OsThreadEvent`] for thread blocking.
+    /// A [`CoreEvent`] backed by [`OsThreadEvent`] for thread blocking.
     #[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
-    pub type ResetEvent = WordEvent<OsThreadEvent>;
+    pub type ResetEvent = CoreEvent<OsThreadEvent>;
 }
 
 const IS_SET: usize = 0b1;
 
 /// A word (`usize`) sized [`ThreadEvent`] implementation.
-pub struct WordEvent<E> {
+pub struct CoreEvent<E> {
     state: AtomicUsize,
     phantom: PhantomData<E>,
 }
 
-unsafe impl<E: Send> Send for WordEvent<E> {}
+unsafe impl<E: Send> Send for CoreEvent<E> {}
 
-unsafe impl<E: Sync> Sync for WordEvent<E> {}
+unsafe impl<E: Sync> Sync for CoreEvent<E> {}
 
-impl<E> Default for WordEvent<E> {
+impl<E> Default for CoreEvent<E> {
     fn default() -> Self {
         Self::new(false)
     }
 }
 
-impl<E> WordEvent<E> {
+impl<E> CoreEvent<E> {
     #[inline]
     pub fn new(is_set: bool) -> Self {
         Self {
@@ -46,15 +46,15 @@ impl<E> WordEvent<E> {
     }
 }
 
-impl<E: ThreadEvent> fmt::Debug for WordEvent<E> {
+impl<E: ThreadEvent> fmt::Debug for CoreEvent<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WordEvent")
+        f.debug_struct("CoreEvent")
             .field("is_set", &self.is_set())
             .finish()
     }
 }
 
-impl<E: ThreadEvent> ThreadEvent for WordEvent<E> {
+impl<E: ThreadEvent> ThreadEvent for CoreEvent<E> {
     #[inline]
     fn is_set(&self) -> bool {
         self.state.load(Ordering::Acquire) == IS_SET
@@ -82,7 +82,7 @@ impl<E: ThreadEvent> ThreadEvent for WordEvent<E> {
     }
 }
 
-impl<E: ThreadEvent> WordEvent<E> {
+impl<E: ThreadEvent> CoreEvent<E> {
     #[cold]
     fn wake_slow(&self, head: &WaitNode<E>) {
         loop {
