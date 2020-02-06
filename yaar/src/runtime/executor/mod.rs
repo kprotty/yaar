@@ -1,7 +1,7 @@
 pub mod scheduler;
 
 use super::task::Task;
-use core::cell::Cell;
+use core::{cell::Cell, ptr::NonNull};
 
 pub trait Executor: Sync {
     /// Schedule the task to be eventually executed.
@@ -10,7 +10,7 @@ pub trait Executor: Sync {
 
 /// Reference to the current running executor.
 static EXECUTOR_REF: ExecutorRef = ExecutorRef(Cell::new(None));
-struct ExecutorRef(Cell<Option<&'static dyn Executor>>);
+struct ExecutorRef(Cell<Option<NonNull<dyn Executor>>>);
 unsafe impl Sync for ExecutorRef {}
 
 /// For the duration of the function provided, use the given executor as the
@@ -21,9 +21,9 @@ unsafe impl Sync for ExecutorRef {}
 ///
 /// This is not thread safe as it assumes owned access to the global executor
 /// reference.
-pub fn with_executor_as<E: Executor + 'static, T>(executor: &E, f: impl FnOnce(&E) -> T) -> T {
-    let our_ref = unsafe { &*(executor as *const E) };
-    let old_ref = EXECUTOR_REF.0.replace(Some(our_ref));
+pub fn with_executor_as<E: Executor, T>(executor: &E, f: impl FnOnce(&E) -> T) -> T {
+    let our_ref = (executor as &dyn Executor) as *const _ as *mut _;
+    let old_ref = EXECUTOR_REF.0.replace(NonNull::new(our_ref));
     let result = f(executor);
     EXECUTOR_REF.0.set(old_ref);
     result
@@ -34,10 +34,8 @@ pub fn with_executor_as<E: Executor + 'static, T>(executor: &E, f: impl FnOnce(&
 ///
 /// # Safety
 ///
-/// Usage should not persist the global executor reference as the static
-/// lifetime serves only as a placebo to indicate that the reference is global.
-/// This means that there are no guarantees on its validity after the function
-/// ends.
-pub fn with_executor<T>(f: impl FnOnce(&'static dyn Executor) -> T) -> Option<T> {
-    EXECUTOR_REF.0.get().map(f)
+/// Usage should not persist the global executor reference as there are
+/// no guarantees on its validity after the function ends.
+pub fn with_executor<T>(f: impl FnOnce(&dyn Executor) -> T) -> Option<T> {
+    EXECUTOR_REF.0.get().map(|ptr| f(unsafe { &*ptr.as_ptr() }))
 }

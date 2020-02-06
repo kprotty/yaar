@@ -4,16 +4,13 @@
 use crate::{
     runtime::{
         platform::Platform,
-        with_executor_as,
+        task::{GlobalQueue, LocalQueue, Task},
+        Executor, with_executor_as,
     },
     util::CachePadded,
 };
-use core::{
-    ptr::NonNull,
-    future::Future,
-    num::NonZeroUsize,
-    slice::from_raw_parts,
-};
+use core::{num::NonZeroUsize, ptr::NonNull, slice::from_raw_parts};
+use yaar_lock::sync::CoreMutex;
 
 pub enum RunError {
     /// No nodes were provided for the executor to run the future.
@@ -29,46 +26,46 @@ pub struct NodeExecutor<P: Platform> {
 }
 
 impl<P: Platform> NodeExecutor<P> {
-    /// TODO: Run the future with an executor optimized for single threaded access.
-    pub fn run_serial<T>(
-        _platform: &P,
-        _future: impl Future<Output = T>,
-    ) -> T {
+    /// TODO: Run the task with an executor optimized for single threaded
+    /// access.
+    pub fn run_serial(_platform: &P, _task: &Task) {
         unimplemented!();
     }
 
-    /// TODO: Run the future with a scheme akin to well-known executors such as
+    /// TODO: Run the task with a scheme akin to well-known executors such as
     /// tokio and async-std with a unified SMP thread-pool over multiple Nodes.
-    pub fn run_smp<T>(
+    pub fn run_smp(
         _platform: &P,
         _workers: &[Worker<P>],
         _max_threads: NonZeroUsize,
-    ) -> T {
+        _task: &Task,
+    ) {
         unimplemented!();
     }
 
-
-    pub fn run_using<T>(
+    pub fn run_using(
         platform: &P,
         start_node: usize,
         nodes: &[NonNull<Node<P>>],
-        _future: impl Future<Output = T>,
-    ) -> Result<T, RunError> {
+        task: &Task,
+    ) -> Result<(), RunError> {
         if nodes.len() == 0 {
             return Err(RunError::EmptyNodes);
         } else if start_node >= nodes.len() {
             return Err(RunError::InvalidStart);
         }
 
-        with_executor_as(&Self {
-            platform: NonNull::new(platform as *const _ as *mut _).unwrap(),
-            nodes_ptr: NonNull::new(nodes.as_ptr() as *mut _).unwrap(),
-            nodes_len: nodes.len(),
-        }, |executor| {
-
-            let main_node = executor.nodes[start_node];
-            
-        })
+        with_executor_as(
+            &Self {
+                platform: NonNull::new(platform as *const _ as *mut _).unwrap(),
+                nodes_ptr: NonNull::new(nodes.as_ptr() as *mut _).unwrap(),
+                nodes_len: nodes.len(),
+            },
+            |executor| {
+                let main_node = executor.nodes()[start_node];
+                unimplemented!()
+            },
+        )
     }
 
     /// Get the array of Nodes passed into the run function.
@@ -79,6 +76,14 @@ impl<P: Platform> NodeExecutor<P> {
     /// Get the reference to the platform passed into the run function.
     pub fn platform(&self) -> &P {
         unsafe { &*self.platform.as_ptr() }
+    }
+}
+
+unsafe impl<P: Platform> Sync for NodeExecutor<P> {}
+
+impl<P: Platform> Executor for NodeExecutor<P> {
+    fn schedule(&self, _task: &Task) {
+        // TODO
     }
 }
 

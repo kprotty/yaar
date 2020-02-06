@@ -48,8 +48,6 @@ pub struct Task {
     state: Cell<usize>,
 }
 
-unsafe impl Sync for Task {}
-
 impl Task {
     /// Create a new task using the given resume function.
     ///
