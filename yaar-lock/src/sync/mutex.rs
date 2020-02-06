@@ -141,12 +141,11 @@ impl<E: ThreadEvent> CoreMutex<E> {
                 return;
             }
 
-            // Try to lock the queue using an Acquire barrier on success
-            // in order to have WaitNode write visibility. See below.
+            // Try to lock the queue.
             match self.state.compare_exchange_weak(
                 state,
                 state | QUEUE_LOCK,
-                Ordering::Acquire,
+                Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -154,10 +153,6 @@ impl<E: ThreadEvent> CoreMutex<E> {
             }
         }
 
-        // A Acquire barrier is required when looping back with a new state
-        // since it will be dereferenced and read from as the head of the queue
-        // and updates to its fields need to be visible from the Release store in
-        // `lock_slow()`.
         'outer: loop {
             // If the mutex is locked, let the under dequeue the node.
             // Safe to use Relaxed on success since not making any memory writes visible.
@@ -171,9 +166,13 @@ impl<E: ThreadEvent> CoreMutex<E> {
                     Ok(_) => return,
                     Err(s) => state = s,
                 }
-                fence(Ordering::Acquire);
                 continue;
             }
+
+            // A Acquire barrier is required when dereferencing a new state
+            // since updates to its fields need to be visible from the Release store in
+            // `lock_slow()`.
+            fence(Ordering::Acquire);
 
             // The head is safe to deref since its confirmed to be non-null with the queue
             // locking above.
@@ -194,7 +193,6 @@ impl<E: ThreadEvent> CoreMutex<E> {
 
                     // re-process the queue if a new node comes in
                     if state & QUEUE_MASK != 0 {
-                        fence(Ordering::Acquire);
                         continue 'outer;
                     }
                 }
@@ -231,7 +229,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for CoreMutex<E> {
                 match self.state.compare_exchange_weak(
                     state,
                     state | QUEUE_LOCK,
-                    Ordering::Acquire,
+                    Ordering::Relaxed,
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => break,
@@ -241,6 +239,9 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for CoreMutex<E> {
         }
 
         'outer: loop {
+            // See `unlock_slow()` for the reasoning on the Acquire fence.
+            fence(Ordering::Acquire);
+
             // The head is safe to deref since its confirmed non-null with the queue locking
             // above.
             let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<E>) };
@@ -262,9 +263,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for CoreMutex<E> {
                     }
 
                     // Re-process the queue if a new node comes in.
-                    // See `unlock_slow()` for the reasoning on the Acquire fence.
                     if state & QUEUE_MASK != 0 {
-                        fence(Ordering::Acquire);
                         continue 'outer;
                     }
                 }
