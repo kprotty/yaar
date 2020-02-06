@@ -70,7 +70,7 @@ impl Task {
     }
 
     /// Set the linked list pointer of the task.
-    pub fn set_next(&self, ptr: Option<NonNull<Self>>) {
+    pub unsafe fn set_next(&self, ptr: Option<NonNull<Self>>) {
         let ptr = ptr.map(|p| p.as_ptr()).unwrap_or(null_mut());
         self.next
             .set((self.next.get() & !PTR_MASK) | (ptr as usize));

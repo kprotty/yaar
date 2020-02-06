@@ -1,23 +1,18 @@
 use yaar_lock::ThreadEvent;
 
 pub trait Platform: Sync {
-    type SpawnError;
     type CpuAffinity;
-    type ThreadLocal: ThreadLocal;
     type ThreadEvent: ThreadEvent;
+
+    fn get_tls(&self) -> usize;
+
+    fn set_tls(&self, value: usize);
 
     fn spawn_thread(
         &self,
         node_id: usize,
-        worker_id: usize,
-        affinity: Option<&Self::CpuAffinity>,
+        affinity: &Option<Self::CpuAffinity>,
         parameter: usize,
         f: extern "C" fn(param: usize),
-    ) -> Result<(), Self::SpawnError>;
-}
-
-pub trait ThreadLocal {
-    fn get(&self) -> usize;
-
-    fn set(&self, value: usize);
+    ) -> bool;
 }
