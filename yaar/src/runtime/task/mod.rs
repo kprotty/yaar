@@ -4,9 +4,6 @@ pub use self::list::*;
 mod queue;
 pub use self::queue::*;
 
-mod future;
-pub use self::future::*;
-
 use core::{
     cell::Cell,
     marker::PhantomPinned,
@@ -31,11 +28,20 @@ pub enum Priority {
     Critical = 0b11,
 }
 
+/// Specifies the heirarchy and distribution of a task into the scheduler.
 pub enum Kind {
+    /// The task should be scheduled in relation to the current parent task.
     Child = 0b00,
+    /// The task is independent of others and can be distributed across the
+    /// system for scheduling purposes.
     Parent = 0b01,
 }
 
+/// A structure which represents a unit of execution for the scheduler.
+///
+/// A task is akin to the state for a Thread, Fiber, or Coroutine but
+/// is small and generic which allows it to be used to execute anything
+/// that can provide a valid address for it, not just futures.
 pub struct Task {
     _pin: PhantomPinned,
     next: Cell<usize>,
@@ -66,13 +72,7 @@ impl Task {
     }
 
     /// Set the linked list pointer of the task.
-    ///
-    /// # Safety
-    ///
-    /// This uses an immutable references but modifies the Task.
-    /// No synchronization is done therefor the caller must ensure
-    /// that it is not called in parallel.
-    pub unsafe fn set_next(&self, ptr: Option<NonNull<Self>>) {
+    pub fn set_next(&self, ptr: Option<NonNull<Self>>) {
         let ptr = ptr.map(|p| p.as_ptr()).unwrap_or(null_mut());
         self.next
             .set((self.next.get() & !PTR_MASK) | (ptr as usize));
@@ -91,12 +91,6 @@ impl Task {
     }
 
     /// Set the priority of the task.
-    ///
-    /// # Safety
-    ///
-    /// This uses an immutable references but modifies the Task.
-    /// No synchronization is done therefor the caller must ensure
-    /// that it is not called in parallel.
     #[inline]
     pub unsafe fn set_priority(&self, priority: Priority) {
         self.next
@@ -114,12 +108,6 @@ impl Task {
     }
 
     /// Set the task kind.
-    ///
-    /// # Safety
-    ///
-    /// This uses an immutable references but modifies the Task.
-    /// No synchronization is done therefor the caller must ensure
-    /// that it is not called in parallel.
     pub unsafe fn set_kind(&self, kind: Kind) {
         self.state
             .set((self.state.get() & PTR_MASK) | (kind as usize));
@@ -129,9 +117,9 @@ impl Task {
     ///
     /// # Safety
     ///
-    /// This is unsafe as it's called internally in the scheduler for
-    /// polling the task. Its unsafe for the task to be resumed by multiple
-    /// threads.
+    /// This is unsafe as it may be called in parallel inside the scheduler.
+    /// The caller should ensure that only one thread is calling a task's resume
+    /// fn.
     #[inline]
     pub unsafe fn resume(&self) {
         let resume_fn: unsafe fn(*const Self) = transmute(self.state.get());

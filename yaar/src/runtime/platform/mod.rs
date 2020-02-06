@@ -10,7 +10,7 @@ pub trait Platform: Sync {
         &self,
         node_id: usize,
         worker_id: usize,
-        affinity: &Self::CpuAffinity,
+        affinity: Option<&Self::CpuAffinity>,
         parameter: usize,
         f: extern "C" fn(param: usize),
     ) -> Result<(), Self::SpawnError>;

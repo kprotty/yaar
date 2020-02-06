@@ -34,10 +34,10 @@ pub fn with_executor_as<E: Executor + 'static, T>(executor: &E, f: impl FnOnce(&
 ///
 /// # Safety
 ///
-/// Internal usage should not persist the global executor reference as
-/// the static lifetime serves only as a placebo to indicate that the reference
-/// is global meaning there are no guarantees on its validity after the function
+/// Usage should not persist the global executor reference as the static
+/// lifetime serves only as a placebo to indicate that the reference is global.
+/// This means that there are no guarantees on its validity after the function
 /// ends.
-pub(crate) fn with_executor<T>(f: impl FnOnce(&'static dyn Executor) -> T) -> Option<T> {
+pub fn with_executor<T>(f: impl FnOnce(&'static dyn Executor) -> T) -> Option<T> {
     EXECUTOR_REF.0.get().map(f)
 }
