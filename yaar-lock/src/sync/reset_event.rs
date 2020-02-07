@@ -26,8 +26,7 @@ pub struct CoreEvent<E> {
     phantom: PhantomData<E>,
 }
 
-unsafe impl<E: Send> Send for CoreEvent<E> {}
-
+unsafe impl<E> Send for CoreEvent<E> {}
 unsafe impl<E: Sync> Sync for CoreEvent<E> {}
 
 impl<E> Default for CoreEvent<E> {

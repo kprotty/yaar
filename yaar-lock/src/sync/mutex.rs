@@ -45,7 +45,7 @@ pub struct CoreMutex<E> {
     phantom: PhantomData<E>,
 }
 
-unsafe impl<E: Send> Send for CoreMutex<E> {}
+unsafe impl<E> Send for CoreMutex<E> {}
 unsafe impl<E: Sync> Sync for CoreMutex<E> {}
 
 unsafe impl<E: ThreadEvent> lock_api::RawMutex for CoreMutex<E> {
