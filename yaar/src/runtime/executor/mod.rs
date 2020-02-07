@@ -1,9 +1,9 @@
 pub mod scheduler;
 
 use super::task::Task;
-use core::{cell::Cell, ptr::NonNull};
+use core::{any::Any, cell::Cell, ptr::NonNull};
 
-pub trait Executor: Sync {
+pub trait Executor: Any + Sync {
     /// Schedule the task to be eventually executed.
     fn schedule(&self, task: &Task);
 }
