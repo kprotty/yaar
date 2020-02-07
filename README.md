@@ -1,6 +1,6 @@
 yaar
-[![Licence](https://img.shields.io/badge/license-MIT%20or%20Apache-blue.svg)](#License)
-[![Documentation](https://docs.rs/yaar/badge.svg)](https://docs.rs/yaar/)
+[![Crates.io](https://img.shields.io/crates/v/yaar-reactor.svg)](https://crates.io/crates/yaar-reactor)
+[![Documentation](https://docs.rs/yaar-reactor/badge.svg)](https://docs.rs/yaar-reactor/)
 ====
 
 **Y**et **A**nother **A**synchronous **R**untime (yaar)

@@ -1,5 +1,5 @@
 yaar-lock
-[![Licence](https://img.shields.io/badge/license-MIT%20or%20Apache-blue.svg)](#License)
+[![Crates.io](https://img.shields.io/crates/v/yaar-lock.svg)](https://crates.io/crates/yaar-lock)
 [![Documentation](https://docs.rs/yaar-lock/badge.svg)](https://docs.rs/yaar-lock/)
 ====
 

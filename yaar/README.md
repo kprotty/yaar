@@ -1,5 +1,5 @@
 yaar
-[![Licence](https://img.shields.io/badge/license-MIT%20or%20Apache-blue.svg)](#License)
+[![Crates.io](https://img.shields.io/crates/v/yaar.svg)](https://crates.io/crates/yaar)
 [![Documentation](https://docs.rs/yaar/badge.svg)](https://docs.rs/yaar/)
 ====
 
