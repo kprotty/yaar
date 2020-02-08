@@ -1,6 +1,6 @@
 yaar
-[![Crates.io](https://img.shields.io/crates/v/yaar-reactor.svg)](https://crates.io/crates/yaar-reactor)
-[![Documentation](https://docs.rs/yaar-reactor/badge.svg)](https://docs.rs/yaar-reactor/)
+[![Crates.io](https://img.shields.io/crates/v/yaar.svg)](https://crates.io/crates/yaar)
+[![Documentation](https://docs.rs/yaar/badge.svg)](https://docs.rs/yaar/)
 ====
 
 **Y**et **A**nother **A**synchronous **R**untime (yaar)
@@ -10,7 +10,7 @@ optimized around configuration and no_std. This crate is currently under develop
 Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
-yaar = "0.1"
+yaar = { version = "0.1", features = ["full"] }
 ```
 
 ## License

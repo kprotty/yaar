@@ -1,5 +1,5 @@
 yaar-reactor
-[![Licence](https://img.shields.io/badge/license-MIT%20or%20Apache-blue.svg)](#License)
+[![Crates.io](https://img.shields.io/crates/v/yaar-reactor.svg)](https://crates.io/crates/yaar-reactor)
 [![Documentation](https://docs.rs/yaar-reactor/badge.svg)](https://docs.rs/yaar-reactor/)
 ====
 
