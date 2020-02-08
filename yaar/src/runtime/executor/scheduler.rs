@@ -7,7 +7,6 @@ use crate::runtime::{
     with_executor, with_executor_as, Executor,
 };
 use core::{
-    any::Any,
     cell::Cell,
     num::NonZeroUsize,
     ptr::NonNull,
@@ -103,9 +102,21 @@ impl<P: Platform> NodeExecutor<P> {
                     }
                 }
 
-                // TODO
-                let main_node = executor.nodes()[start_node];
-                let worker_pool = main_node.worker_pool.lock();
+                // Using the starting node:
+                // - find an idle worker on the node
+                // - enqueue the task on the worker to run it
+                // - use the main thread to run said worker to run the task
+                Thread::<P>::run({
+                    let node = executor.nodes()[start_node];
+                    let mut worker_pool = node.worker_pool.lock();
+                    worker_pool.free_threads -= 1;
+                    let worker = worker_pool.find_worker(node).unwrap();
+                    unsafe { worker.run_queue.push(task, &node.run_queue) };
+                    worker as *const _ as usize
+                });
+
+                // Wait for the executor to stop running
+                executor.stop_event.wait();
                 Ok(())
             },
         )
@@ -137,7 +148,7 @@ impl<P: Platform> NodeExecutor<P> {
     /// Run the function with a reference to the current running
     /// [`NodeExecutor`] if any.
     fn with_current<T>(f: impl FnOnce(&Self) -> T) -> Option<T> {
-        with_executor(|executor| (executor as *const Self).map(f)).flatten()
+        with_executor(|executor| f(unsafe { &*(executor as *const _ as *const Self) }))
     }
 
     /// Run the function with a reference to the current running [`Thread`] if
@@ -179,11 +190,11 @@ unsafe impl<P: Platform> Sync for NodeExecutor<P> {}
 
 impl<P: Platform> Executor for NodeExecutor<P> {
     fn schedule(&self, task: &Task) {
-        match task.kind() {
+        let node = match task.kind() {
             // Distribute root/parent tasks round-robin across nodes.
             // The task then becomes a child to that node so its not re-distributed.
             Kind::Parent => {
-                let next_node = self.next_node.fetch_add(1, Ordering::Relaxed);
+                let next_node = self.next_node.fetch_add(1, Ordering::SeqCst);
                 let node = self.nodes()[next_node % self.nodes().len()];
                 node.run_queue.push({
                     let mut list = List::default();
@@ -191,18 +202,28 @@ impl<P: Platform> Executor for NodeExecutor<P> {
                     list.push(task);
                     list
                 });
-                node.spawn_worker();
+                Some(node)
             }
             // Enqueue child tasks locally to the worker on this thread's node.
-            Kind::Child => {
-                Self::with_current_worker(|worker| {
-                    let node = worker
-                        .node()
-                        .expect("Trying to schedule a task on a Worker not tied to a Node");
-                    worker.run_queue.push(task, &node.run_queue);
-                    node.spawn_worker();
-                })
-                .expect("Trying to schedule a task on a thread without a Worker");
+            Kind::Child => {    
+                self.current_thread(None)
+                    .and_then(|thread| thread.worker.get())
+                    .and_then(|worker_ptr| unsafe {
+                        let worker = &*worker_ptr.as_ptr();
+                        worker.node().map(|node| {
+                            worker.run_queue.push(task, &node.run_queue);
+                            node
+                        })
+                    })
+            }
+        };
+
+        // Try to spawn a worker on the node in order to handle this new tasks.
+        // Acquire barrier to synchronize with thread coming out of searching.
+        // spawn_worker() has a stronger atomic operation to handle stale loads.
+        if let Some(node) = node {
+            if node.workers_searching.load(Ordering::Acquire) == 0 {
+                node.spawn_worker();
             }
         }
     }
@@ -294,7 +315,7 @@ impl<P: Platform> WorkerPool<P> {
     }
 
     /// Try to get an idle worker from the idle worker cache.
-    fn get_worker<'a>(&mut self, node: &Node<P>) -> Option<&'a Worker<P>> {
+    fn find_worker<'a>(&mut self, node: &Node<P>) -> Option<&'a Worker<P>> {
         self.idle_workers.map(|worker| {
             let worker = unsafe { &*worker.as_ptr() };
             self.idle_workers = worker.next.get();
@@ -313,7 +334,7 @@ impl<P: Platform> WorkerPool<P> {
     /// Spawn a new worker if possible on the provided node using a cached
     /// thread or creating a new thread.
     fn spawn_worker(&mut self, node: &Node<P>) -> bool {
-        self.get_worker(node)
+        self.find_worker(node)
             .map(|worker| {
                 // try and use a thread in the idle queue
                 if let Some(thread) = self.idle_threads {
@@ -403,11 +424,11 @@ impl<P: Platform> Thread<P> {
         }
 
         // TODO: synchronize stop_event notification using
-        // Node<P>.WorkerPool(inc(free_thread) == max_thread).
+        // Node<P>.WorkerPool(inc(free_threads) == max_threads).
         // TODO: look into idling more threads / delayed thread stop.
     }
 
-    fn poll<'a>(&self, tick: usize, node: &Node<P>) -> Option<&'a Task> {
+    fn poll<'a>(&self, _tick: usize, _node: &Node<P>) -> Option<&'a Task> {
         // TODO:
         //
         // if no worker: return None
