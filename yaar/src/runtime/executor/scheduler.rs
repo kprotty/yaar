@@ -7,16 +7,20 @@ use crate::runtime::{
     with_executor, with_executor_as, Executor,
 };
 use core::{
+    pin::Pin,
     cell::Cell,
     num::NonZeroUsize,
     ptr::NonNull,
     slice::from_raw_parts,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, AtomicBool, Ordering},
 };
 use yaar_lock::{
     sync::{CoreMutex, RawMutex},
     ThreadEvent,
 };
+
+#[cfg(feature = "time")]
+use crate::runtime::time::Clock;
 
 pub enum RunError {
     /// No nodes were provided for the executor to run the future.
@@ -104,8 +108,12 @@ impl<P: Platform> NodeExecutor<P> {
 
                 // Using the starting node:
                 // - find an idle worker on the node
-                // - enqueue the task on the worker to run it
-                // - use the main thread to run said worker to run the task
+                // - enqueue the task on the worker to execute it
+                // - use the main thread to run said worker
+                //
+                // Safety:
+                // It is safe to push to worker run_queue here
+                // since the run_queue can't be currently accessed by another thread.
                 Thread::<P>::run({
                     let node = executor.nodes()[start_node];
                     let mut worker_pool = node.worker_pool.lock();
@@ -124,30 +132,38 @@ impl<P: Platform> NodeExecutor<P> {
 
     /// Get the array of Nodes passed into the run function.
     fn nodes(&self) -> &[&Node<P>] {
+        // Safety: the node slice lives as long as the executor since they're local to the run function.
         unsafe { from_raw_parts(self.nodes_ptr.as_ptr() as *const _, self.nodes_len) }
     }
 
     /// Get the reference to the platform passed into the run function.
     fn platform(&self) -> &P {
+        // Safety: the platform reference lives as long as the executor since they're local to the run function.
         unsafe { &*self.platform.as_ptr() }
     }
 
     /// Get or set the current [`Thread`] based on thread local storage.
-    fn current_thread<'a>(&self, set: Option<NonNull<Thread<P>>>) -> Option<&'a Thread<P>> {
-        unsafe {
-            if let Some(thread_ptr) = set {
-                self.platform()
-                    .set_tls(thread_ptr.as_ref() as *const _ as usize);
-                Some(&*thread_ptr.as_ptr())
-            } else {
-                NonNull::new(self.platform().get_tls() as *mut Thread<P>).map(|ptr| &*ptr.as_ptr())
-            }
+    fn current_thread<'a>(&self, set: Option<&'a Thread<P>>) -> Option<&'a Thread<P>> {
+        if let Some(new_thread) = set {
+            self.platform().set_tls(new_thread as *const _ as usize);
+            Some(new_thread)
+        } else {
+            // Safety:
+            // the tls is set only once on thread creation in Thread::run
+            // so it is assumed that it will stay that value for the lifetime of the thread.
+            let thread_ptr = self.platform().get_tls() as *mut Thread<P>;
+            NonNull::new(thread_ptr).map(|ptr| unsafe { &*ptr.as_ptr() })
         }
     }
 
     /// Run the function with a reference to the current running
     /// [`NodeExecutor`] if any.
     fn with_current<T>(f: impl FnOnce(&Self) -> T) -> Option<T> {
+        // Safety: VERIFY
+        // The current executor should be the NodeExecutor so casting it as so should be safe.
+        //
+        // TODO: Look into instead using some method of Any::downcast_ref() to convert the
+        // generic Executor reference into a typed NodeExecutor reference.
         with_executor(|executor| f(unsafe { &*(executor as *const _ as *const Self) }))
     }
 
@@ -186,9 +202,16 @@ impl<P: Platform> NodeExecutor<P> {
     }
 }
 
+/// Safety:
+/// The NodeExecutor needs to be shared over possibly many threads
+/// and all exposed values are either synchronized or immutable once shared.
 unsafe impl<P: Platform> Sync for NodeExecutor<P> {}
 
 impl<P: Platform> Executor for NodeExecutor<P> {
+    /// Schedule a task onto a running NodeExecutor.
+    /// This assumes ownership of the task in the sense
+    /// that no other thread is allowed to read or write to it
+    /// Even though it is a shared reference
     fn schedule(&self, task: &Task) {
         let node = match task.kind() {
             // Distribute root/parent tasks round-robin across nodes.
@@ -207,13 +230,11 @@ impl<P: Platform> Executor for NodeExecutor<P> {
             // Enqueue child tasks locally to the worker on this thread's node.
             Kind::Child => {    
                 self.current_thread(None)
-                    .and_then(|thread| thread.worker.get())
-                    .and_then(|worker_ptr| unsafe {
-                        let worker = &*worker_ptr.as_ptr();
-                        worker.node().map(|node| {
-                            worker.run_queue.push(task, &node.run_queue);
-                            node
-                        })
+                    .and_then(|thread| thread.worker())
+                    .and_then(|worker| worker.node().map(|node| (worker, node)))
+                    .map(|(worker, node)| unsafe {
+                        worker.run_queue.push(task, &node.run_queue);
+                        node
                     })
             }
         };
@@ -252,6 +273,8 @@ pub struct Node<P: Platform> {
     /// A FIFO, linked list of tasks available to all workers/threads on this
     /// node.
     run_queue: GlobalQueue<CoreMutex<P::ThreadEvent>>,
+    /// Flag which determines if the Node should be signaled for stopping.
+    is_active: AtomicBool,
 }
 
 impl<P: Platform> Node<P> {
@@ -269,11 +292,13 @@ impl<P: Platform> Node<P> {
 
     /// Get the array of Workers passed into the new function.
     fn workers(&self) -> &[Worker<P>] {
+        // Safety: initialization of the node ensures that it lives as long as the workers.
         unsafe { from_raw_parts(self.workers_ptr.as_ptr() as *const _, self.workers_len) }
     }
 
     /// Get the executor that this node is running on.
     fn executor(&self) -> &NodeExecutor<P> {
+        // Safety: the node executor always lives longer than the Node. 
         unsafe { &*self.executor.get().unwrap().as_ptr() }
     }
 
@@ -287,6 +312,7 @@ impl<P: Platform> Node<P> {
             == 0
         {
             if self.worker_pool.lock().spawn_worker(self) {
+                self.is_active.store(true, Ordering::Relaxed);
                 self.workers_searching.fetch_sub(1, Ordering::Release);
             }
         }
@@ -316,6 +342,9 @@ impl<P: Platform> WorkerPool<P> {
 
     /// Try to get an idle worker from the idle worker cache.
     fn find_worker<'a>(&mut self, node: &Node<P>) -> Option<&'a Worker<P>> {
+        // Safety: 
+        // The workers live as long as the node provided and 
+        // and are only enqueued internally through `put_worker`.
         self.idle_workers.map(|worker| {
             let worker = unsafe { &*worker.as_ptr() };
             self.idle_workers = worker.next.get();
@@ -336,7 +365,13 @@ impl<P: Platform> WorkerPool<P> {
     fn spawn_worker(&mut self, node: &Node<P>) -> bool {
         self.find_worker(node)
             .map(|worker| {
-                // try and use a thread in the idle queue
+                // Try and use a thread in the idle queue.
+                //
+                // Safety: 
+                // Only threads created in Thread::run() are pushed to the 
+                // idle_threads list and they do not get deallocated while
+                // they're idle as they should be blocked on their event
+                // (which is woken up below).
                 if let Some(thread) = self.idle_threads {
                     let thread = unsafe { &*thread.as_ptr() };
                     self.idle_threads = thread.next.get();
@@ -347,7 +382,7 @@ impl<P: Platform> WorkerPool<P> {
                     return true;
                 }
 
-                // try to spawn a new thread
+                // Try to spawn a new thread
                 if self.free_threads != 0 {
                     if node.executor().platform().spawn_thread(
                         node,
@@ -385,25 +420,35 @@ struct Thread<P: Platform> {
 }
 
 impl<P: Platform> Thread<P> {
+    /// Get a reference to the [`Worker`] owned by this thread.
+    fn worker<'a>(&self) -> Option<&'a Worker<P>> {
+        // Safety: the worker outlives the thread & is only set internally.
+        self.worker.get().map(|ptr| unsafe { &*ptr.as_ptr() })
+    }
+
     /// Entry point for running a worker on a [`Platform`] thread.
-    pub extern "C" fn run(worker: usize) {
-        // Get a reference to the node for this thread.
-        let node = unsafe {
-            &*(&*(worker as *mut Worker<P>))
-                .node
-                .get()
-                .expect("Worker passed in without an associated Node")
-                .as_ptr()
-        };
+    extern "C" fn run(worker: usize) {
+        // Safety: 
+        // Thread::run always receives a pointer to a valid worke from Node::spawn_worker.
+        let worker = unsafe { &*(worker as *const Worker<P>) };
+        let node = worker.node().expect("Worker passed into Thread without an associated Node");
 
         // Create this thread on the stack.
         let this = Self {
             next: Cell::new(None),
             data: P::ThreadLocalData::default(),
-            worker: Cell::new(NonNull::new(worker as *mut Worker<P>)),
+            worker: Cell::new(NonNull::new(worker as *const _ as *mut _)),
             is_searching: Cell::new(node.workers_searching.load(Ordering::Acquire) != 0),
             event: P::ThreadEvent::default(),
         };
+        
+        // Set the thread reference as the thread local value using this platform.
+        //
+        // Safety:
+        // The Thread is stack allocated so can be pinned.
+        // See: https://rust-lang-nursery.github.io/futures-api-docs/0.3.0-alpha.1/futures/macro.pin_mut.html
+        let this = unsafe { Pin::new_unchecked(&this) };
+        let _ = node.executor().current_thread(Some(&*this)).unwrap();
 
         let mut tick = 0;
         while let Some(task) = this.poll(tick, node) {
@@ -418,7 +463,11 @@ impl<P: Platform> Thread<P> {
                 }
             }
 
-            // execute the task & forward the tick.
+            // Execute the task & forward the tick.
+            //
+            // Safety: 
+            // The caller which schedules the task ensures that
+            // the resume function wont be called in parallel here.
             unsafe { task.resume() };
             tick = tick.wrapping_add(1);
         }
@@ -428,7 +477,7 @@ impl<P: Platform> Thread<P> {
         // TODO: look into idling more threads / delayed thread stop.
     }
 
-    fn poll<'a>(&self, _tick: usize, _node: &Node<P>) -> Option<&'a Task> {
+    fn poll<'a>(&self, tick: usize, node: &Node<P>) -> Option<&'a Task> {
         // TODO:
         //
         // if no worker: return None
@@ -465,7 +514,68 @@ impl<P: Platform> Thread<P> {
         //   - if many found, pop 1, acquire worker, submit reset, return 1
         //
         // give up thread, wait for event, re-loop
+
+        'poll: loop {
+            // Can only fetch tasks if thread has a worker
+            let worker = match self.worker() {
+                Some(worker) => worker,
+                None => return None,
+            };
+            
+            // Check for any expired timers
+            let mut wait_time = None;
+            if let Some(task) = self.poll_timers(worker, &mut wait_time) {
+                return Some(task);
+            }
+            
+            // Check the local queue
+            if let Some(task) = unsafe { self.poll_local(worker, node, tick) } {
+                return Some(task);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "time"))]
+    fn poll_timers<'a>(
+        &self,
+        _worker: &Worker<P>,
+        _wait_time: &mut Option<()>,
+    ) -> Option<&'a Task> {
         None
+    }
+
+    #[cfg(feature = "time")]
+    fn poll_timers<'a>(
+        &self,
+        _worker: &Worker<P>,
+        _wait_time: &mut Option<<P::Clock as Clock>::Instant>,
+    ) -> Option<&'a Task> {
+        // TODO: check worker delay queue for expired entries,
+        //       if none, update wait_time with next expiry. 
+        None
+    }
+
+    /// Poll a task from the local thread & worker.
+    /// Safety: Only the current thread (which owns the worker) is calling pop on the run_queue.
+    unsafe fn poll_local<'a>(&self, worker: &Worker<P>, node: &Node<P>, tick: usize) -> Option<&'a Task> {
+        // Check the global queue once in a while to ensure eventual system fairness.
+        if tick % 64 == 0 {
+            let task = node.run_queue.pop(&worker.run_queue, node.workers().len(), 1);
+            if let Some(task) = task {
+                return Some(task);
+            }
+        }
+
+        // Check the back of the local queue (FIFO) once in a while to ensure eventual local fairness
+        if tick % 16 == 0 {
+            let task = worker.run_queue.pop().map(|ptr| &*ptr.as_ptr());
+            if let Some(task) = task {
+                return Some(task);
+            }
+        }
+
+        // Pop from the front of the local queue by default (LIFO)
+        worker.run_queue.pop().map(|ptr| &*ptr.as_ptr())
     }
 }
 
@@ -485,6 +595,8 @@ pub struct Worker<P: Platform> {
 impl<P: Platform> Worker<P> {
     /// Get a reference to the workers [`Node`] if any.
     fn node<'a>(&self) -> Option<&'a Node<P>> {
+        // Safety: 
+        // The node can only be set internallys and shares the same lifetime as the worker.
         self.node.get().map(|ptr| unsafe { &*ptr.as_ptr() })
     }
 }

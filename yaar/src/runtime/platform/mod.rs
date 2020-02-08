@@ -1,9 +1,19 @@
 use super::scheduler::{Node, Worker};
 use yaar_lock::ThreadEvent;
 
+#[cfg(feature = "time")]
+use super::time::Clock;
+#[cfg(feature = "io")]
+use yaar_reactor::Reactor;
+
 pub trait Platform: Sync + Sized + 'static {
     type CpuAffinity;
     type ThreadEvent: ThreadEvent;
+
+    #[cfg(feature = "time")]
+    type Clock: Clock;
+    #[cfg(feature = "io")]
+    type Reactor: Reactor;
 
     type NodeLocalData;
     type WorkerLocalData;

@@ -52,6 +52,28 @@ impl<R: RawMutex> GlobalQueue<R> {
         queue.push_back(back);
         self.size.store(self.len() + size, Ordering::Relaxed);
     }
+
+    /// Dequeue a batch of tasks onto the given [`LocalQueue`], 
+    /// returning one of the task consumed.
+    /// 
+    /// `max_local_queues` is used as a hint for distribution while
+    /// `max_batch_size` limits the amount of tasks that can be dequeued. 
+    ///
+    /// # Safety
+    ///
+    /// The pop operation assumes that the caller is the producer thread of
+    /// the provided [`LocalQueue`]; The only thread that can call push(),
+    /// pop() and pop_front() on it. Trying to pop() from the same LocalQueue
+    /// on multiple threads may result in undefined behavior.
+    pub unsafe fn pop<'a>(
+        &self,
+        queue: &LocalQueue,
+        max_local_queues: usize,
+        max_batch_size: usize,
+    ) -> Option<&'a Task> {
+        // TODO
+        None
+    }
 }
 
 use self::atomic_index::*;
@@ -89,7 +111,7 @@ impl Default for LocalQueue {
     fn default() -> Self {
         Self {
             pos: CachePadded::new([AtomicIndex::new(0), AtomicIndex::new(0)]),
-            // Safety: assume_init() safe as all the array elements end up initialized.
+            // Safety: assume_init() is safe as all the array elements end up initialized.
             tasks: unsafe {
                 let mut tasks = MaybeUninit::uninit();
                 let ptr = tasks.as_mut_ptr() as *mut Cell<MaybeUninit<*const Task>>;
@@ -127,7 +149,8 @@ impl LocalQueue {
 
     /// Get an atomic reference to both the head and tail of the ring buffer.
     pub(super) fn pos(&self) -> &AtomicUsize {
-        // Safety: as long as the head & tail fit in the same atomic type,
+        // Safety:
+        // As long as the head & tail fit in the same atomic type,
         // they can both be interacted with atomically.
         assert_eq!(size_of::<AtomicUsize>(), size_of::<[AtomicIndex; 2]>());
         unsafe { &*(&self.pos as *const _ as *const _) }
