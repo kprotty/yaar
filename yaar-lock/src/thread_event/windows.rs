@@ -151,41 +151,44 @@ type WaitOnAddress = extern "stdcall" fn(
 /// On success, sets the necessary functions and returns true.
 unsafe fn load_wait_on_address() -> bool {
     // api-ms-win-core-synch-l1-2-0.dll
-    let dll = GetModuleHandleW((&[
-        b'a' as u16,
-        b'p' as u16,
-        b'i' as u16,
-        b'-' as u16,
-        b'm' as u16,
-        b's' as u16,
-        b'-' as u16,
-        b'w' as u16,
-        b'i' as u16,
-        b'n' as u16,
-        b'-' as u16,
-        b'c' as u16,
-        b'o' as u16,
-        b'r' as u16,
-        b'e' as u16,
-        b'-' as u16,
-        b's' as u16,
-        b'y' as u16,
-        b'n' as u16,
-        b'c' as u16,
-        b'h' as u16,
-        b'-' as u16,
-        b'l' as u16,
-        b'1' as u16,
-        b'-' as u16,
-        b'2' as u16,
-        b'-' as u16,
-        b'0' as u16,
-        b'.' as u16,
-        b'd' as u16,
-        b'l' as u16,
-        b'l' as u16,
-        0 as u16,
-    ]).as_ptr() as LPCWSTR);
+    let dll = GetModuleHandleW(
+        (&[
+            b'a' as u16,
+            b'p' as u16,
+            b'i' as u16,
+            b'-' as u16,
+            b'm' as u16,
+            b's' as u16,
+            b'-' as u16,
+            b'w' as u16,
+            b'i' as u16,
+            b'n' as u16,
+            b'-' as u16,
+            b'c' as u16,
+            b'o' as u16,
+            b'r' as u16,
+            b'e' as u16,
+            b'-' as u16,
+            b's' as u16,
+            b'y' as u16,
+            b'n' as u16,
+            b'c' as u16,
+            b'h' as u16,
+            b'-' as u16,
+            b'l' as u16,
+            b'1' as u16,
+            b'-' as u16,
+            b'2' as u16,
+            b'-' as u16,
+            b'0' as u16,
+            b'.' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
+            0 as u16,
+        ])
+            .as_ptr() as LPCWSTR,
+    );
     if dll.is_null() {
         return false;
     }
@@ -227,18 +230,21 @@ type NtInvokeKeyedEvent = extern "stdcall" fn(
 /// On success, stores the event handle in BACKEND_HANDLE and returns true.
 unsafe fn load_keyed_events() -> bool {
     // ntdll.dll
-    let dll = GetModuleHandleW((&[
-        b'n' as u16,
-        b't' as u16,
-        b'd' as u16,
-        b'l' as u16,
-        b'l' as u16,
-        b'.' as u16,
-        b'd' as u16,
-        b'l' as u16,
-        b'l' as u16,
-        0 as u16,
-    ]).as_ptr() as LPCWSTR);
+    let dll = GetModuleHandleW(
+        (&[
+            b'n' as u16,
+            b't' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
+            b'.' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
+            0 as u16,
+        ])
+            .as_ptr() as LPCWSTR,
+    );
     if dll.is_null() {
         return false;
     }

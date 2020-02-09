@@ -1,5 +1,5 @@
-use std::{iter, sync::Barrier, time, convert::TryInto};
 use crossbeam_utils::{thread::scope, CachePadded};
+use std::{convert::TryInto, iter, sync::Barrier, time};
 
 pub fn main() {
     bench_all("Contended", 2);
@@ -18,7 +18,7 @@ fn bench_all(name: &str, num_locks: u32) {
         n_threads: num_cpus::get().try_into().unwrap(),
         n_locks: num_locks,
         n_ops: 10_000,
-        n_rounds: 25,
+        n_rounds: 100,
     };
 
     println!("------------------------------------------------");
@@ -28,6 +28,8 @@ fn bench_all(name: &str, num_locks: u32) {
     bench::<mutexes::ParkingLot>(&options);
     bench::<mutexes::YaarLock>(&options);
     bench::<mutexes::AmdSpin>(&options);
+    #[cfg(windows)]
+    bench::<mutexes::NtLock>(&options);
     println!();
 }
 
@@ -55,7 +57,7 @@ fn bench<M: Mutex>(options: &Options) {
 }
 
 mod mutexes {
-    use super::Mutex;
+    use super::*;
 
     pub(crate) type Std = std::sync::Mutex<u32>;
     impl Mutex for Std {
@@ -87,6 +89,17 @@ mod mutexes {
     pub(crate) type YaarLock = yaar_lock::sync::Mutex<u32>;
     impl Mutex for YaarLock {
         const LABEL: &'static str = "yaar_lock";
+        fn with_lock(&self, f: impl FnOnce(&mut u32)) {
+            let mut guard = self.lock();
+            f(&mut guard)
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) type NtLock = ntlock::Mutex<u32>;
+    #[cfg(windows)]
+    impl Mutex for NtLock {
+        const LABEL: &'static str = "ntlock";
         fn with_lock(&self, f: impl FnOnce(&mut u32)) {
             let mut guard = self.lock();
             f(&mut guard)
@@ -215,5 +228,177 @@ mod amd_spinlock {
         fn drop(&mut self) {
             self.lock.locked.store(false, Ordering::Release)
         }
+    }
+}
+
+#[cfg(windows)]
+mod ntlock {
+    use std::{
+        cell::UnsafeCell,
+        ops::{Deref, DerefMut},
+        sync::atomic::{spin_loop_hint, AtomicU32, AtomicU8, AtomicUsize, Ordering},
+    };
+
+    const WAKE: u32 = 1 << 8;
+    const WAIT: u32 = 1 << 9;
+
+    pub struct Mutex<T> {
+        waiters: AtomicU32,
+        value: UnsafeCell<T>,
+    }
+
+    unsafe impl<T: Send> Send for Mutex<T> {}
+    unsafe impl<T: Send> Sync for Mutex<T> {}
+
+    impl<T: Default> Default for Mutex<T> {
+        fn default() -> Self {
+            Self::new(T::default())
+        }
+    }
+
+    impl<T> Mutex<T> {
+        pub const fn new(value: T) -> Self {
+            Self {
+                waiters: AtomicU32::new(0),
+                value: UnsafeCell::new(value),
+            }
+        }
+
+        #[inline]
+        fn locked(&self) -> &AtomicU8 {
+            unsafe { &*(&self.waiters as *const _ as *const _) }
+        }
+
+        #[inline]
+        pub fn lock(&self) -> MutexGuard<'_, T> {
+            if self.locked().swap(1, Ordering::Acquire) != 0 {
+                self.lock_slow();
+            }
+            MutexGuard { mutex: self }
+        }
+
+        #[cold]
+        fn lock_slow(&self) {
+            let handle = Self::get_handle();
+            loop {
+                let waiters = self.waiters.load(Ordering::Relaxed);
+                if waiters & 1 == 0 {
+                    if self.locked().swap(1, Ordering::Acquire) == 0 {
+                        return;
+                    }
+                } else if self
+                    .waiters
+                    .compare_exchange_weak(
+                        waiters,
+                        (waiters + WAIT) | 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    let ret =
+                        unsafe { NtWaitForKeyedEvent(handle, self as *const _ as usize, 0, 0) };
+                    debug_assert_eq!(ret, 0);
+                    self.waiters.fetch_sub(WAKE, Ordering::Relaxed);
+                }
+                spin_loop_hint();
+            }
+        }
+
+        fn unlock(&self) {
+            self.locked().store(0, Ordering::Release);
+            loop {
+                let waiters = self.waiters.load(Ordering::Relaxed);
+                if (waiters < WAIT) || (waiters & 1 != 0) || (waiters & WAKE != 0) {
+                    return;
+                }
+                if self
+                    .waiters
+                    .compare_exchange_weak(
+                        waiters,
+                        (waiters - WAIT) + WAKE,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    let ret = unsafe {
+                        NtReleaseKeyedEvent(Self::get_handle(), self as *const _ as usize, 0, 0)
+                    };
+                    debug_assert_eq!(ret, 0);
+                    return;
+                }
+                spin_loop_hint();
+            }
+        }
+
+        fn handle_ref() -> &'static AtomicUsize {
+            static HANDLE: AtomicUsize = AtomicUsize::new(0);
+            &HANDLE
+        }
+
+        fn get_handle() -> usize {
+            let handle = Self::handle_ref().load(Ordering::Relaxed);
+            if handle != 0 {
+                return handle;
+            }
+            Self::get_handle_slow()
+        }
+
+        #[cold]
+        fn get_handle_slow() -> usize {
+            let mut handle = 0;
+            const MASK: u32 = 0x80000000 | 0x40000000; // GENERIC_READ | GENERIC_WRITE
+            let ret = unsafe { NtCreateKeyedEvent(&mut handle, MASK, 0, 0) };
+            assert_eq!(ret, 0, "Nt Keyed Events not available");
+            match Self::handle_ref().compare_exchange(
+                0,
+                handle,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => handle,
+                Err(new_handle) => {
+                    let ret = unsafe { CloseHandle(handle) };
+                    debug_assert_eq!(ret, 0);
+                    new_handle
+                }
+            }
+        }
+    }
+
+    pub struct MutexGuard<'a, T> {
+        mutex: &'a Mutex<T>,
+    }
+
+    impl<'a, T> Drop for MutexGuard<'a, T> {
+        fn drop(&mut self) {
+            self.mutex.unlock();
+        }
+    }
+
+    impl<'a, T> DerefMut for MutexGuard<'a, T> {
+        fn deref_mut(&mut self) -> &mut T {
+            unsafe { &mut *self.mutex.value.get() }
+        }
+    }
+
+    impl<'a, T> Deref for MutexGuard<'a, T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            unsafe { &*self.mutex.value.get() }
+        }
+    }
+
+    #[link(name = "kernel32")]
+    extern "stdcall" {
+        fn CloseHandle(handle: usize) -> u32;
+    }
+
+    #[cfg_attr(target_env = "msvc", link(name = "ntdll"))]
+    extern "stdcall" {
+        fn NtCreateKeyedEvent(handle_ptr: &mut usize, mask: u32, x: usize, y: usize) -> usize;
+        fn NtWaitForKeyedEvent(handle: usize, key: usize, block: usize, timeout: usize) -> usize;
+        fn NtReleaseKeyedEvent(handle: usize, key: usize, block: usize, timeout: usize) -> usize;
     }
 }
