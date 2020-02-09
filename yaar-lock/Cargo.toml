@@ -27,26 +27,6 @@ os = [
     "winapi/libloaderapi",
 ]
 
-# Used for controlling dev dependencies
-bench_sync = [
-    "os",
-    "sync",
-    "criterion",
-    "num_cpus",
-    "parking_lot",
-    "crossbeam-utils",
-]
-bench_async = [
-    "os",
-    "future",
-    "criterion",
-    "num_cpus",
-    "futures-intrusive/std",
-    "async-std",
-    "tokio/sync",
-    "tokio/rt-threaded",
-]
-
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true, default-features = false }
 
@@ -54,30 +34,8 @@ libc = { version = "0.2", optional = true, default-features = false }
 winapi = { version = "0.3", optional = true, default-features = false }
 
 [dependencies]
-# lib depedencies
 lock_api = { version = "0.3", optional = true }
 futures-intrusive = { version = "0.3", optional = true, default-features = false }
-
-# dev dependencies
-num_cpus = { version = "1.11", optional = true }
-parking_lot = { version = "0.10", optional = true }
-criterion = { version = "0.3", optional = true }
-crossbeam-utils = { version = "0.7", optional = true }
-async-std = { version = "1.4", optional = true }
-tokio = { version = "0.2", optional = true }
-
-[lib]
-name = "yaar_lock"
-
-[[bench]]
-name = "async_mutex"
-harness = false
-required-features = ["bench_async"]
-
-[[bench]]
-name = "sync_mutex"
-harness = false
-required-features = ["bench_sync"]
 
 [package.metadata.docs.rs]
 features = ["full", "nightly"]

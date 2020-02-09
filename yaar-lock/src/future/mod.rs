@@ -1,39 +1,39 @@
-use super::sync::CoreEvent;
+use super::sync::CoreMutex;
 use futures_intrusive::sync::*;
 
 /// A synchronization primitive which can be either in the set or reset state.
-pub type RawResetEvent<ThreadEvent> = GenericManualResetEvent<CoreEvent<ThreadEvent>>;
+pub type RawResetEvent<ThreadEvent> = GenericManualResetEvent<CoreMutex<ThreadEvent>>;
 
 /// A Future that is resolved once the corresponding `RawResetEvent` has been
 /// set
 pub type RawWaitForEventFuture<'a, ThreadEvent> =
-    GenericWaitForEventFuture<'a, CoreEvent<ThreadEvent>>;
+    GenericWaitForEventFuture<'a, CoreMutex<ThreadEvent>>;
 
 /// A futures-aware mutex.
-pub type RawMutex<T, ThreadEvent> = GenericMutex<CoreEvent<ThreadEvent>, T>;
+pub type RawMutex<T, ThreadEvent> = GenericMutex<CoreMutex<ThreadEvent>, T>;
 
 /// An RAII guard returned by the lock and try_lock methods of `RawMutex`.
 /// When this structure is dropped (falls out of scope), the lock will be
 /// unlocked.
-pub type RawMutexGuard<'a, T, ThreadEvent> = GenericMutexGuard<'a, CoreEvent<ThreadEvent>, T>;
+pub type RawMutexGuard<'a, T, ThreadEvent> = GenericMutexGuard<'a, CoreMutex<ThreadEvent>, T>;
 
 /// A future which resolves when the target mutex has been successfully
 /// acquired.
 pub type RawMutexLockFuture<'a, T, ThreadEvent> =
-    GenericMutexLockFuture<'a, CoreEvent<ThreadEvent>, T>;
+    GenericMutexLockFuture<'a, CoreMutex<ThreadEvent>, T>;
 
 /// A futures-aware semaphore.
-pub type RawSemaphore<ThreadEvent> = GenericSemaphore<CoreEvent<ThreadEvent>>;
+pub type RawSemaphore<ThreadEvent> = GenericSemaphore<CoreMutex<ThreadEvent>>;
 
 /// An RAII guard returned by the acquire and try_acquire methods of
 /// `RawSemaphore`.
 pub type RawSemaphoreReleaser<'a, ThreadEvent> =
-    GenericSemaphoreReleaser<'a, CoreEvent<ThreadEvent>>;
+    GenericSemaphoreReleaser<'a, CoreMutex<ThreadEvent>>;
 
 /// A future which resolves when the target semaphore has been successfully
 /// acquired.
 pub type RawSemaphoreAcquireFuture<'a, ThreadEvent> =
-    GenericSemaphoreAcquireFuture<'a, CoreEvent<ThreadEvent>>;
+    GenericSemaphoreAcquireFuture<'a, CoreMutex<ThreadEvent>>;
 
 #[cfg(feature = "os")]
 use super::OsThreadEvent;

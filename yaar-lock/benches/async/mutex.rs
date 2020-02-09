@@ -1,4 +1,3 @@
-use async_std::{sync::Mutex as AsyncStdMutex, task};
 use criterion::{criterion_group, criterion_main, Benchmark, Criterion};
 use futures_intrusive::sync::{Mutex as IntrusiveMutex, Semaphore};
 use std::{
@@ -15,18 +14,6 @@ const TEST_SECS: u64 = 10;
 const ITERATIONS: usize = 50;
 const NUM_YIELDS: usize = 10;
 const YIELD_CHANCE: usize = 25;
-
-trait Block {
-    fn block_on<F: Future<Output = ()>>(&self, f: F);
-}
-
-struct FakeAsyncStdRuntime;
-
-impl Block for FakeAsyncStdRuntime {
-    fn block_on<F: Future<Output = ()>>(&self, f: F) {
-        task::block_on(f);
-    }
-}
 
 struct Yield {
     iter: usize,
@@ -131,16 +118,6 @@ fn tokio_rt_yaar_unfair(c: &mut Criterion) {
     );
 }
 
-fn tokio_rt_async_std(c: &mut Criterion) {
-    benchmarks!(
-        c,
-        tokio::runtime::Runtime::new().unwrap(),
-        tokio::spawn,
-        "tokio/async_std",
-        AsyncStdMutex::new(()),
-    );
-}
-
 fn tokio_rt_tokio(c: &mut Criterion) {
     benchmarks!(
         c,
@@ -151,86 +128,17 @@ fn tokio_rt_tokio(c: &mut Criterion) {
     );
 }
 
-fn async_std_intrusive_fair(c: &mut Criterion) {
-    benchmarks!(
-        c,
-        FakeAsyncStdRuntime {},
-        task::spawn,
-        "async_std/futures_intrusive(fair)",
-        IntrusiveMutex::new((), true),
-    );
-}
-
-fn async_std_intrusive_unfair(c: &mut Criterion) {
-    benchmarks!(
-        c,
-        FakeAsyncStdRuntime {},
-        task::spawn,
-        "async_std/futures_intrusive(unfair)",
-        IntrusiveMutex::new((), false),
-    );
-}
-
-fn async_std_yaar_fair(c: &mut Criterion) {
-    benchmarks!(
-        c,
-        FakeAsyncStdRuntime {},
-        task::spawn,
-        "async_std/yaar(fair)",
-        YaarMutex::new((), true),
-    );
-}
-
-fn async_std_yaar_unfair(c: &mut Criterion) {
-    benchmarks!(
-        c,
-        FakeAsyncStdRuntime {},
-        task::spawn,
-        "async_std/yaar(unfair)",
-        YaarMutex::new((), false),
-    );
-}
-
-fn async_std_async_std(c: &mut Criterion) {
-    benchmarks!(
-        c,
-        FakeAsyncStdRuntime {},
-        task::spawn,
-        "async_std/async_std",
-        AsyncStdMutex::new(()),
-    );
-}
-
-fn async_std_tokio(c: &mut Criterion) {
-    benchmarks!(
-        c,
-        FakeAsyncStdRuntime {},
-        task::spawn,
-        "async_std/tokio",
-        TokioMutex::new(()),
-    );
-}
-
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .sample_size(20)
         .measurement_time(Duration::from_secs(TEST_SECS));
     targets =
-        // tokio
         tokio_rt_yaar_unfair,
         tokio_rt_intrusive_unfair,
         tokio_rt_yaar_fair,
         tokio_rt_intrusive_fair,
-        tokio_rt_async_std,
         tokio_rt_tokio,
-        // async-std
-        async_std_yaar_unfair,
-        async_std_intrusive_unfair,
-        async_std_yaar_fair,
-        async_std_intrusive_fair,
-        async_std_async_std,
-        async_std_tokio
 }
 
 criterion_main!(benches);
