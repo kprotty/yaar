@@ -53,11 +53,11 @@ impl<R: RawMutex> GlobalQueue<R> {
         self.size.store(self.len() + size, Ordering::Relaxed);
     }
 
-    /// Dequeue a batch of tasks onto the given [`LocalQueue`], 
+    /// Dequeue a batch of tasks onto the given [`LocalQueue`],
     /// returning one of the task consumed.
-    /// 
+    ///
     /// `max_local_queues` is used as a hint for distribution while
-    /// `max_batch_size` limits the amount of tasks that can be dequeued. 
+    /// `max_batch_size` limits the amount of tasks that can be dequeued.
     ///
     /// # Safety
     ///
@@ -141,6 +141,11 @@ impl LocalQueue {
         &self.pos[Self::TAIL_POS]
     }
 
+    /// Load the tail position of the ring buffer without synchronization.
+    fn load_tail_unsync(&self) -> PosIndex {
+        unsafe { *(self.tail() as *const _ as usize as *const PosIndex) }
+    }
+
     /// Convert a head & tail value into a machine word to interact with
     /// [`pos()`].
     pub(super) fn to_pos(head: PosIndex, tail: PosIndex) -> usize {
@@ -157,6 +162,8 @@ impl LocalQueue {
     }
 
     /// Get an approximation of the local queue size.
+    ///
+    /// This is safe to be called by multiple threads.
     #[inline]
     pub fn len(&self) -> usize {
         let head = self.head().load(Ordering::Acquire);
@@ -181,9 +188,10 @@ impl LocalQueue {
     /// Push as task to the end this queue, overflowing into the global queue if
     /// this queue is full.
     fn push_back<R: RawMutex>(&self, task: &Task, global_queue: &GlobalQueue<R>) {
-        // Relaxed loads as not viewing `tasks` updates from other threads
+        // Unsync load on tail as this thread is the only one that can update it.
+        // Relaxed load on head as not viewing `tasks` updates from other threads
         // since this should be the only thread that can write to `tasks`.
-        let tail = self.tail().load(Ordering::Relaxed);
+        let tail = self.load_tail_unsync();
         let mut head = self.head().load(Ordering::Relaxed);
 
         loop {
@@ -207,9 +215,10 @@ impl LocalQueue {
     /// Push as task to the front this queue, overflowing into the global queue
     /// if this queue is full.
     fn push_front<R: RawMutex>(&self, task: &Task, global_queue: &GlobalQueue<R>) {
+        // Unsync load on tail as this thread is the only one that can update it.
         // Relaxed loads as not viewing `tasks` updates from other threads
         // since this should be the only thread that can write to `tasks`.
-        let tail = self.tail().load(Ordering::Relaxed);
+        let tail = self.load_tail_unsync();
         let mut head = self.head().load(Ordering::Relaxed);
 
         loop {
@@ -282,8 +291,9 @@ impl LocalQueue {
     ///
     /// This should only be called by the producer thread of this local queue.
     pub unsafe fn pop(&self) -> Option<NonNull<Task>> {
+        // Unsync load on tail as this is the only thread that can update it.
         // Relaxed loads as not viewing `tasks` updates from other threads.
-        let tail = self.tail().load(Ordering::Relaxed);
+        let tail = self.load_tail_unsync();
         let mut head = self.head().load(Ordering::Relaxed);
 
         loop {
@@ -313,8 +323,9 @@ impl LocalQueue {
     ///
     /// This should only be called by the producer thread of this local queue.
     pub unsafe fn pop_front(&self) -> Option<NonNull<Task>> {
+        // Unsync load on tail as this is the only thread that can update it.
         // Relaxed loads as not viewing `tasks` updates from other threads.
-        let tail = self.tail().load(Ordering::Relaxed);
+        let tail = self.load_tail_unsync();
         let mut head = self.head().load(Ordering::Relaxed);
 
         loop {
@@ -349,8 +360,9 @@ impl LocalQueue {
     /// This is safe to be called from the consumer threads while the producer
     /// thread is running and panics if the current LocalQueue is empty.
     pub fn steal(&self, other: &Self) -> Option<NonNull<Task>> {
+        // Unsync load on tail as this is the only thread that can update it.
         // Relaxed ordering since not observing any changes from other threads.
-        let tail = self.tail().load(Ordering::Relaxed);
+        let tail = self.load_tail_unsync();
         let head = self.head().load(Ordering::Relaxed);
         assert_eq!(
             tail.wrapping_sub(head),

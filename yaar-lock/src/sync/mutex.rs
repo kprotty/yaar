@@ -166,9 +166,10 @@ impl<E: ThreadEvent> CoreMutex<E> {
                 Err(s) => state = s,
             }
         }
-        
+
         // On re-loop, an Acquire barrier is required as the new state with be deref'd
-        // and updates to its fields need to be visible from the Release store in `lock_slow()`.
+        // and updates to its fields need to be visible from the Release store in
+        // `lock_slow()`.
         'outer: loop {
             // If the mutex is locked, let the under dequeue the node.
             // Safe to use Relaxed on success since not making any memory writes visible.

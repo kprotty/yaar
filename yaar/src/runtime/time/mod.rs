@@ -1,4 +1,3 @@
-
 pub trait Clock {
     type Instant: Default + PartialOrd<Self::Instant>;
 
