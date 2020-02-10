@@ -64,7 +64,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutex for CoreMutex<E> {
 
     fn lock(&self) {
         if !self.try_lock() {
-            let node = WaitNode::<E>::default();
+            let node = WaitNode::default();
             self.lock_slow(&node);
         }
     }
@@ -77,10 +77,18 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutex for CoreMutex<E> {
     }
 }
 
+/// Action to perform after ThreadEvent notification.
+enum Notify {
+    /// Retry to acquire the mutex
+    Retry,
+    /// Onership of the mutex has been transferred.
+    Acquired,
+}
+
 impl<E: ThreadEvent> CoreMutex<E> {
     #[cold]
-    fn lock_slow(&self, wait_node: &WaitNode<E>) {
-        const MAX_SPIN_DOUBLING: usize = 4;
+    fn lock_slow(&self, wait_node: &WaitNode<E, Notify>) {
+        const MAX_SPIN_DOUBLING: usize = 0;
 
         let mut spin = 0;
         let mut state = self.state.load(Ordering::Relaxed);
@@ -99,11 +107,16 @@ impl<E: ThreadEvent> CoreMutex<E> {
                 continue;
             }
 
-            // spin if theres no waiting nodes & havent spun too much
-            let head = (state & QUEUE_MASK) as *const WaitNode<E>;
+            // spin if theres no waiting nodes & havent spun too much.
+            // On windows 10 for most desktop cpus, its better not to spin much.
+            let head = (state & QUEUE_MASK) as *const WaitNode<E, Notify>;
             if head.is_null() && spin < MAX_SPIN_DOUBLING {
                 spin += 1;
-                (0..(1 << spin)).for_each(|_| spin_loop_hint());
+                if cfg!(all(windows, feature = "os")) {
+                    spin_loop_hint();
+                } else {
+                    (0..(1 << spin)).for_each(|_| spin_loop_hint());
+                }
                 state = self.state.load(Ordering::Relaxed);
                 continue;
             }
@@ -121,12 +134,13 @@ impl<E: ThreadEvent> CoreMutex<E> {
             }
 
             // wait to be signaled by an unlocking thread
-            if wait_node.wait() {
-                return;
-            } else {
-                spin = 0;
-                wait_node.reset();
-                state = self.state.load(Ordering::Relaxed);
+            match wait_node.wait() {
+                Notify::Acquired => return,
+                Notify::Retry => {
+                    spin = 0;
+                    wait_node.reset();
+                    state = self.state.load(Ordering::Relaxed);
+                }
             }
         }
     }
@@ -145,14 +159,16 @@ impl<E: ThreadEvent> CoreMutex<E> {
             match self.state.compare_exchange_weak(
                 state,
                 state | QUEUE_LOCK,
-                Ordering::Relaxed,
+                Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(s) => state = s,
             }
         }
-
+        
+        // On re-loop, an Acquire barrier is required as the new state with be deref'd
+        // and updates to its fields need to be visible from the Release store in `lock_slow()`.
         'outer: loop {
             // If the mutex is locked, let the under dequeue the node.
             // Safe to use Relaxed on success since not making any memory writes visible.
@@ -166,17 +182,13 @@ impl<E: ThreadEvent> CoreMutex<E> {
                     Ok(_) => return,
                     Err(s) => state = s,
                 }
+                fence(Ordering::Acquire);
                 continue;
             }
 
-            // A Acquire barrier is required when dereferencing a new state
-            // since updates to its fields need to be visible from the Release store in
-            // `lock_slow()`.
-            fence(Ordering::Acquire);
-
             // The head is safe to deref since its confirmed to be non-null with the queue
             // locking above.
-            let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<E>) };
+            let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<E, Notify>) };
             let (new_tail, tail) = head.dequeue();
             if new_tail.is_null() {
                 loop {
@@ -184,8 +196,8 @@ impl<E: ThreadEvent> CoreMutex<E> {
                     match self.state.compare_exchange_weak(
                         state,
                         state & MUTEX_LOCK,
-                        Ordering::Release,
-                        Ordering::Relaxed,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
                     ) {
                         Ok(_) => break,
                         Err(s) => state = s,
@@ -201,7 +213,7 @@ impl<E: ThreadEvent> CoreMutex<E> {
             }
 
             // wake up the dequeued tail
-            tail.notify(false);
+            tail.notify(Notify::Retry);
             return;
         }
     }
@@ -244,7 +256,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for CoreMutex<E> {
 
             // The head is safe to deref since its confirmed non-null with the queue locking
             // above.
-            let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<E>) };
+            let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<E, Notify>) };
             let (new_tail, tail) = head.dequeue();
 
             // update the state to dequeue with a Release ordering which
@@ -272,7 +284,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for CoreMutex<E> {
             }
 
             // wake up the node with the mutex still locked (direct handoff)
-            tail.notify(true);
+            tail.notify(Notify::Acquired);
             return;
         }
     }
@@ -296,7 +308,7 @@ fn test_mutex() {
         /// thread
         is_exclusive: AtomicBool,
         /// Counter which is verified after running.
-        /// u128 since most cpus cannot operate on it with one instruction.
+        /// Use u128 as most cpus cannot operate on it with one instruction.
         count: u128,
     }
 
@@ -306,6 +318,7 @@ fn test_mutex() {
         count: 0,
     }));
 
+    // Run NUM_THREAD thread which update the context count for NUM_ITERS each
     let workers = (0..NUM_THREADS)
         .map(|_| {
             let context = context.clone();
@@ -321,6 +334,9 @@ fn test_mutex() {
             })
         })
         .collect::<Vec<_>>();
+
+    // Start the worker threads, wait for them to complete, and check if
+    // incrementation is correct.
     start_barrier.wait();
     workers.into_iter().for_each(|t| t.join().unwrap());
     assert_eq!(

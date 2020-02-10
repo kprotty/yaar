@@ -8,27 +8,27 @@ pub(crate) enum WaitNodeState {
     Uninit,
     /// The node is initialized and probably waiting in the wait queue.
     Waiting,
-    /// The node was dequeued and should check a resource again.
+    /// The node was dequeued and woken up with a resume token
     Notified,
-    /// The node was dequeued and was given ownership of a resource.
-    DirectNotified,
 }
 
 /// An intrusive, doubly linked list node used to track blocked threads.
-pub(crate) struct WaitNode<E> {
+pub(crate) struct WaitNode<Event, Token> {
     state: Cell<WaitNodeState>,
-    event: Cell<MaybeUninit<E>>,
+    event: Cell<MaybeUninit<Event>>,
+    token: Cell<MaybeUninit<Token>>,
     prev: Cell<MaybeUninit<*const Self>>,
     next: Cell<MaybeUninit<*const Self>>,
     tail: Cell<MaybeUninit<*const Self>>,
 }
 
 /// Lazy initialize WaitNode as it improves performance in the fast path.
-impl<E> Default for WaitNode<E> {
+impl<Event, Token> Default for WaitNode<Event, Token> {
     fn default() -> Self {
         Self {
             state: Cell::new(WaitNodeState::Uninit),
             event: Cell::new(MaybeUninit::uninit()),
+            token: Cell::new(MaybeUninit::uninit()),
             prev: Cell::new(MaybeUninit::uninit()),
             next: Cell::new(MaybeUninit::uninit()),
             tail: Cell::new(MaybeUninit::uninit()),
@@ -36,7 +36,7 @@ impl<E> Default for WaitNode<E> {
     }
 }
 
-impl<E: Default> WaitNode<E> {
+impl<Event: Default, Token> WaitNode<Event, Token> {
     /// Given the head of the queue, prepend this WaitNode
     /// to the queue by initializing it and returning the
     /// new head of the queue.
@@ -46,7 +46,7 @@ impl<E: Default> WaitNode<E> {
             WaitNodeState::Uninit => {
                 self.state.set(WaitNodeState::Waiting);
                 self.prev.set(MaybeUninit::new(null()));
-                self.event.set(MaybeUninit::new(E::default()));
+                self.event.set(MaybeUninit::new(Event::default()));
             }
             // node is already initialized, only change the links volatile to the head below.
             WaitNodeState::Waiting => {}
@@ -111,11 +111,11 @@ impl<E: Default> WaitNode<E> {
     }
 }
 
-impl<E: ThreadEvent> WaitNode<E> {
+impl<Event: ThreadEvent, Token> WaitNode<Event, Token> {
     /// Get a reference to the thread event, assuming the WaitNode is
     /// initialized.
     #[inline]
-    fn get_event(&self) -> &E {
+    fn get_event(&self) -> &Event {
         unsafe { &*(&*self.event.as_ptr()).as_ptr() }
     }
 
@@ -128,36 +128,32 @@ impl<E: ThreadEvent> WaitNode<E> {
         self.prev.set(MaybeUninit::new(null()));
     }
 
-    /// Unblock this node, waking it up with either normal or direct notify.
+    /// Unblock this node, waking it up with some token value.
     /// This assumes that this WaitNode is in a waiting state.
-    pub fn notify(&self, is_direct: bool) {
+    pub fn notify(&self, token: Token) {
         let event = self.get_event();
         debug_assert_eq!(self.state.get(), WaitNodeState::Waiting);
-        self.state.set(if is_direct {
-            WaitNodeState::DirectNotified
-        } else {
-            WaitNodeState::Notified
-        });
+        self.token.set(MaybeUninit::new(token));
+        self.state.set(WaitNodeState::Notified);
         event.set();
     }
 
     /// Block this node, waiting to be notified by another WaitNode.
-    /// Returns whether the notification was direct.
-    /// This assumes that this node is initialized.
-    pub fn wait(&self) -> bool {
+    /// Returns the token value set when notified.
+    pub fn wait(&self) -> Token {
         self.get_event().wait();
         match self.state.get() {
-            WaitNodeState::Notified => false,
-            WaitNodeState::DirectNotified => true,
+            WaitNodeState::Notified => unsafe {
+                self.token.replace(MaybeUninit::uninit()).assume_init()
+            },
             // Using unreachable_unchecked improves performance during benchmarks.
             #[cfg(not(debug_assertions))]
             _ => unsafe { core::hint::unreachable_unchecked() },
             // In debug mode, this fault should still be caught and reported
             #[cfg(debug_assertions)]
             unexpected => unreachable!(
-                "unexpected WaitNodeState: expected {:?} or {:?} found {:?}",
+                "unexpected WaitNodeState: expected {:?} found {:?}",
                 WaitNodeState::Notified,
-                WaitNodeState::DirectNotified,
                 unexpected,
             ),
         }
