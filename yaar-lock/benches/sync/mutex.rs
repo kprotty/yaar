@@ -28,7 +28,7 @@ fn bench_all(name: &str, num_locks: u32) {
     bench::<mutexes::ParkingLot>(&options);
     bench::<mutexes::YaarLock>(&options);
     bench::<mutexes::AmdSpin>(&options);
-    #[cfg(windows)]
+    #[cfg(all(windows, target_env = "msvc"))]
     bench::<mutexes::NtLock>(&options);
     println!();
 }
@@ -95,9 +95,9 @@ mod mutexes {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, target_env = "msvc"))]
     pub(crate) type NtLock = ntlock::Mutex<u32>;
-    #[cfg(windows)]
+    #[cfg(all(windows, target_env = "msvc"))]
     impl Mutex for NtLock {
         const LABEL: &'static str = "ntlock";
         fn with_lock(&self, f: impl FnOnce(&mut u32)) {
@@ -231,7 +231,7 @@ mod amd_spinlock {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_env = "msvc"))]
 mod ntlock {
     use std::{
         cell::UnsafeCell,
@@ -395,7 +395,7 @@ mod ntlock {
         fn CloseHandle(handle: usize) -> u32;
     }
 
-    #[cfg_attr(target_env = "msvc", link(name = "ntdll"))]
+    #[link(name = "ntdll")]
     extern "stdcall" {
         fn NtCreateKeyedEvent(handle_ptr: &mut usize, mask: u32, x: usize, y: usize) -> usize;
         fn NtWaitForKeyedEvent(handle: usize, key: usize, block: usize, timeout: usize) -> usize;

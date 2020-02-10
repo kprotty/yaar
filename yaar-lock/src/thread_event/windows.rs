@@ -123,10 +123,10 @@ fn get_backend() -> Backend {
     // Acquire orderings on both loads to observe the loaded functions.
     match BACKEND_HANDLE.load(Ordering::Acquire) {
         0 => unsafe {
-            if load_wait_on_address() {
-                Backend::WaitOnAddress
-            } else if load_keyed_events() {
+            if load_keyed_events() {
                 Backend::KeyedEvent(BACKEND_HANDLE.load(Ordering::Acquire) as HANDLE)
+            } else if load_wait_on_address() {
+                Backend::WaitOnAddress
             } else {
                 unreachable!("Windows Event requires either WaitOnAddress (Win8+) or NT Keyed Events (WinXP+)")
             }
