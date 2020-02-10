@@ -5,6 +5,11 @@ yaar-lock
 
 Small & Fast synchronization primitives for `#![no_std]` environments.
 
+`yaar-lock` provides synchronization primitives for both blocking and non-blocking (futures) environments. For blocking primitives, it relies on a [user-supplied] implementation for parking threads while also providing a [default] for common platforms. This method of extensibility with convenient defaults is a pattern that can be seen across other `yaar` components. 
+
+[user-supplied]: https://docs.rs/yaar-lock/0.2.1/yaar_lock/trait.ThreadEvent.html
+[default]: https://docs.rs/yaar-lock/0.2.1/yaar_lock/struct.OsThreadEvent.html
+
 ## Usage
 Add this to your `Cargo.toml`:
 ```toml

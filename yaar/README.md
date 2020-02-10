@@ -6,6 +6,14 @@ yaar
 **Y**et **A**nother **A**synchronous **R**untime (yaar)
 optimized around configuration and no_std. This crate is currently under development.
 
+## Overview
+
+Yaar is a customizable runtime built around the idea of intrusive data structures and resource efficiency. Some of the features it provides include:
+
+* Multithreaded, NUMA-aware, work-stealing task scheduler (not limited to futures).
+* Extendable primitives for swapping in and implementing your own task scheduler.
+* (soon) Utilities for efficient future exection and structured concurrency.
+
 ## Usage
 Add this to your `Cargo.toml`:
 ```toml
