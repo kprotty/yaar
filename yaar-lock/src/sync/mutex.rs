@@ -108,10 +108,10 @@ impl<E: ThreadEvent> CoreMutex<E> {
             }
 
             // spin if theres no waiting nodes & havent spun too much.
-            // On windows 10 for most desktop cpus, its better not to spin much.
             let head = (state & QUEUE_MASK) as *const WaitNode<E, Notify>;
             if head.is_null() && spin < MAX_SPIN_DOUBLING {
                 spin += 1;
+                // On windows 10 for most desktop cpus, its better not to spin much.
                 if cfg!(all(windows, feature = "os")) {
                     spin_loop_hint();
                 } else {
@@ -159,7 +159,7 @@ impl<E: ThreadEvent> CoreMutex<E> {
             match self.state.compare_exchange_weak(
                 state,
                 state | QUEUE_LOCK,
-                Ordering::Acquire,
+                Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -167,9 +167,6 @@ impl<E: ThreadEvent> CoreMutex<E> {
             }
         }
 
-        // On re-loop, an Acquire barrier is required as the new state with be deref'd
-        // and updates to its fields need to be visible from the Release store in
-        // `lock_slow()`.
         'outer: loop {
             // If the mutex is locked, let the under dequeue the node.
             // Safe to use Relaxed on success since not making any memory writes visible.
@@ -183,9 +180,13 @@ impl<E: ThreadEvent> CoreMutex<E> {
                     Ok(_) => return,
                     Err(s) => state = s,
                 }
-                fence(Ordering::Acquire);
                 continue;
             }
+
+            // an Acquire barrier is required as the new state will be deref'd
+            // and updates to its fields need to be visible from the Release store in
+            // `lock_slow()`.
+            fence(Ordering::Acquire);
 
             // The head is safe to deref since its confirmed to be non-null with the queue
             // locking above.
@@ -197,8 +198,8 @@ impl<E: ThreadEvent> CoreMutex<E> {
                     match self.state.compare_exchange_weak(
                         state,
                         state & MUTEX_LOCK,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
                     ) {
                         Ok(_) => break,
                         Err(s) => state = s,
@@ -210,7 +211,9 @@ impl<E: ThreadEvent> CoreMutex<E> {
                     }
                 }
             } else {
-                self.state.fetch_and(!QUEUE_LOCK, Ordering::Release);
+                // unlock the queue without zero'ing the head since theres still more nodes.
+                // Release ordering to publish tail updates to the next unlocker's fence(Acquire).
+                self.state.fetch_sub(QUEUE_LOCK, Ordering::Release);
             }
 
             // wake up the dequeued tail
@@ -281,7 +284,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutexFair for CoreMutex<E> {
                     }
                 }
             } else {
-                self.state.fetch_and(!QUEUE_LOCK, Ordering::Release);
+                self.state.fetch_sub(QUEUE_LOCK, Ordering::Release);
             }
 
             // wake up the node with the mutex still locked (direct handoff)
