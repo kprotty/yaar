@@ -28,6 +28,8 @@ fn bench_all(name: &str, num_locks: u32) {
     bench::<mutexes::ParkingLot>(&options);
     bench::<mutexes::YaarLock>(&options);
     bench::<mutexes::AmdSpin>(&options);
+    #[cfg(unix)]
+    bench::<mutexes::PosixLock>(&options);
     #[cfg(all(windows, target_env = "msvc"))]
     bench::<mutexes::NtLock>(&options);
     println!();
@@ -100,6 +102,17 @@ mod mutexes {
     #[cfg(all(windows, target_env = "msvc"))]
     impl Mutex for NtLock {
         const LABEL: &'static str = "ntlock";
+        fn with_lock(&self, f: impl FnOnce(&mut u32)) {
+            let mut guard = self.lock();
+            f(&mut guard)
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) type PosixLock = posix_lock::Mutex<u32>;
+    #[cfg(unix)]
+    impl Mutex for PosixLock {
+        const LABEL: &'static str = "posix_lock";
         fn with_lock(&self, f: impl FnOnce(&mut u32)) {
             let mut guard = self.lock();
             f(&mut guard)
@@ -227,6 +240,91 @@ mod amd_spinlock {
     impl<'a, T> Drop for AmdSpinlockGuard<'a, T> {
         fn drop(&mut self) {
             self.lock.locked.store(false, Ordering::Release)
+        }
+    }
+}
+
+#[cfg(unix)]
+mod posix_lock {
+    use std::{
+        cell::UnsafeCell,
+        ops::{Deref, DerefMut},
+        sync::atomic::{spin_loop_hint, AtomicU8, Ordering},
+    };
+
+    pub struct Mutex<T> {
+        state: AtomicU8,
+        value: UnsafeCell<T>,
+    }
+
+    unsafe impl<T: Send> Send for Mutex<T> {}
+    unsafe impl<T: Send> Sync for Mutex<T> {}
+
+    impl<T: Default> Default for Mutex<T> {
+        fn default() -> Self {
+            Self::new(T::default())
+        }
+    }
+
+    impl<T> Mutex<T> {
+        pub const fn new(value: T) -> Self {
+            Self {
+                state: AtomicU8::new(0),
+                value: UnsafeCell::new(value),
+            }
+        }
+
+        #[inline]
+        pub fn lock(&self) -> MutexGuard<'_, T> {
+            if self
+                .state
+                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                self.lock_slow();
+            }
+            MutexGuard { mutex: self }
+        }
+
+        #[cold]
+        fn lock_slow(&self) {
+            loop {
+                if self.state.load(Ordering::Relaxed) == 0 {
+                    if self.state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                        return;
+                    }
+                }
+                extern "C" { fn sched_yield() -> i32; }
+                unsafe { sched_yield() };
+            }
+        }
+
+        #[inline]
+        fn unlock(&self) {
+            self.state.store(0, Ordering::Release);
+        }
+    }
+
+    pub struct MutexGuard<'a, T> {
+        mutex: &'a Mutex<T>,
+    }
+
+    impl<'a, T> Drop for MutexGuard<'a, T> {
+        fn drop(&mut self) {
+            self.mutex.unlock();
+        }
+    }
+
+    impl<'a, T> DerefMut for MutexGuard<'a, T> {
+        fn deref_mut(&mut self) -> &mut T {
+            unsafe { &mut *self.mutex.value.get() }
+        }
+    }
+
+    impl<'a, T> Deref for MutexGuard<'a, T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            unsafe { &*self.mutex.value.get() }
         }
     }
 }
