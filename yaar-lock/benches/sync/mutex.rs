@@ -2,7 +2,7 @@ use crossbeam_utils::{thread::scope, CachePadded};
 use std::{convert::TryInto, iter, sync::Barrier, time};
 
 pub fn main() {
-    bench_all("Contended", 2);
+    bench_all("Contended", 1);
     bench_all("Uncontended", 1000);
 }
 
@@ -18,7 +18,7 @@ fn bench_all(name: &str, num_locks: u32) {
         n_threads: num_cpus::get().try_into().unwrap(),
         n_locks: num_locks,
         n_ops: 10_000,
-        n_rounds: 100,
+        n_rounds: 20,
     };
 
     println!("------------------------------------------------");

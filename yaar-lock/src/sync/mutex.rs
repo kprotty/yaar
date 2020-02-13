@@ -72,10 +72,12 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutex for CoreMutex<E> {
     }
 
     fn unlock(&self) {
-        let state = self.state.fetch_sub(MUTEX_LOCK, Ordering::Release);
-        if (state & QUEUE_MASK != 0) && (state & QUEUE_LOCK == 0) {
+        if self.state
+            .compare_exchange_weak(MUTEX_LOCK, 0, Ordering::Release, Ordering::Relaxed)
+            .is_err()
+        {
             self.unlock_slow();
-        }
+        }        
     }
 }
 
@@ -138,7 +140,7 @@ impl<E: ThreadEvent> CoreMutex<E> {
     #[cold]
     fn unlock_slow(&self) {
         // acquire the queue lock in order to dequeue a node
-        let mut state = self.state.load(Ordering::Relaxed);
+        let mut state = self.state.fetch_sub(MUTEX_LOCK, Ordering::Release);
         loop {
             // give up if theres no nodes to dequeue or the queue is already locked.
             if (state & QUEUE_MASK == 0) || (state & QUEUE_LOCK != 0) {
