@@ -84,7 +84,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutex for CoreMutex<E> {
 impl<E: ThreadEvent> CoreMutex<E> {
     #[cold]
     fn lock_slow(&self, wait_node: &QueueNode<E>) {
-        const MAX_SPIN_DOUBLING: usize = 0;
+        const MAX_SPIN_DOUBLING: usize = 5;
 
         let mut spin = 0;
         let mut state = self.state.load(Ordering::Relaxed);
