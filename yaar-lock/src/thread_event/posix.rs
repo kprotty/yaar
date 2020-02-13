@@ -1,6 +1,6 @@
 use core::cell::{Cell, UnsafeCell};
 use libc::{
-    pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_signal, pthread_cond_t,
+    pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_wait, pthread_cond_t,
     pthread_mutex_destroy, pthread_mutex_lock, pthread_mutex_t, pthread_mutex_unlock,
     PTHREAD_COND_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
 };
