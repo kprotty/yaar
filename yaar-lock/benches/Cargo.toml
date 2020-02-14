@@ -5,6 +5,7 @@ edition = "2018"
 authors = ["kprotty"]
 
 [features]
+sync_rwlock = ["sync", "libc"]
 sync_mutex = ["sync"]
 sync = [
     "yaar-lock/os",
@@ -20,6 +21,9 @@ async = [
     "yaar-lock/future",
     "tokio/rt-threaded",
 ]
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [dependencies]
 yaar-lock = { path = "../", features = ["os"] }
@@ -40,3 +44,8 @@ required-features = ["async_mutex"]
 name = "sync_mutex"
 path = "./sync/mutex.rs"
 required-features = ["sync_mutex"]
+
+[[bin]]
+name = "sync_rwlock"
+path = "./sync/rwlock.rs"
+required-features = ["sync_rwlock"]

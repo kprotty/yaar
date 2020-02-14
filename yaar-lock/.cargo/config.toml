@@ -10,3 +10,9 @@ bench_sync_mutex = [
     "sync_mutex", "--features=sync_mutex",
     "--manifest-path", "./benches/Cargo.toml",
 ]
+
+bench_sync_rwlock = [
+    "run", "--release", "--bin",
+    "sync_rwlock", "--features=sync_rwlock",
+    "--manifest-path", "./benches/Cargo.toml",
+]
