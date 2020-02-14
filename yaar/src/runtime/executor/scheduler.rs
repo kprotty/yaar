@@ -304,7 +304,13 @@ impl<P: Platform> Node<P> {
     /// Get the executor that this node is running on.
     fn executor(&self) -> &NodeExecutor<P> {
         // Safety: the node executor always lives longer than the Node.
-        unsafe { &*self.executor.get().unwrap().as_ptr() }
+        unsafe {
+            &*self
+                .executor
+                .get()
+                .expect("Node without an executor")
+                .as_ptr()
+        }
     }
 
     /// Try to spawn a new worker to handle system load of tasks.
@@ -523,7 +529,7 @@ impl<P: Platform> Thread<P> {
         //
         // give up thread, wait for event, re-loop
 
-        'poll: loop {
+        loop {
             // Can only fetch tasks if thread has a worker
             let worker = match self.worker() {
                 Some(worker) => worker,
@@ -537,7 +543,12 @@ impl<P: Platform> Thread<P> {
             }
 
             // Check the local queue
-            if let Some(task) = unsafe { self.poll_local(worker, node, tick) } {
+            if let Some(task) = self.poll_local(worker, node, tick) {
+                return Some(task);
+            }
+
+            // Check the global queue
+            if let Some(task) = self.poll_global(worker, node, !0) {
                 return Some(task);
             }
         }
@@ -558,26 +569,19 @@ impl<P: Platform> Thread<P> {
         _worker: &Worker<P>,
         _wait_time: &mut Option<<P::Clock as Clock>::Instant>,
     ) -> Option<&'a Task> {
-        // TODO: check worker delay queue for expired entries,
-        //       if none, update wait_time with next expiry.
+        // TODO:
+        // check worker delay queue for expired entries,
+        // if none, update wait_time with next expiry.
         None
     }
 
     /// Poll a task from the local thread & worker.
     /// Safety: Only the current thread (which owns the worker) is calling pop
     /// on the run_queue.
-    unsafe fn poll_local<'a>(
-        &self,
-        worker: &Worker<P>,
-        node: &Node<P>,
-        tick: usize,
-    ) -> Option<&'a Task> {
+    fn poll_local<'a>(&self, worker: &Worker<P>, node: &Node<P>, tick: usize) -> Option<&'a Task> {
         // Check the global queue once in a while to ensure eventual system fairness.
         if tick % 64 == 0 {
-            let task = node
-                .run_queue
-                .pop(&worker.run_queue, node.workers().len(), 1);
-            if let Some(task) = task {
+            if let Some(task) = self.poll_global(worker, node, 1) {
                 return Some(task);
             }
         }
@@ -585,14 +589,44 @@ impl<P: Platform> Thread<P> {
         // Check the back of the local queue (FIFO) once in a while to ensure eventual
         // local fairness
         if tick % 16 == 0 {
-            let task = worker.run_queue.pop().map(|ptr| &*ptr.as_ptr());
+            let task = unsafe { worker.run_queue.pop().map(|task_ptr| &*task_ptr.as_ptr()) };
             if let Some(task) = task {
                 return Some(task);
             }
         }
 
         // Pop from the front of the local queue by default (LIFO)
-        worker.run_queue.pop_front().map(|ptr| &*ptr.as_ptr())
+        unsafe {
+            worker
+                .run_queue
+                .pop_front()
+                .map(|task_ptr| &*task_ptr.as_ptr())
+        }
+    }
+
+    /// Poll a batch of tasks from the global queue on a given node,
+    /// pushing the remaining tasks on the workers local run queue.
+    ///
+    /// Safety:
+    /// * `node`s worker slice cannot be empty
+    /// * `max_batch` cannot be zero
+    /// * `max_batch` greater than 1 requires the worker's local queue to be
+    ///   empty.
+    fn poll_global<'a>(
+        &self,
+        worker: &Worker<P>,
+        node: &Node<P>,
+        max_batch: usize,
+    ) -> Option<&'a Task> {
+        unsafe {
+            node.run_queue
+                .pop(
+                    &worker.run_queue,
+                    NonZeroUsize::new_unchecked(node.workers().len()),
+                    NonZeroUsize::new_unchecked(max_batch),
+                )
+                .map(|task_ptr| &*task_ptr.as_ptr())
+        }
     }
 }
 

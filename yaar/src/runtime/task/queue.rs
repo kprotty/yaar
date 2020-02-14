@@ -2,6 +2,7 @@ use super::{LinkedList, List, Priority, Task};
 use crate::util::CachePadded;
 use core::{
     cell::Cell,
+    num::NonZeroUsize,
     convert::TryInto,
     fmt,
     mem::{size_of, transmute, MaybeUninit},
@@ -47,9 +48,9 @@ impl<R: RawMutex> GlobalQueue<R> {
             return;
         }
 
-        let mut queue = self.list.lock();
-        queue.push_front(front);
-        queue.push_back(back);
+        let mut global_queue = self.list.lock();
+        global_queue.push_front(front);
+        global_queue.push_back(back);
         self.size.store(self.len() + size, Ordering::Relaxed);
     }
 
@@ -63,16 +64,70 @@ impl<R: RawMutex> GlobalQueue<R> {
     ///
     /// The pop operation assumes that the caller is the producer thread of
     /// the provided [`LocalQueue`]; The only thread that can call push(),
-    /// pop() and pop_front() on it. Trying to pop() from the same LocalQueue
-    /// on multiple threads may result in undefined behavior.
-    pub unsafe fn pop<'a>(
+    /// pop() and pop_front() on it. Trying to pop() from the same
+    /// LocalQueue on multiple threads may result in undefined behavior.
+    pub unsafe fn pop(
         &self,
-        queue: &LocalQueue,
-        max_local_queues: usize,
-        max_batch_size: usize,
-    ) -> Option<&'a Task> {
-        // TODO
-        None
+        local_queue: &LocalQueue,
+        max_local_queues: NonZeroUsize,
+        max_batch_size: NonZeroUsize,
+    ) -> Option<NonNull<Task>> {
+        // preemptively check size before trying to grab batch.
+        let mut global_queue = self.list.lock();
+        let size = self.size.load(Ordering::Relaxed);
+        if size == 0 {
+            return None;
+        }
+
+        // compute the amount of tasks to grab from the global queue
+        let mut batch = ((size / max_local_queues.get()) + 1)
+            .min(size)
+            .min(max_batch_size.get())
+            .min(LocalQueue::SIZE);
+        self.size.store(size - batch, Ordering::Relaxed);
+
+        // return the first task popped from the global queue
+        let task = global_queue.pop();
+        batch -= 1;
+
+        // Push the remaining batch of tasks to the provided local queue.
+        //
+        // Safety:
+        // * this thread should be the only producer thread for the local queue.
+        // * the local queue provided must be empty if grabbing a batch of tasks.
+        if batch != 0 {
+            let mut tail = local_queue.load_tail_unsync();
+            let mut head = local_queue.head().load(Ordering::Relaxed);
+            assert_eq!(
+                tail.wrapping_sub(head),
+                0,
+                "Should only steal large batch from global queue if local queue is empty"
+            );
+
+            for _ in 0..batch {
+                let task = global_queue
+                    .pop()
+                    .map(|task_ptr| &*task_ptr.as_ptr())
+                    .unwrap_or_else(|| core::hint::unreachable_unchecked());
+                let priority = task.priority();
+                let task = MaybeUninit::new(task as *const _);
+                match priority {
+                    Priority::Low | Priority::Normal => {
+                        local_queue.tasks[(tail as usize) % LocalQueue::SIZE].set(task);
+                        tail = tail.wrapping_add(1);
+                    }
+                    Priority::High | Priority::Critical => {
+                        head = head.wrapping_sub(1);
+                        local_queue.tasks[(head as usize) % LocalQueue::SIZE].set(task);
+                    }
+                }
+            }
+
+            let new_pos = LocalQueue::to_pos(head, tail);
+            local_queue.pos().store(new_pos, Ordering::Release);
+        }
+
+        task
     }
 }
 
@@ -177,8 +232,7 @@ impl LocalQueue {
     /// # Safety
     ///
     /// This should only be called by the producer thread of this local queue.
-    pub unsafe fn push<R: RawMutex>(&self, task: *const Task, global_queue: &GlobalQueue<R>) {
-        let task = &*task;
+    pub unsafe fn push<R: RawMutex>(&self, task: &Task, global_queue: &GlobalQueue<R>) {
         match task.priority() {
             Priority::Low | Priority::Normal => self.push_back(task, global_queue),
             Priority::High | Priority::Critical => self.push_front(task, global_queue),
@@ -189,10 +243,10 @@ impl LocalQueue {
     /// this queue is full.
     fn push_back<R: RawMutex>(&self, task: &Task, global_queue: &GlobalQueue<R>) {
         // Unsync load on tail as this thread is the only one that can update it.
-        // Relaxed load on head as not viewing `tasks` updates from other threads
+        // Release load on head as not viewing `tasks` updates from other threads
         // since this should be the only thread that can write to `tasks`.
         let tail = self.load_tail_unsync();
-        let mut head = self.head().load(Ordering::Relaxed);
+        let mut head = self.head().load(Ordering::Release);
 
         loop {
             // Push the task to the tail if the queue isn't full.
@@ -216,10 +270,10 @@ impl LocalQueue {
     /// if this queue is full.
     fn push_front<R: RawMutex>(&self, task: &Task, global_queue: &GlobalQueue<R>) {
         // Unsync load on tail as this thread is the only one that can update it.
-        // Relaxed loads as not viewing `tasks` updates from other threads
+        // Release loads as not viewing `tasks` updates from other threads
         // since this should be the only thread that can write to `tasks`.
         let tail = self.load_tail_unsync();
-        let mut head = self.head().load(Ordering::Relaxed);
+        let mut head = self.head().load(Ordering::Release);
 
         loop {
             // Push the task to the head if the queue isn't full.
@@ -232,7 +286,7 @@ impl LocalQueue {
                     head,
                     new_head,
                     Ordering::Release,
-                    Ordering::Relaxed,
+                    Ordering::Release,
                 ) {
                     Ok(_) => return,
                     Err(new_head) => head = new_head,
@@ -260,14 +314,14 @@ impl LocalQueue {
         global_queue: &GlobalQueue<R>,
     ) -> Result<(), PosIndex> {
         // Try to grab half of our tasks to move to the global queue.
-        // Uses Relaxed ordering as no other thread should be able to
+        // Uses Release ordering as no other thread should be able to
         // write to our tasks for us to observe since we're the only producer.
         let batch = Self::SIZE / 2;
         if let Err(new_head) = self.head().compare_exchange_weak(
             head,
             head.wrapping_add(batch.try_into().unwrap()),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
+            Ordering::Release,
+            Ordering::Release,
         ) {
             return Err(new_head);
         }
@@ -292,9 +346,9 @@ impl LocalQueue {
     /// This should only be called by the producer thread of this local queue.
     pub unsafe fn pop(&self) -> Option<NonNull<Task>> {
         // Unsync load on tail as this is the only thread that can update it.
-        // Relaxed loads as not viewing `tasks` updates from other threads.
+        // Release loads as not viewing `tasks` updates from other threads.
         let tail = self.load_tail_unsync();
-        let mut head = self.head().load(Ordering::Relaxed);
+        let mut head = self.head().load(Ordering::Release);
 
         loop {
             // Our queue is empty.
@@ -302,14 +356,14 @@ impl LocalQueue {
                 return None;
             }
 
-            // Read the head task in the queue, using a Relaxed
+            // Read the head task in the queue, using a Release
             // ordering since not making any writes visible to other threads.
             let task = self.tasks[(head as usize) % Self::SIZE].get();
             match self.head().compare_exchange_weak(
                 head,
                 head.wrapping_add(1),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
+                Ordering::Release,
+                Ordering::Release,
             ) {
                 Ok(_) => return NonNull::new(task.assume_init() as *mut _),
                 Err(new_head) => head = new_head,
@@ -324,9 +378,9 @@ impl LocalQueue {
     /// This should only be called by the producer thread of this local queue.
     pub unsafe fn pop_front(&self) -> Option<NonNull<Task>> {
         // Unsync load on tail as this is the only thread that can update it.
-        // Relaxed loads as not viewing `tasks` updates from other threads.
+        // Release loads as not viewing `tasks` updates from other threads.
         let tail = self.load_tail_unsync();
-        let mut head = self.head().load(Ordering::Relaxed);
+        let mut head = self.head().load(Ordering::Release);
 
         loop {
             // Our queue is empty.
@@ -338,15 +392,15 @@ impl LocalQueue {
             //
             // When updating the tail, the head could change from a
             // `steal()`ing consumer thread so the head & tail need to
-            // be modified at the same time. Uses a Relaxed ordering since
+            // be modified at the same time. Uses a Release ordering since
             // other threads nor our own is make any writes visible.
             let new_tail = tail.wrapping_sub(1);
             let task = self.tasks[(new_tail as usize) % Self::SIZE].get();
             match self.pos().compare_exchange_weak(
                 Self::to_pos(head, tail),
                 Self::to_pos(head, new_tail),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
+                Ordering::Release,
+                Ordering::Release,
             ) {
                 Ok(_) => return NonNull::new(task.assume_init() as *mut _),
                 Err(new_pos) => head = transmute::<_, [PosIndex; 2]>(new_pos)[Self::HEAD_POS],
@@ -361,9 +415,9 @@ impl LocalQueue {
     /// thread is running and panics if the current LocalQueue is empty.
     pub fn steal(&self, other: &Self) -> Option<NonNull<Task>> {
         // Unsync load on tail as this is the only thread that can update it.
-        // Relaxed ordering since not observing any changes from other threads.
+        // Release ordering since not observing any changes from other threads.
         let tail = self.load_tail_unsync();
-        let head = self.head().load(Ordering::Relaxed);
+        let head = self.head().load(Ordering::Release);
         assert_eq!(
             tail.wrapping_sub(head),
             0,
@@ -389,15 +443,15 @@ impl LocalQueue {
                 self.tasks[(tail.wrapping_add(i) as usize) % Self::SIZE].set(task);
             }
 
-            // Try to commit the steal. Relaxed ordering is ok since
+            // Try to commit the steal. Release ordering is ok since
             // no writes to communicate to other's producer thread.
             if other
                 .head()
                 .compare_exchange_weak(
                     other_head,
                     other_head.wrapping_add(batch),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
+                    Ordering::Release,
+                    Ordering::Release,
                 )
                 .is_err()
             {
