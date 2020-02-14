@@ -249,11 +249,11 @@ mod posix_lock {
     use std::{
         cell::UnsafeCell,
         ops::{Deref, DerefMut},
-        sync::atomic::{spin_loop_hint, AtomicU8, Ordering},
+        sync::atomic::{spin_loop_hint, AtomicBool, Ordering},
     };
 
     pub struct Mutex<T> {
-        state: AtomicU8,
+        locked: AtomicBool,
         value: UnsafeCell<T>,
     }
 
@@ -269,7 +269,7 @@ mod posix_lock {
     impl<T> Mutex<T> {
         pub const fn new(value: T) -> Self {
             Self {
-                state: AtomicU8::new(0),
+                locked: AtomicBool::new(false),
                 value: UnsafeCell::new(value),
             }
         }
@@ -277,8 +277,8 @@ mod posix_lock {
         #[inline]
         pub fn lock(&self) -> MutexGuard<'_, T> {
             if self
-                .state
-                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
                 self.lock_slow();
@@ -288,20 +288,26 @@ mod posix_lock {
 
         #[cold]
         fn lock_slow(&self) {
+            let mut spin = 4;
             loop {
-                if self.state.load(Ordering::Relaxed) == 0 {
-                    if self.state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                if !self.locked.load(Ordering::Relaxed) {
+                    if self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                         return;
                     }
                 }
-                extern "C" { fn sched_yield() -> i32; }
-                unsafe { sched_yield() };
+                if spin != 0 {
+                    spin -= 1;
+                    spin_loop_hint();
+                } else {
+                    extern "C" { fn sched_yield() -> i32; }
+                    unsafe { sched_yield() };
+                }
             }
         }
 
         #[inline]
         fn unlock(&self) {
-            self.state.store(0, Ordering::Release);
+            self.locked.store(false, Ordering::Release);
         }
     }
 
