@@ -515,7 +515,7 @@ impl<P: Platform> Thread<P> {
         //   - steal_from(for n in nodes if n != node)
         // poll many from global queue
         //
-        // give up worker, stop is_search (dec searching - AcqRel)
+        // give up worker, stop is_searching (dec searching - AcqRel)
         // (for below) if was thread.is_searching, restore it (inc searching - Acq) if
         // found task for w in node.workers: if timers(w) or localq(w):
         //   - grab idle worker, if none, break loop
@@ -536,21 +536,63 @@ impl<P: Platform> Thread<P> {
                 None => return None,
             };
 
-            // Check for any expired timers
+            // Check for any available tasks on the system:
+            // - expired timers
+            // - worker run queue
+            // - global run queue
+            // - reactor (non blocking)
+            // - other worker run queues
+            // - global run queue (in case any new tasks came in).
             let mut wait_time = None;
-            if let Some(task) = self.poll_timers(worker, &mut wait_time) {
+            if let Some(task) = self
+                .poll_timers(worker, &mut wait_time)
+                .or_else(|| self.poll_local(worker, node, tick))
+                .or_else(|| self.poll_global(worker, node, !0))
+                .or_else(|| self.poll_reactor(worker, node, None))
+                .or_else(|| self.poll_others(worker, node))
+                .or_else(|| self.poll_global(worker, node, !0))
+            {
                 return Some(task);
             }
 
-            // Check the local queue
-            if let Some(task) = self.poll_local(worker, node, tick) {
-                return Some(task);
+            // No tasks found in the system, give up our worker
+            thread.worker.set(None);
+            node.worker_pool.lock().put_worker(node, worker);
+            
+            // Transition from searching -> not-searching
+            let was_searching = self.is_searching.get();
+            if was_searching {
+                self.is_searching.set(false);
+                node.workers_searching.fetch_sub(1, Ordering::AcqRel);
+            }
+            
+            // Check all run queues again
+            let has_work = |some_node| {
+                some_node.run_queue.len() != 0 ||
+                some_node.workers().any(|worker| worker.run_queue.len() != 0)
+            };
+            let has_work = has_work(node) || node
+                .executor()
+                .nodes()
+                .filter(|some_node| some_node.id == node.id)
+                .any(has_work);
+            
+            // Retry polling for work is new work was discovered/
+            // Restore searching & searching count for the spawn_worker() after finding a task.
+            if has_work {
+                if let Some(worker) = node.worker_pool.lock().find_worker(node) {
+                    if was_searching {
+                        self.is_searching.set(true);
+                        node.workers_searching.fetch_add(1, Ordering::Relaxed);
+                    }
+                    thread.worker.set(Some(worker));
+                    continue;
+                }
             }
 
-            // Check the global queue
-            if let Some(task) = self.poll_global(worker, node, !0) {
-                return Some(task);
-            }
+            // TODO: Finally, try to poll the network:
+            // either to wait for IO blocked tasks to be ready
+            // or to wait for a timer on a worker to expire
         }
     }
 
