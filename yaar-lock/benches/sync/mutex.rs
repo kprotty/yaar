@@ -1,245 +1,113 @@
-use crossbeam_utils::{thread::scope, CachePadded};
-use std::{convert::TryInto, iter, sync::Barrier, time};
+// Copyright 2016 Amanieu d'Antras
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
 
-pub fn main() {
-    bench_all("Contended", 1);
-    bench_all("Uncontended", 1000);
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Barrier,
+    },
+    thread,
+    time::Duration,
+};
+
+trait Mutex<T> {
+    const NAME: &'static str;
+
+    fn new(v: T) -> Self;
+
+    fn lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R;
 }
 
-struct Options {
-    n_threads: u32,
-    n_locks: u32,
-    n_ops: u32,
-    n_rounds: u32,
-}
+impl<T> Mutex<T> for std::sync::Mutex<T> {
+    const NAME: &'static str = "std::sync::Mutex";
 
-fn bench_all(name: &str, num_locks: u32) {
-    let options = Options {
-        n_threads: num_cpus::get().try_into().unwrap(),
-        n_locks: num_locks,
-        n_ops: 10_000,
-        n_rounds: 20,
-    };
-
-    println!("------------------------------------------------");
-    println!("{} (locks = {})", name, options.n_locks);
-    println!("------------------------------------------------");
-    bench::<mutexes::Std>(&options);
-    bench::<mutexes::ParkingLot>(&options);
-    bench::<mutexes::YaarLock>(&options);
-    bench::<mutexes::AmdSpin>(&options);
-    #[cfg(unix)]
-    bench::<mutexes::PosixLock>(&options);
-    #[cfg(all(windows, target_env = "msvc"))]
-    bench::<mutexes::NtLock>(&options);
-    println!();
-}
-
-fn bench<M: Mutex>(options: &Options) {
-    let mut times = (0..options.n_rounds)
-        .map(|_| run_bench::<M>(options))
-        .collect::<Vec<_>>();
-    times.sort();
-
-    let avg = times.iter().sum::<time::Duration>() / options.n_rounds;
-    let min = times[0];
-    let max = *times.last().unwrap();
-
-    let avg = format!("{:?}", avg);
-    let min = format!("{:?}", min);
-    let max = format!("{:?}", max);
-
-    println!(
-        "{:<20} avg {:<12} min {:<12} max {:<12}",
-        M::LABEL,
-        avg,
-        min,
-        max
-    )
-}
-
-mod mutexes {
-    use super::*;
-
-    pub(crate) type Std = std::sync::Mutex<u32>;
-    impl Mutex for Std {
-        const LABEL: &'static str = "std::sync::Mutex";
-        fn with_lock(&self, f: impl FnOnce(&mut u32)) {
-            let mut guard = self.lock().unwrap();
-            f(&mut guard)
-        }
+    fn new(v: T) -> Self {
+        Self::new(v)
     }
 
-    pub(crate) type ParkingLot = parking_lot::Mutex<u32>;
-    impl Mutex for ParkingLot {
-        const LABEL: &'static str = "parking_lot::Mutex";
-        fn with_lock(&self, f: impl FnOnce(&mut u32)) {
-            let mut guard = self.lock();
-            f(&mut guard)
-        }
-    }
-
-    pub(crate) type AmdSpin = crate::amd_spinlock::AmdSpinlock<u32>;
-    impl Mutex for AmdSpin {
-        const LABEL: &'static str = "AmdSpinlock";
-        fn with_lock(&self, f: impl FnOnce(&mut u32)) {
-            let mut guard = self.lock();
-            f(&mut guard)
-        }
-    }
-
-    pub(crate) type YaarLock = yaar_lock::sync::Mutex<u32>;
-    impl Mutex for YaarLock {
-        const LABEL: &'static str = "yaar_lock";
-        fn with_lock(&self, f: impl FnOnce(&mut u32)) {
-            let mut guard = self.lock();
-            f(&mut guard)
-        }
-    }
-
-    #[cfg(all(windows, target_env = "msvc"))]
-    pub(crate) type NtLock = ntlock::Mutex<u32>;
-    #[cfg(all(windows, target_env = "msvc"))]
-    impl Mutex for NtLock {
-        const LABEL: &'static str = "ntlock";
-        fn with_lock(&self, f: impl FnOnce(&mut u32)) {
-            let mut guard = self.lock();
-            f(&mut guard)
-        }
-    }
-
-    #[cfg(unix)]
-    pub(crate) type PosixLock = posix_lock::Mutex<u32>;
-    #[cfg(unix)]
-    impl Mutex for PosixLock {
-        const LABEL: &'static str = "posix_lock";
-        fn with_lock(&self, f: impl FnOnce(&mut u32)) {
-            let mut guard = self.lock();
-            f(&mut guard)
-        }
+    fn lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        f(&mut *self.lock().unwrap())
     }
 }
 
-fn random_numbers(seed: u32) -> impl Iterator<Item = u32> {
-    let mut random = seed;
-    iter::repeat_with(move || {
-        random ^= random << 13;
-        random ^= random >> 17;
-        random ^= random << 5;
-        random
-    })
+impl<T> Mutex<T> for parking_lot::Mutex<T> {
+    const NAME: &'static str = "parking_lot::Mutex";
+
+    fn new(v: T) -> Self {
+        Self::new(v)
+    }
+
+    fn lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        f(&mut *self.lock())
+    }
 }
 
-trait Mutex: Sync + Send + Default {
-    const LABEL: &'static str;
-    fn with_lock(&self, f: impl FnOnce(&mut u32));
+impl<T> Mutex<T> for yaar_lock::sync::Mutex<T> {
+    const NAME: &'static str = "yaar_lock::Mutex";
+
+    fn new(v: T) -> Self {
+        Self::new(v)
+    }
+
+    fn lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        f(&mut *self.lock())
+    }
 }
 
-fn run_bench<M: Mutex>(options: &Options) -> time::Duration {
-    let locks = &(0..options.n_locks)
-        .map(|_| CachePadded::new(M::default()))
-        .collect::<Vec<_>>();
+#[cfg(unix)]
+mod pthread {
+    use std::cell::UnsafeCell;
 
-    let start_barrier = &Barrier::new(options.n_threads as usize + 1);
-    let end_barrier = &Barrier::new(options.n_threads as usize + 1);
-
-    let elapsed = scope(|scope| {
-        let thread_seeds = random_numbers(0x6F4A955E).scan(0x9BA2BF27, |state, n| {
-            *state ^= n;
-            Some(*state)
-        });
-        for thread_seed in thread_seeds.take(options.n_threads as usize) {
-            scope.spawn(move |_| {
-                start_barrier.wait();
-                let indexes = random_numbers(thread_seed)
-                    .map(|it| it % options.n_locks)
-                    .map(|it| it as usize)
-                    .take(options.n_ops as usize);
-                for idx in indexes {
-                    locks[idx].with_lock(|cnt| *cnt += 1);
-                }
-                end_barrier.wait();
-            });
-        }
-
-        std::thread::sleep(time::Duration::from_millis(100));
-        start_barrier.wait();
-        let start = time::Instant::now();
-        end_barrier.wait();
-        let elapsed = start.elapsed();
-
-        let mut total = 0;
-        for lock in locks.iter() {
-            lock.with_lock(|cnt| total += *cnt);
-        }
-        assert_eq!(total, options.n_threads * options.n_ops);
-
-        elapsed
-    })
-    .unwrap();
-    elapsed
-}
-
-mod amd_spinlock {
-    use std::{
-        cell::UnsafeCell,
-        ops,
-        sync::atomic::{spin_loop_hint, AtomicBool, Ordering},
-    };
-
-    #[derive(Default)]
-    pub(crate) struct AmdSpinlock<T> {
-        locked: AtomicBool,
-        data: UnsafeCell<T>,
-    }
-    unsafe impl<T: Send> Send for AmdSpinlock<T> {}
-    unsafe impl<T: Send> Sync for AmdSpinlock<T> {}
-
-    pub(crate) struct AmdSpinlockGuard<'a, T> {
-        lock: &'a AmdSpinlock<T>,
+    pub struct Mutex<T> {
+        value: UnsafeCell<T>,
+        lock: UnsafeCell<libc::pthread_mutex_t>,
     }
 
-    impl<T> AmdSpinlock<T> {
-        pub(crate) fn lock(&self) -> AmdSpinlockGuard<T> {
-            loop {
-                let was_locked = self.locked.load(Ordering::Relaxed);
-                if !was_locked
-                    && self
-                        .locked
-                        .compare_exchange_weak(
-                            was_locked,
-                            true,
-                            Ordering::Acquire,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                {
-                    break;
-                }
-                spin_loop_hint()
-            }
-            AmdSpinlockGuard { lock: self }
-        }
-    }
+    unsafe impl<T> Sync for Mutex<T> {}
 
-    impl<'a, T> ops::Deref for AmdSpinlockGuard<'a, T> {
-        type Target = T;
-        fn deref(&self) -> &Self::Target {
-            let ptr = self.lock.data.get();
-            unsafe { &*ptr }
-        }
-    }
-
-    impl<'a, T> ops::DerefMut for AmdSpinlockGuard<'a, T> {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            let ptr = self.lock.data.get();
-            unsafe { &mut *ptr }
-        }
-    }
-
-    impl<'a, T> Drop for AmdSpinlockGuard<'a, T> {
+    impl<T> Drop for Mutex<T> {
         fn drop(&mut self) {
-            self.lock.locked.store(false, Ordering::Release)
+            unsafe {
+                libc::pthread_mutex_destroy(self.lock.get());
+            }
+        }
+    }
+
+    impl<T> super::Mutex<T> for Mutex<T> {
+        const NAME: &'static str = "pthread_rwlock_t";
+
+        fn new(v: T) -> Self {
+            Self {
+                value: UnsafeCell::new(v),
+                lock: UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER),
+            }
+        }
+
+        fn lock<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce(&mut T) -> R,
+        {
+            unsafe {
+                libc::pthread_mutex_lock(self.lock.get());
+                let res = f(&mut *self.value.get());
+                libc::pthread_mutex_unlock(self.lock.get());
+                res
+            }
         }
     }
 }
@@ -248,8 +116,7 @@ mod amd_spinlock {
 mod posix_lock {
     use std::{
         cell::UnsafeCell,
-        ops::{Deref, DerefMut},
-        sync::atomic::{spin_loop_hint, AtomicBool, Ordering},
+        sync::atomic::{spin_loop_hint, Ordering, AtomicBool},
     };
 
     pub struct Mutex<T> {
@@ -257,25 +124,22 @@ mod posix_lock {
         value: UnsafeCell<T>,
     }
 
-    unsafe impl<T: Send> Send for Mutex<T> {}
-    unsafe impl<T: Send> Sync for Mutex<T> {}
+    unsafe impl<T> Sync for Mutex<T> {}
 
-    impl<T: Default> Default for Mutex<T> {
-        fn default() -> Self {
-            Self::new(T::default())
-        }
-    }
+    impl<T> super::Mutex<T> for Mutex<T> {
+        const NAME: &'static str = "spin::sched_yield";
 
-    impl<T> Mutex<T> {
-        pub const fn new(value: T) -> Self {
+        fn new(v: T) -> Self {
             Self {
                 locked: AtomicBool::new(false),
-                value: UnsafeCell::new(value),
+                value: UnsafeCell::new(v),
             }
         }
 
-        #[inline]
-        pub fn lock(&self) -> MutexGuard<'_, T> {
+        fn lock<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce(&mut T) -> R,
+        {
             if self
                 .locked
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -283,9 +147,13 @@ mod posix_lock {
             {
                 self.lock_slow();
             }
-            MutexGuard { mutex: self }
+            let res = f(unsafe { &mut *self.value.get() });
+            self.locked.store(false, Ordering::Release);
+            res
         }
+    }
 
+    impl<T> Mutex<T> {
         #[cold]
         fn lock_slow(&self) {
             let mut spin = 4;
@@ -299,38 +167,9 @@ mod posix_lock {
                     spin -= 1;
                     spin_loop_hint();
                 } else {
-                    extern "C" { fn sched_yield() -> i32; }
-                    unsafe { sched_yield() };
+                    let _ = unsafe { libc::sched_yield() };
                 }
             }
-        }
-
-        #[inline]
-        fn unlock(&self) {
-            self.locked.store(false, Ordering::Release);
-        }
-    }
-
-    pub struct MutexGuard<'a, T> {
-        mutex: &'a Mutex<T>,
-    }
-
-    impl<'a, T> Drop for MutexGuard<'a, T> {
-        fn drop(&mut self) {
-            self.mutex.unlock();
-        }
-    }
-
-    impl<'a, T> DerefMut for MutexGuard<'a, T> {
-        fn deref_mut(&mut self) -> &mut T {
-            unsafe { &mut *self.mutex.value.get() }
-        }
-    }
-
-    impl<'a, T> Deref for MutexGuard<'a, T> {
-        type Target = T;
-        fn deref(&self) -> &T {
-            unsafe { &*self.mutex.value.get() }
         }
     }
 }
@@ -351,34 +190,35 @@ mod ntlock {
         value: UnsafeCell<T>,
     }
 
-    unsafe impl<T: Send> Send for Mutex<T> {}
     unsafe impl<T: Send> Sync for Mutex<T> {}
 
-    impl<T: Default> Default for Mutex<T> {
-        fn default() -> Self {
-            Self::new(T::default())
+    impl<T> super::Mutex<T> for Mutex<T> {
+        const NAME: &'static str = "NtKeyedEvent";
+
+        fn new(v: T) -> Self {
+            Self {
+                waiters: AtomicU32::new(0),
+                value: UnsafeCell::new(v),
+            }
+        }
+
+        fn lock<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce(&mut T) -> R,
+        {
+            if self.locked().swap(1, Ordering::Acquire) != 0 {
+                self.lock_slow();
+            }
+            let res = f(unsafe { &mut *self.value.get() });
+            self.unlock();
+            res
         }
     }
 
     impl<T> Mutex<T> {
-        pub const fn new(value: T) -> Self {
-            Self {
-                waiters: AtomicU32::new(0),
-                value: UnsafeCell::new(value),
-            }
-        }
-
         #[inline]
         fn locked(&self) -> &AtomicU8 {
             unsafe { &*(&self.waiters as *const _ as *const _) }
-        }
-
-        #[inline]
-        pub fn lock(&self) -> MutexGuard<'_, T> {
-            if self.locked().swap(1, Ordering::Acquire) != 0 {
-                self.lock_slow();
-            }
-            MutexGuard { mutex: self }
         }
 
         #[cold]
@@ -471,29 +311,6 @@ mod ntlock {
         }
     }
 
-    pub struct MutexGuard<'a, T> {
-        mutex: &'a Mutex<T>,
-    }
-
-    impl<'a, T> Drop for MutexGuard<'a, T> {
-        fn drop(&mut self) {
-            self.mutex.unlock();
-        }
-    }
-
-    impl<'a, T> DerefMut for MutexGuard<'a, T> {
-        fn deref_mut(&mut self) -> &mut T {
-            unsafe { &mut *self.mutex.value.get() }
-        }
-    }
-
-    impl<'a, T> Deref for MutexGuard<'a, T> {
-        type Target = T;
-        fn deref(&self) -> &T {
-            unsafe { &*self.mutex.value.get() }
-        }
-    }
-
     #[link(name = "kernel32")]
     extern "stdcall" {
         fn CloseHandle(handle: usize) -> u32;
@@ -505,4 +322,168 @@ mod ntlock {
         fn NtWaitForKeyedEvent(handle: usize, key: usize, block: usize, timeout: usize) -> usize;
         fn NtReleaseKeyedEvent(handle: usize, key: usize, block: usize, timeout: usize) -> usize;
     }
+}
+
+fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
+    num_threads: usize,
+    work_per_critical_section: usize,
+    work_between_critical_sections: usize,
+    seconds_per_test: usize,
+) -> Vec<usize> {
+    let lock = Arc::new(([0u8; 300], M::new(0.0), [0u8; 300]));
+    let keep_going = Arc::new(AtomicBool::new(true));
+    let barrier = Arc::new(Barrier::new(num_threads));
+    let mut threads = vec![];
+    for _ in 0..num_threads {
+        let barrier = barrier.clone();
+        let lock = lock.clone();
+        let keep_going = keep_going.clone();
+        threads.push(thread::spawn(move || {
+            let mut local_value = 0.0;
+            let mut value = 0.0;
+            let mut iterations = 0usize;
+            barrier.wait();
+            while keep_going.load(Ordering::Relaxed) {
+                lock.1.lock(|shared_value| {
+                    for _ in 0..work_per_critical_section {
+                        *shared_value += value;
+                        *shared_value *= 1.01;
+                        value = *shared_value;
+                    }
+                });
+                for _ in 0..work_between_critical_sections {
+                    local_value += value;
+                    local_value *= 1.01;
+                    value = local_value;
+                }
+                iterations += 1;
+            }
+            (iterations, value)
+        }));
+    }
+
+    thread::sleep(Duration::from_secs(seconds_per_test as u64));
+    keep_going.store(false, Ordering::Relaxed);
+    threads.into_iter().map(|x| x.join().unwrap().0).collect()
+}
+
+fn run_benchmark_iterations<M: Mutex<f64> + Send + Sync + 'static>(
+    num_threads: usize,
+    work_per_critical_section: usize,
+    work_between_critical_sections: usize,
+    seconds_per_test: usize,
+    test_iterations: usize,
+) {
+    let mut data = vec![];
+    for _ in 0..test_iterations {
+        let run_data = run_benchmark::<M>(
+            num_threads,
+            work_per_critical_section,
+            work_between_critical_sections,
+            seconds_per_test,
+        );
+        data.extend_from_slice(&run_data);
+    }
+
+    let average = data.iter().fold(0f64, |a, b| a + *b as f64) / data.len() as f64;
+    let variance = data
+        .iter()
+        .fold(0f64, |a, b| a + ((*b as f64 - average).powi(2)))
+        / data.len() as f64;
+    data.sort();
+
+    let k_hz = 1.0 / seconds_per_test as f64 / 1000.0;
+    println!(
+        "{:20} | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz",
+        M::NAME,
+        average * k_hz,
+        data[data.len() / 2] as f64 * k_hz,
+        variance.sqrt() * k_hz
+    );
+}
+
+fn run_all(
+    num_threads: usize,
+    work_per_critical_section: usize,
+    work_between_critical_sections: usize,
+    seconds_per_test: usize,
+    test_iterations: usize,
+) {
+    println!(
+        "{:^20} | {:^14} | {:^14} | {:^14}",
+        "name", "average", "median", "std.dev."
+    );
+
+    run_benchmark_iterations::<parking_lot::Mutex<f64>>(
+        num_threads,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+    );
+
+    run_benchmark_iterations::<yaar_lock::sync::Mutex<f64>>(
+        num_threads,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+    );
+
+    run_benchmark_iterations::<std::sync::Mutex<f64>>(
+        num_threads,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+    );
+
+    #[cfg(unix)] {
+        run_benchmark_iterations::<pthread::Mutex<f64>>(
+            num_threads,
+            work_per_critical_section,
+            work_between_critical_sections,
+            seconds_per_test,
+            test_iterations,
+        );
+        run_benchmark_iterations::<posix_lock::Mutex<f64>>(
+            num_threads,
+            work_per_critical_section,
+            work_between_critical_sections,
+            seconds_per_test,
+            test_iterations,
+        );
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    run_benchmark_iterations::<ntlock::Mutex<f64>>(
+        num_threads,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+    );
+}
+
+fn bench_all(name: &'static str, num_threads: usize) {
+    let work_per_critical_section = 0;
+    let work_between_critical_sections = 0;
+    let seconds_per_test = 1;
+    let test_iterations = 1;
+
+    println!("-- {} (num_threads = {})", name, num_threads);
+    run_all(
+        num_threads,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+    );
+    println!();
+}
+
+fn main() {
+    let num_threads = num_cpus::get();
+    bench_all("Contention", num_threads);
+    bench_all("Uncontended", 1);
 }
