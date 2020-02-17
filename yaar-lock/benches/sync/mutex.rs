@@ -178,7 +178,6 @@ mod posix_lock {
 mod ntlock {
     use std::{
         cell::UnsafeCell,
-        ops::{Deref, DerefMut},
         sync::atomic::{spin_loop_hint, AtomicU32, AtomicU8, AtomicUsize, Ordering},
     };
 

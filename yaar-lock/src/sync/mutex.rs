@@ -1,8 +1,8 @@
-use super::WaitNode;
+use super::{SpinWait, WaitNode};
 use crate::ThreadEvent;
 use core::{
     marker::PhantomData,
-    sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 #[cfg(feature = "os")]
@@ -37,18 +37,22 @@ const MUTEX_LOCK: usize = 1;
 const QUEUE_LOCK: usize = 2;
 const QUEUE_MASK: usize = !(QUEUE_LOCK | MUTEX_LOCK);
 
-type QueueNode<E> = WaitNode<E, ()>;
+type QueueNode<E> = WaitNode<E, Notify>;
+enum Notify {
+    Retry,
+    Acquire,
+}
 
 /// [`lock_api::RawMutex`] implementation of parking_lot's [`WordLock`].
 ///
 /// [`WordLock`]: https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
-pub struct CoreMutex<E> {
+pub struct CoreMutex<E: ThreadEvent> {
     state: AtomicUsize,
     phantom: PhantomData<E>,
 }
 
-unsafe impl<E> Send for CoreMutex<E> {}
-unsafe impl<E: Sync> Sync for CoreMutex<E> {}
+unsafe impl<E: ThreadEvent> Send for CoreMutex<E> {}
+unsafe impl<E: ThreadEvent> Sync for CoreMutex<E> {}
 
 unsafe impl<E: ThreadEvent> lock_api::RawMutex for CoreMutex<E> {
     const INIT: Self = Self {
@@ -66,28 +70,28 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutex for CoreMutex<E> {
 
     fn lock(&self) {
         if !self.try_lock() {
-            let node = QueueNode::default();
-            self.lock_slow(&node);
+            self.lock_slow();
         }
     }
 
     fn unlock(&self) {
-        if self.state
-            .compare_exchange_weak(MUTEX_LOCK, 0, Ordering::Release, Ordering::Relaxed)
+        if self
+            .state
+            .compare_exchange(MUTEX_LOCK, 0, Ordering::Release, Ordering::Relaxed)
             .is_err()
         {
             self.unlock_slow();
-        }        
+        }
     }
 }
 
 impl<E: ThreadEvent> CoreMutex<E> {
     #[cold]
-    fn lock_slow(&self, wait_node: &QueueNode<E>) {
-        const MAX_SPIN_DOUBLING: usize = 5;
-
-        let mut spin = 0;
+    fn lock_slow(&self) {
+        let wait_node = QueueNode::new();
+        let mut spin_wait = SpinWait::new();
         let mut state = self.state.load(Ordering::Relaxed);
+
         loop {
             // try to acquire the mutex if its unlocked
             if state & MUTEX_LOCK == 0 {
@@ -103,22 +107,15 @@ impl<E: ThreadEvent> CoreMutex<E> {
                 continue;
             }
 
-            // spin if theres no waiting nodes & havent spun too much.
+            // spin if theres no waiting nodes & if we haven't spun too much.
             let head = (state & QUEUE_MASK) as *const QueueNode<E>;
-            if head.is_null() && spin < MAX_SPIN_DOUBLING {
-                spin += 1;
-                // On windows 10 for most desktop cpus, its better not to spin much.
-                if cfg!(all(windows, feature = "os")) {
-                    spin_loop_hint();
-                } else {
-                    (0..(1 << spin)).for_each(|_| spin_loop_hint());
-                }
+            if head.is_null() && spin_wait.spin() {
                 state = self.state.load(Ordering::Relaxed);
                 continue;
             }
 
             // try to enqueue our node to the wait queue
-            let head = wait_node.enqueue(head);
+            let head = wait_node.push(head, false);
             if let Err(s) = self.state.compare_exchange_weak(
                 state,
                 (head as usize) | (state & !QUEUE_MASK),
@@ -130,16 +127,20 @@ impl<E: ThreadEvent> CoreMutex<E> {
             }
 
             // wait to be signaled by an unlocking thread
-            wait_node.wait();
-            spin = 0;
-            wait_node.reset();
-            state = self.state.load(Ordering::Relaxed);
+            match wait_node.wait() {
+                Notify::Acquire => return,
+                Notify::Retry => {
+                    wait_node.reset();
+                    spin_wait.reset();
+                    state = self.state.load(Ordering::Relaxed);
+                }
+            }
         }
     }
 
     #[cold]
     fn unlock_slow(&self) {
-        // acquire the queue lock in order to dequeue a node
+        // Unlock the mutex to let another possible thread acquire it while we dequeue.
         let mut state = self.state.fetch_sub(MUTEX_LOCK, Ordering::Release);
         loop {
             // give up if theres no nodes to dequeue or the queue is already locked.
@@ -151,7 +152,7 @@ impl<E: ThreadEvent> CoreMutex<E> {
             match self.state.compare_exchange_weak(
                 state,
                 state | QUEUE_LOCK,
-                Ordering::Relaxed,
+                Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -159,15 +160,26 @@ impl<E: ThreadEvent> CoreMutex<E> {
             }
         }
 
+        // When dereferencing the head through the state variable, there needs to have
+        // been an Acquire barrier. This is to observe the changes done to the
+        // head node from the Release compare_exchange_weak in lock_slow().
+        // Subsequentially, stores which unlock the queue after modifying nodes should
+        // use Release to publish the changes to future unlock() threads which
+        // Acquire the changes from the QUEUE_LOCK loop above.
+
         'outer: loop {
-            // If the mutex is locked, let the under dequeue the node.
-            // Safe to use Relaxed on success since not making any memory writes visible.
+            // The head is safe to deref since its confirmed to be non-null with the queue
+            // locking above.
+            let head = unsafe { &*((state & QUEUE_MASK) as *const QueueNode<E>) };
+            let tail = head.tail();
+
+            // If the mutex is locked, let the locker thread dequeue the node.
             if state & MUTEX_LOCK != 0 {
                 match self.state.compare_exchange_weak(
                     state,
                     state & !QUEUE_LOCK,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 ) {
                     Ok(_) => return,
                     Err(s) => state = s,
@@ -175,23 +187,15 @@ impl<E: ThreadEvent> CoreMutex<E> {
                 continue;
             }
 
-            // an Acquire barrier is required as the new state will be deref'd
-            // and updates to its fields need to be visible from the Release store in
-            // `lock_slow()`.
-            fence(Ordering::Acquire);
-
-            // The head is safe to deref since its confirmed to be non-null with the queue
-            // locking above.
-            let head = unsafe { &*((state & QUEUE_MASK) as *const QueueNode<E>) };
-            let (new_tail, tail) = head.dequeue();
+            let new_tail = head.pop(tail);
             if new_tail.is_null() {
                 loop {
                     // unlock the queue while zeroing the head since tail is last node
                     match self.state.compare_exchange_weak(
                         state,
                         state & MUTEX_LOCK,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
                     ) {
                         Ok(_) => break,
                         Err(s) => state = s,
@@ -204,12 +208,11 @@ impl<E: ThreadEvent> CoreMutex<E> {
                 }
             } else {
                 // unlock the queue without zero'ing the head since theres still more nodes.
-                // Release ordering to publish tail updates to the next unlocker's fence(Acquire).
                 self.state.fetch_sub(QUEUE_LOCK, Ordering::Release);
             }
 
             // wake up the dequeued tail
-            tail.notify(());
+            tail.notify(Notify::Retry);
             return;
         }
     }

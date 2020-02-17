@@ -20,22 +20,24 @@ mod if_os {
 
 const IS_SET: usize = 0b1;
 
+type QueueNode<E> = WaitNode<E, ()>;
+
 /// A word (`usize`) sized [`ThreadEvent`] implementation.
-pub struct CoreEvent<E> {
+pub struct CoreEvent<E: ThreadEvent> {
     state: AtomicUsize,
     phantom: PhantomData<E>,
 }
 
-unsafe impl<E> Send for CoreEvent<E> {}
-unsafe impl<E: Sync> Sync for CoreEvent<E> {}
+unsafe impl<E: ThreadEvent> Send for CoreEvent<E> {}
+unsafe impl<E: ThreadEvent> Sync for CoreEvent<E> {}
 
-impl<E> Default for CoreEvent<E> {
+impl<E: ThreadEvent> Default for CoreEvent<E> {
     fn default() -> Self {
         Self::new(false)
     }
 }
 
-impl<E> CoreEvent<E> {
+impl<E: ThreadEvent> CoreEvent<E> {
     #[inline]
     pub fn new(is_set: bool) -> Self {
         Self {
@@ -67,7 +69,7 @@ impl<E: ThreadEvent> ThreadEvent for CoreEvent<E> {
     #[inline]
     fn set(&self) {
         let state = self.state.swap(IS_SET, Ordering::Release);
-        let head = (state & !IS_SET) as *const WaitNode<E, ()>;
+        let head = (state & !IS_SET) as *const QueueNode<E>;
         if !head.is_null() {
             self.wake_slow(unsafe { &*head });
         }
@@ -83,9 +85,10 @@ impl<E: ThreadEvent> ThreadEvent for CoreEvent<E> {
 
 impl<E: ThreadEvent> CoreEvent<E> {
     #[cold]
-    fn wake_slow(&self, head: &WaitNode<E, ()>) {
+    fn wake_slow(&self, head: &QueueNode<E>) {
         loop {
-            let (new_tail, tail) = head.dequeue();
+            let tail = head.tail();
+            let new_tail = head.pop(tail);
             tail.notify(());
             if new_tail.is_null() {
                 break;
@@ -95,7 +98,7 @@ impl<E: ThreadEvent> CoreEvent<E> {
 
     #[cold]
     fn wait_slow(&self) {
-        let wait_node = WaitNode::<E, ()>::default();
+        let wait_node = QueueNode::<E>::new();
         let mut state = self.state.load(Ordering::Acquire);
 
         loop {
@@ -103,8 +106,8 @@ impl<E: ThreadEvent> CoreEvent<E> {
                 return;
             }
 
-            let head = (state & !IS_SET) as *const WaitNode<E, ()>;
-            let new_head = wait_node.enqueue(head);
+            let head = (state & !IS_SET) as *const QueueNode<E>;
+            let new_head = wait_node.push(head, false);
             if let Err(s) = self.state.compare_exchange_weak(
                 state,
                 new_head as usize,
