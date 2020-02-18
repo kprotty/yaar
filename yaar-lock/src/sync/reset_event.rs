@@ -20,8 +20,6 @@ mod if_os {
 
 const IS_SET: usize = 0b1;
 
-type QueueNode<E> = WaitNode<E, ()>;
-
 /// A word (`usize`) sized [`ThreadEvent`] implementation.
 pub struct CoreEvent<E: ThreadEvent> {
     state: AtomicUsize,
@@ -69,7 +67,7 @@ impl<E: ThreadEvent> ThreadEvent for CoreEvent<E> {
     #[inline]
     fn set(&self) {
         let state = self.state.swap(IS_SET, Ordering::Release);
-        let head = (state & !IS_SET) as *const QueueNode<E>;
+        let head = (state & !IS_SET) as *const WaitNode<E, ()>;
         if !head.is_null() {
             self.wake_slow(unsafe { &*head });
         }
@@ -85,11 +83,11 @@ impl<E: ThreadEvent> ThreadEvent for CoreEvent<E> {
 
 impl<E: ThreadEvent> CoreEvent<E> {
     #[cold]
-    fn wake_slow(&self, head: &QueueNode<E>) {
+    fn wake_slow(&self, head: &WaitNode<E, ()>) {
         loop {
             let tail = head.tail();
             let new_tail = head.pop(tail);
-            tail.notify(());
+            tail.notify();
             if new_tail.is_null() {
                 break;
             }
@@ -98,7 +96,7 @@ impl<E: ThreadEvent> CoreEvent<E> {
 
     #[cold]
     fn wait_slow(&self) {
-        let wait_node = QueueNode::<E>::new();
+        let wait_node = WaitNode::<E, ()>::new(());
         let mut state = self.state.load(Ordering::Acquire);
 
         loop {
@@ -106,8 +104,8 @@ impl<E: ThreadEvent> CoreEvent<E> {
                 return;
             }
 
-            let head = (state & !IS_SET) as *const QueueNode<E>;
-            let new_head = wait_node.push(head, false);
+            let head = (state & !IS_SET) as *const WaitNode<E, ()>;
+            let new_head = wait_node.push(head);
             if let Err(s) = self.state.compare_exchange_weak(
                 state,
                 new_head as usize,

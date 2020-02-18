@@ -548,7 +548,7 @@ impl<P: Platform> Thread<P> {
                 .poll_timers(worker, &mut wait_time)
                 .or_else(|| self.poll_local(worker, node, tick))
                 .or_else(|| self.poll_global(worker, node, !0))
-                .or_else(|| self.poll_reactor(worker, node, None))
+                .or_else(|| self.poll_reactor(node, None))
                 .or_else(|| self.poll_others(worker, node))
                 .or_else(|| self.poll_global(worker, node, !0))
             {
@@ -593,6 +593,9 @@ impl<P: Platform> Thread<P> {
             // TODO: Finally, try to poll the network:
             // either to wait for IO blocked tasks to be ready
             // or to wait for a timer on a worker to expire
+            if let Some(task) = self.poll_reactor(node, wait_time) {
+                
+            }
         }
     }
 

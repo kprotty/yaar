@@ -1,6 +1,8 @@
 use crate::ThreadEvent;
+use super::{WaitNode, SpinWait, CoreMutex};
 use core::{
-    marker::PhantomData,
+    ptr::null,
+    cell::Cell,
     sync::atomic::{Ordering, AtomicUsize},
 };
 
@@ -30,10 +32,16 @@ const PARKED: usize = 0b001;
 const WRITE: usize = 0b010;
 const READ: usize = 0b100;
 
+#[derive(Copy, Clone, PartialEq)]
+enum Tag {
+    Reader,
+    Writer,
+}
+
 pub struct CoreRwLock<E: ThreadEvent> {
     state: AtomicUsize,
-    queue: AtomicUsize,
-    phantom: PhantomData<E>,
+    mutex: CoreMutex<E>,
+    queue: Cell<*const WaitNode<E, Tag>>,
 }
 
 unsafe impl<E: ThreadEvent> Send for CoreRwLock<E> {}
@@ -42,8 +50,8 @@ unsafe impl<E: ThreadEvent> Sync for CoreRwLock<E> {}
 unsafe impl<E: ThreadEvent> lock_api::RawRwLock for CoreRwLock<E> {
     const INIT: Self = Self {
         state: AtomicUsize::new(0),
-        queue: AtomicUsize::new(0),
-        phantom: PhantomData,
+        mutex: CoreMutex::INIT,
+        queue: Cell::new(0),
     };
 
     type GuardMarker = lock_api::GuardSend;
@@ -51,13 +59,17 @@ unsafe impl<E: ThreadEvent> lock_api::RawRwLock for CoreRwLock<E> {
     #[inline]
     fn try_lock_exclusive(&self) -> bool {
         self.state
-            .compare_exchange_weak(0, WRITE, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(0, WRITE, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
     }
 
     #[inline]
     fn lock_exclusive(&self) {
-        if !self.try_lock_exclusive() {
+        if self
+            .state
+            .compare_exchange(0, WRITE, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             self.lock_exclusive_slow();
         }
     }
@@ -75,26 +87,12 @@ unsafe impl<E: ThreadEvent> lock_api::RawRwLock for CoreRwLock<E> {
 
     #[inline]
     fn try_lock_shared(&self) -> bool {
-        let state = self.state.load(Ordering::Relaxed);
-        if state & (WRITE | PARKED) == 0 {
-            if let Some(new_state) = state.checked_add(READ) {
-                return match self.state.compare_exchange_weak(
-                    state,
-                    new_state,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => true,
-                    Err(_) => self.try_lock_shared_slow(),
-                };
-            }
-        }
-        false
+        self.try_lock_shared_fast() || self.try_lock_shared_slow()
     }
 
     #[inline]
     fn lock_shared(&self) {
-        if !self.try_lock_shared() {
+        if !self.try_lock_shared_fast() {
             self.lock_shared_slow();
         }
     }
@@ -109,44 +107,100 @@ unsafe impl<E: ThreadEvent> lock_api::RawRwLock for CoreRwLock<E> {
 }
 
 impl<E: ThreadEvent> CoreRwLock<E> {
-    #[cold]
-    fn lock_exclusive_slow(&self) {
-        let node = WaitNode::new(true);
+    fn lock_common(
+        &self,
+        tag: Tag,
+        node_tag: usize,
+        try_lock: impl Fn(&mut usize) -> bool,
+    ) {
+        let wait_node = WaitNode::<E, Tag>::new(tag);
+        let mut spin_wait = SpinWait::new();
         let mut state = self.state.load(Ordering::Relaxed);
+
         loop {
-            if state & WRITE == 0 {
-                match self.state.compare_exchange_weak(
-                    state,
-                    state | WRITE,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return,
-                    Err(e) => state = e,
-                }
+            if try_lock(&mut state) {
+                return;
+            }
+
+            if (state & PARKED == 0) && spin_wait.spin() {
+                state = self.state.load(Ordering::Relaxed);
                 continue;
             }
 
             if state & PARKED == 0 {
-                if let Err(e) = self.state.compare_exchange_weak(
+                if let Err(s) = self.state.compare_exchange_weak(
                     state,
                     state | PARKED,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 ) {
-                    state = e;
+                    state = s;
                     continue;
                 }
             }
 
-            unimplemented!();
+            self.mutex.lock();
+            state = self.state.load(Ordering::Relaxed);
+
+            if state & (WRITE | PARKED) == 0 {
+                self.mutex.unlock();
+            } else {
+                let head = self.queue.get();
+                let new_head = wait_node.push(head);
+                self.queue.set(new_head);
+                self.mutex.unlock();
+                wait_node.wait();
+            }
+            
+            wait_node.reset();
+            spin_wait.reset();
+            state = self.state.load(Ordering::Relaxed);
         }
     }
 
     #[cold]
+    fn lock_exclusive_slow(&self) {
+        self.lock_common(Tag::Writer, |state: &mut usize| {
+            loop {
+                if *state & WRITE != 0 {
+                    return false;
+                }
+                match self.state.compare_exchange_weak(
+                    *state,
+                    *state | WRITE,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(s) => *state = s,
+                }
+            }
+        });
+    }
+
+    #[cold]
     fn unlock_exclusive_slow(&self) {
-        self.state.fetch_sub(WRITE, Ordering::Release);
-        unimplemented!();
+        self.mutex.lock();
+
+        let head = unsafe { &*self.queue };
+        let tail = head.tail();
+        let new_tail = head.pop(tail);
+
+
+    }
+
+    #[inline(always)]
+    fn try_lock_shared_fast(&self) -> bool {
+        let state = self.state.load(Ordering::Relaxed);
+        if state & (WRITE | PARKED) == 0 {
+            if let Some(new_state) = state.checked_add(READ) {
+                return self
+                    .state
+                    .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok();
+            }
+        }
+        false
     }
 
     #[cold]

@@ -37,12 +37,6 @@ const MUTEX_LOCK: usize = 1;
 const QUEUE_LOCK: usize = 2;
 const QUEUE_MASK: usize = !(QUEUE_LOCK | MUTEX_LOCK);
 
-type QueueNode<E> = WaitNode<E, Notify>;
-enum Notify {
-    Retry,
-    Acquire,
-}
-
 /// [`lock_api::RawMutex`] implementation of parking_lot's [`WordLock`].
 ///
 /// [`WordLock`]: https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
@@ -62,18 +56,37 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutex for CoreMutex<E> {
 
     type GuardMarker = lock_api::GuardSend;
 
+    #[inline]
     fn try_lock(&self) -> bool {
-        self.state
-            .compare_exchange_weak(0, MUTEX_LOCK, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+        let mut state = self.state.load(Ordering::Relaxed);
+        loop {
+            if state & MUTEX_LOCK == 0 {
+                return false;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state | MUTEX_LOCK,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(s) => state = s,
+            }
+        }
     }
 
+    #[inline]
     fn lock(&self) {
-        if !self.try_lock() {
+        if self
+            .state
+            .compare_exchange_weak(0, MUTEX_LOCK, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             self.lock_slow();
         }
     }
 
+    #[inline]
     fn unlock(&self) {
         if self
             .state
@@ -88,7 +101,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawMutex for CoreMutex<E> {
 impl<E: ThreadEvent> CoreMutex<E> {
     #[cold]
     fn lock_slow(&self) {
-        let wait_node = QueueNode::new();
+        let wait_node = WaitNode::<E, ()>::new(());
         let mut spin_wait = SpinWait::new();
         let mut state = self.state.load(Ordering::Relaxed);
 
@@ -108,14 +121,14 @@ impl<E: ThreadEvent> CoreMutex<E> {
             }
 
             // spin if theres no waiting nodes & if we haven't spun too much.
-            let head = (state & QUEUE_MASK) as *const QueueNode<E>;
+            let head = (state & QUEUE_MASK) as *const WaitNode<E, ()>;
             if head.is_null() && spin_wait.spin() {
                 state = self.state.load(Ordering::Relaxed);
                 continue;
             }
 
             // try to enqueue our node to the wait queue
-            let head = wait_node.push(head, false);
+            let head = wait_node.push(head);
             if let Err(s) = self.state.compare_exchange_weak(
                 state,
                 (head as usize) | (state & !QUEUE_MASK),
@@ -127,14 +140,10 @@ impl<E: ThreadEvent> CoreMutex<E> {
             }
 
             // wait to be signaled by an unlocking thread
-            match wait_node.wait() {
-                Notify::Acquire => return,
-                Notify::Retry => {
-                    wait_node.reset();
-                    spin_wait.reset();
-                    state = self.state.load(Ordering::Relaxed);
-                }
-            }
+            wait_node.wait();
+            wait_node.reset();
+            spin_wait.reset();
+            state = self.state.load(Ordering::Relaxed);
         }
     }
 
@@ -170,7 +179,7 @@ impl<E: ThreadEvent> CoreMutex<E> {
         'outer: loop {
             // The head is safe to deref since its confirmed to be non-null with the queue
             // locking above.
-            let head = unsafe { &*((state & QUEUE_MASK) as *const QueueNode<E>) };
+            let head = unsafe { &*((state & QUEUE_MASK) as *const WaitNode<E, ()>) };
             let tail = head.tail();
 
             // If the mutex is locked, let the locker thread dequeue the node.
@@ -212,7 +221,7 @@ impl<E: ThreadEvent> CoreMutex<E> {
             }
 
             // wake up the dequeued tail
-            tail.notify(Notify::Retry);
+            tail.notify();
             return;
         }
     }

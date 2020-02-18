@@ -8,28 +8,28 @@ enum State {
     Notified,
 }
 
-pub struct WaitNode<E, Token> {
+pub struct WaitNode<E, T> {
+    pub tag: T,
     state: Cell<State>,
     event: Cell<MaybeUninit<E>>,
-    token: Cell<MaybeUninit<Token>>,
     prev: Cell<MaybeUninit<*const Self>>,
     next: Cell<MaybeUninit<*const Self>>,
     tail: Cell<MaybeUninit<*const Self>>,
 }
 
-impl<E: Default, Token> WaitNode<E, Token> {
-    pub fn new() -> Self {
+impl<E: Default, T> WaitNode<E, T> {
+    pub fn new(tag: T) -> Self {
         Self {
+            tag,
             state: Cell::new(State::Uninit),
             event: Cell::new(MaybeUninit::uninit()),
-            token: Cell::new(MaybeUninit::uninit()),
             prev: Cell::new(MaybeUninit::uninit()),
             next: Cell::new(MaybeUninit::uninit()),
             tail: Cell::new(MaybeUninit::uninit()),
         }
     }
 
-    pub fn push(&self, head: *const Self, is_locked: bool) -> *const Self {
+    pub fn push(&self, head: *const Self) -> *const Self {
         if self.state.get() == State::Uninit {
             self.state.set(State::Waiting);
             self.prev.set(MaybeUninit::new(null()));
@@ -40,14 +40,8 @@ impl<E: Default, Token> WaitNode<E, Token> {
         self.next.set(MaybeUninit::new(head));
         if head.is_null() {
             self.tail.set(MaybeUninit::new(self));
-        } else if !is_locked {
-            self.tail.set(MaybeUninit::new(null()));
         } else {
-            unsafe {
-                let head = &*head;
-                self.tail.set(head.tail.get());
-                head.prev.set(MaybeUninit::new(self));
-            }
+            self.tail.set(MaybeUninit::new(null()));
         }
 
         let new_head = self as *const Self;
@@ -88,7 +82,7 @@ impl<E: Default, Token> WaitNode<E, Token> {
     }
 }
 
-impl<E: ThreadEvent, Token> WaitNode<E, Token> {
+impl<E: ThreadEvent, T> WaitNode<E, T> {
     #[inline(always)]
     fn event(&self) -> &E {
         debug_assert_ne!(self.state.get(), State::Uninit);
@@ -101,18 +95,13 @@ impl<E: ThreadEvent, Token> WaitNode<E, Token> {
         self.event().reset();
     }
 
-    pub fn wait(&self) -> Token {
+    pub fn wait(&self) {
         debug_assert_eq!(self.state.get(), State::Waiting);
         self.event().wait();
-
-        debug_assert_eq!(self.state.get(), State::Notified);
-        unsafe { self.token.replace(MaybeUninit::uninit()).assume_init() }
     }
 
-    pub fn notify(&self, token: Token) {
+    pub fn notify(&self) {
         debug_assert_eq!(self.state.get(), State::Waiting);
-        self.token.set(MaybeUninit::new(token));
-
         self.state.set(State::Notified);
         self.event().set();
     }
