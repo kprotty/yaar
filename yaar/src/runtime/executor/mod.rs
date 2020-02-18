@@ -31,11 +31,6 @@ pub fn with_executor_as<E: Executor, T>(executor: &E, f: impl FnOnce(&E) -> T) -
 
 /// Run the provided function with a referece to the global executor.
 /// Returns `None` if not called in the scope of [`with_executor_as`].
-///
-/// # Safety
-///
-/// Usage should not persist the global executor reference as there are
-/// no guarantees on its validity after the function ends.
-pub fn with_executor<T>(f: impl FnOnce(&dyn Executor) -> T) -> Option<T> {
-    EXECUTOR_REF.0.get().map(|ptr| f(unsafe { &*ptr.as_ptr() }))
+pub fn with_executor<T>(f: impl FnOnce(*const dyn Executor) -> T) -> Option<T> {
+    EXECUTOR_REF.0.get().map(|ptr| f(ptr.as_ptr()))
 }

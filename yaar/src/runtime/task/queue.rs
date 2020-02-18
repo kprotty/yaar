@@ -42,7 +42,13 @@ impl<R: RawMutex> GlobalQueue<R> {
     }
 
     /// Push a list of tasks all at once to the global queue.
-    pub fn push(&self, list: List) {
+    ///
+    /// # Safety
+    ///
+    /// The lists operate on raw pointers so the caller has to ensure
+    /// their validity and lifetime up until they are popped from this
+    /// GlobalQueue or the LocalQueue passed into the pop() function.
+    pub unsafe fn push(&self, list: List) {
         let List { front, back, size } = list;
         if size == 0 {
             return;
@@ -66,6 +72,10 @@ impl<R: RawMutex> GlobalQueue<R> {
     /// the provided [`LocalQueue`]; The only thread that can call push(),
     /// pop() and pop_front() on it. Trying to pop() from the same
     /// LocalQueue on multiple threads may result in undefined behavior.
+    ///
+    /// The operation also assumes that the Task raw pointers are valid for
+    /// the lifetime that they remain "un-popped" from both the GlobalQueue
+    /// and the LocalQueue.
     pub unsafe fn pop(
         &self,
         local_queue: &LocalQueue,
@@ -403,7 +413,10 @@ impl LocalQueue {
                 Ordering::Release,
             ) {
                 Ok(_) => return NonNull::new(task.assume_init() as *mut _),
-                Err(new_pos) => head = transmute::<_, [PosIndex; 2]>(new_pos)[Self::HEAD_POS],
+                Err(new_pos) => {
+                    spin_loop_hint();
+                    head = transmute::<_, [PosIndex; 2]>(new_pos)[Self::HEAD_POS];
+                },
             }
         }
     }

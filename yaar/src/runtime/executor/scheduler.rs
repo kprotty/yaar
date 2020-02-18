@@ -102,7 +102,6 @@ impl<P: Platform> NodeExecutor<P> {
                     for (index, worker) in node.workers().iter().enumerate() {
                         worker.node.set(NonNull::new(node as *const _ as *mut _));
                         worker_pool.put_worker(node, worker);
-                        worker.id.set(index);
                     }
                 }
 
@@ -213,10 +212,6 @@ impl<P: Platform> NodeExecutor<P> {
 unsafe impl<P: Platform> Sync for NodeExecutor<P> {}
 
 impl<P: Platform> Executor for NodeExecutor<P> {
-    /// Schedule a task onto a running NodeExecutor.
-    /// This assumes ownership of the task in the sense
-    /// that no other thread is allowed to read or write to it
-    /// Even though it is a shared reference
     fn schedule(&self, task: &Task) {
         let node = match task.kind() {
             // Distribute root/parent tasks round-robin across nodes.
@@ -295,7 +290,8 @@ impl<P: Platform> Node<P> {
     }
 
     /// Get the array of Workers passed into the new function.
-    fn workers(&self) -> &[Worker<P>] {
+    #[inline]
+    pub fn workers(&self) -> &[Worker<P>] {
         // Safety: initialization of the node ensures that it lives as long as the
         // workers.
         unsafe { from_raw_parts(self.workers_ptr.as_ptr() as *const _, self.workers_len) }
@@ -347,7 +343,9 @@ impl<P: Platform> WorkerPool<P> {
     fn put_worker(&mut self, node: &Node<P>, worker: &Worker<P>) {
         worker.next.set(self.idle_workers);
         self.idle_workers = NonNull::new(worker as *const _ as *mut _);
+
         let workers_idle = node.workers_idle.load(Ordering::Relaxed);
+        debug_assert!(workers_idle < node.workers().len());
         node.workers_idle.store(workers_idle + 1, Ordering::Relaxed);
     }
 
@@ -359,7 +357,9 @@ impl<P: Platform> WorkerPool<P> {
         self.idle_workers.map(|worker| {
             let worker = unsafe { &*worker.as_ptr() };
             self.idle_workers = worker.next.get();
+
             let workers_idle = node.workers_idle.load(Ordering::Relaxed);
+            debug_assert!(workers_idle < node.workers().len() && workers_idle > 0);
             node.workers_idle.store(workers_idle - 1, Ordering::Relaxed);
             worker
         })
@@ -414,6 +414,14 @@ impl<P: Platform> WorkerPool<P> {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum ThreadState {
+    Idle,
+    Polling,
+    Searching,
+    Running,
+}
+
 struct Thread<P: Platform> {
     /// Thread acts as a Linked list
     next: Cell<Option<NonNull<Self>>>,
@@ -422,12 +430,12 @@ struct Thread<P: Platform> {
     /// The worker the thread is using to run tasks.
     /// If None, thread is either idle or should exit.
     worker: Cell<Option<NonNull<Worker<P>>>>,
-    /// State which tracks if the worker/thread is searching for work from
-    /// others.
-    is_searching: Cell<bool>,
     /// Synchronization event to park the thread (for caching purposes &
     /// blocking in the future).
     event: P::ThreadEvent,
+    /// State which tracks if the worker/thread is searching for work from
+    /// others.
+    state: Cell<ThreadState>,
 }
 
 impl<P: Platform> Thread<P> {
@@ -452,17 +460,20 @@ impl<P: Platform> Thread<P> {
             next: Cell::new(None),
             data: P::ThreadLocalData::default(),
             worker: Cell::new(NonNull::new(worker as *const _ as *mut _)),
-            is_searching: Cell::new(node.workers_searching.load(Ordering::Acquire) != 0),
             event: P::ThreadEvent::default(),
+            state: Cell::new(match node.workers_searching.load(Ordering::Acquire) {
+                0 => ThreadState::Polling,
+                _ => ThreadState::Searching,
+            }),
         };
 
         // Set the thread reference as the thread local value using this platform.
-        //
-        // Safety:
-        // The Thread is stack allocated so can be pinned.
-        // See: https://rust-lang-nursery.github.io/futures-api-docs/0.3.0-alpha.1/futures/macro.pin_mut.html
-        let this = unsafe { Pin::new_unchecked(&this) };
-        let _ = node.executor().current_thread(Some(&*this)).unwrap();
+        let _ = node
+            .executor()
+            .current_thread(Some(unsafe {
+                Pin::new_unchecked(&this)
+            }))
+            .unwrap();
 
         let mut tick = 0;
         while let Some(task) = this.poll(tick, node) {
@@ -470,8 +481,7 @@ impl<P: Platform> Thread<P> {
             // decrement the searching count and spawn a new worker
             // if it was the last to come out searching in order to
             // eventually maximize CPU utilization.
-            if this.is_searching.get() {
-                this.is_searching.set(false);
+            if this.state.get() == ThreadState::Searching {
                 if node.workers_searching.fetch_sub(1, Ordering::Release) == 1 {
                     node.spawn_worker();
                 }
@@ -482,6 +492,7 @@ impl<P: Platform> Thread<P> {
             // Safety:
             // The caller which schedules the task ensures that
             // the resume function wont be called in parallel here.
+            this.state.set(ThreadState::Running);
             unsafe { task.resume() };
             tick = tick.wrapping_add(1);
         }
@@ -530,154 +541,31 @@ impl<P: Platform> Thread<P> {
         // give up thread, wait for event, re-loop
 
         loop {
+            #[cfg(debug_assertions)]
+            match self.state.get() {
+                ThreadState::Polling | ThreadState::Searching => true,
+                state => unreachable!("Thread tried to poll with state {:?}", state),
+            };
+
             // Can only fetch tasks if thread has a worker
             let worker = match self.worker() {
                 Some(worker) => worker,
                 None => return None,
             };
-
-            // Check for any available tasks on the system:
-            // - expired timers
-            // - worker run queue
-            // - global run queue
-            // - reactor (non blocking)
-            // - other worker run queues
-            // - global run queue (in case any new tasks came in).
+            
             let mut wait_time = None;
-            if let Some(task) = self
-                .poll_timers(worker, &mut wait_time)
-                .or_else(|| self.poll_local(worker, node, tick))
-                .or_else(|| self.poll_global(worker, node, !0))
-                .or_else(|| self.poll_reactor(node, None))
-                .or_else(|| self.poll_others(worker, node))
-                .or_else(|| self.poll_global(worker, node, !0))
-            {
-                return Some(task);
+            if cfg!(feature = "time") {
+
+            } else {
+                wait_time = Option<()>::None;
             }
-
-            // No tasks found in the system, give up our worker
-            thread.worker.set(None);
-            node.worker_pool.lock().put_worker(node, worker);
-            
-            // Transition from searching -> not-searching
-            let was_searching = self.is_searching.get();
-            if was_searching {
-                self.is_searching.set(false);
-                node.workers_searching.fetch_sub(1, Ordering::AcqRel);
-            }
-            
-            // Check all run queues again
-            let has_work = |some_node| {
-                some_node.run_queue.len() != 0 ||
-                some_node.workers().any(|worker| worker.run_queue.len() != 0)
-            };
-            let has_work = has_work(node) || node
-                .executor()
-                .nodes()
-                .filter(|some_node| some_node.id == node.id)
-                .any(has_work);
-            
-            // Retry polling for work is new work was discovered/
-            // Restore searching & searching count for the spawn_worker() after finding a task.
-            if has_work {
-                if let Some(worker) = node.worker_pool.lock().find_worker(node) {
-                    if was_searching {
-                        self.is_searching.set(true);
-                        node.workers_searching.fetch_add(1, Ordering::Relaxed);
-                    }
-                    thread.worker.set(Some(worker));
-                    continue;
-                }
-            }
-
-            // TODO: Finally, try to poll the network:
-            // either to wait for IO blocked tasks to be ready
-            // or to wait for a timer on a worker to expire
-            if let Some(task) = self.poll_reactor(node, wait_time) {
-                
-            }
-        }
-    }
-
-    #[cfg(not(feature = "time"))]
-    fn poll_timers<'a>(
-        &self,
-        _worker: &Worker<P>,
-        _wait_time: &mut Option<()>,
-    ) -> Option<&'a Task> {
-        None
-    }
-
-    #[cfg(feature = "time")]
-    fn poll_timers<'a>(
-        &self,
-        _worker: &Worker<P>,
-        _wait_time: &mut Option<<P::Clock as Clock>::Instant>,
-    ) -> Option<&'a Task> {
-        // TODO:
-        // check worker delay queue for expired entries,
-        // if none, update wait_time with next expiry.
-        None
-    }
-
-    /// Poll a task from the local thread & worker.
-    /// Safety: Only the current thread (which owns the worker) is calling pop
-    /// on the run_queue.
-    fn poll_local<'a>(&self, worker: &Worker<P>, node: &Node<P>, tick: usize) -> Option<&'a Task> {
-        // Check the global queue once in a while to ensure eventual system fairness.
-        if tick % 64 == 0 {
-            if let Some(task) = self.poll_global(worker, node, 1) {
-                return Some(task);
-            }
-        }
-
-        // Check the back of the local queue (FIFO) once in a while to ensure eventual
-        // local fairness
-        if tick % 16 == 0 {
-            let task = unsafe { worker.run_queue.pop().map(|task_ptr| &*task_ptr.as_ptr()) };
-            if let Some(task) = task {
-                return Some(task);
-            }
-        }
-
-        // Pop from the front of the local queue by default (LIFO)
-        unsafe {
-            worker
-                .run_queue
-                .pop_front()
-                .map(|task_ptr| &*task_ptr.as_ptr())
-        }
-    }
-
-    /// Poll a batch of tasks from the global queue on a given node,
-    /// pushing the remaining tasks on the workers local run queue.
-    ///
-    /// Safety:
-    /// * `node`s worker slice cannot be empty
-    /// * `max_batch` cannot be zero
-    /// * `max_batch` greater than 1 requires the worker's local queue to be
-    ///   empty.
-    fn poll_global<'a>(
-        &self,
-        worker: &Worker<P>,
-        node: &Node<P>,
-        max_batch: usize,
-    ) -> Option<&'a Task> {
-        unsafe {
-            node.run_queue
-                .pop(
-                    &worker.run_queue,
-                    NonZeroUsize::new_unchecked(node.workers().len()),
-                    NonZeroUsize::new_unchecked(max_batch),
-                )
-                .map(|task_ptr| &*task_ptr.as_ptr())
         }
     }
 }
 
 pub struct Worker<P: Platform> {
     /// An identifier which represents the worker offset in a [`Node`]
-    id: Cell<usize>,
+    id: usize,
     /// Arbitrary data the platform can inject into workers.
     data: P::WorkerLocalData,
     /// Worker acts as a Linked list
@@ -689,6 +577,18 @@ pub struct Worker<P: Platform> {
 }
 
 impl<P: Platform> Worker<P> {
+    /// Get the worker's id set on creation
+    #[inline]
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    /// Get a reference to the worker's arbitrary data set on creation
+    #[inline]
+    pub fn data(&self) -> &P::WorkerLocalData {
+        &self.data
+    }
+
     /// Get a reference to the workers [`Node`] if any.
     fn node<'a>(&self) -> Option<&'a Node<P>> {
         // Safety:
