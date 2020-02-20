@@ -323,6 +323,65 @@ mod ntlock {
     }
 }
 
+mod spinlock {
+    use std::{
+        cell::UnsafeCell,
+        sync::atomic::{spin_loop_hint, Ordering, AtomicBool},
+    };
+
+    pub struct Mutex<T> {
+        locked: AtomicBool,
+        value: UnsafeCell<T>,
+    }
+
+    unsafe impl<T> Sync for Mutex<T> {}
+
+    impl<T> super::Mutex<T> for Mutex<T> {
+        const NAME: &'static str = "spin_lock";
+
+        fn new(v: T) -> Self {
+            Self {
+                locked: AtomicBool::new(false),
+                value: UnsafeCell::new(v),
+            }
+        }
+
+        fn lock<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce(&mut T) -> R,
+        {
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                self.lock_slow();
+            }
+            let res = f(unsafe { &mut *self.value.get() });
+            self.locked.store(false, Ordering::Release);
+            res
+        }
+    }
+
+    impl<T> Mutex<T> {
+        #[cold]
+        fn lock_slow(&self) {
+            let mut spin = 0;
+            loop {
+                if !self.locked.load(Ordering::Relaxed) {
+                    if self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                        return;
+                    }
+                }
+                (0..(1 << spin)).for_each(|_| spin_loop_hint());
+                if spin <= 6 {
+                    spin += 1;
+                }
+            }
+        }
+    }
+}
+
 fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
     num_threads: usize,
     work_per_critical_section: usize,
@@ -462,6 +521,14 @@ fn run_all(
         seconds_per_test,
         test_iterations,
     );
+
+    run_benchmark_iterations::<spinlock::Mutex<f64>>(
+        num_threads,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+    );
 }
 
 fn bench_all(name: &'static str, num_threads: usize) {
@@ -483,6 +550,9 @@ fn bench_all(name: &'static str, num_threads: usize) {
 
 fn main() {
     let num_threads = num_cpus::get();
-    bench_all("Contention", num_threads);
+    bench_all("High Contention", num_threads);
+    if num_threads > 3 {
+        bench_all("Some Contention", num_threads / 2);
+    }
     bench_all("Uncontended", 1);
 }
