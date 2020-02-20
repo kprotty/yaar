@@ -69,16 +69,17 @@ impl<E: Default, T> WaitNode<E, T> {
         }
     }
 
-    pub fn pop(&self, tail: &Self) -> *const Self {
-        debug_assert_ne!(self.state.get(), State::Uninit);
-        let new_tail = unsafe { tail.prev.get().assume_init() };
+    pub fn next(&self) -> *const Self {
+        debug_assert_eq!(self.state.get(), State::Waiting);
+        let tail = self;
+        unsafe { tail.prev.get().assume_init() }
+    }
 
+    pub fn pop(&self, new_tail: *const Self) {
         let head = self;
         if !new_tail.is_null() {
             head.tail.set(MaybeUninit::new(new_tail));
         }
-
-        new_tail
     }
 }
 

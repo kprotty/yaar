@@ -196,7 +196,7 @@ impl<E: ThreadEvent> CoreMutex<E> {
                 continue;
             }
 
-            let new_tail = head.pop(tail);
+            let new_tail = tail.next();
             if new_tail.is_null() {
                 loop {
                     // unlock the queue while zeroing the head since tail is last node
@@ -217,6 +217,7 @@ impl<E: ThreadEvent> CoreMutex<E> {
                 }
             } else {
                 // unlock the queue without zero'ing the head since theres still more nodes.
+                head.pop(new_tail);
                 self.state.fetch_sub(QUEUE_LOCK, Ordering::Release);
             }
 

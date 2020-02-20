@@ -86,7 +86,8 @@ impl<E: ThreadEvent> CoreEvent<E> {
     fn wake_slow(&self, head: &WaitNode<E, ()>) {
         loop {
             let tail = head.tail();
-            let new_tail = head.pop(tail);
+            let new_tail = tail.next();
+            head.pop(new_tail);
             tail.notify();
             if new_tail.is_null() {
                 break;
