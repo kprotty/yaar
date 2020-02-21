@@ -1,6 +1,9 @@
 mod mutex;
 pub use self::mutex::*;
 
+mod rwlock;
+pub use self::rwlock::*;
+
 mod reset_event;
 pub use self::reset_event::*;
 

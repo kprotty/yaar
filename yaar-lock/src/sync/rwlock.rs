@@ -1,3 +1,13 @@
+macro_rules! dbg {
+    ($e:expr) => ({
+        #[cfg(not(feature = "std"))] { $e }
+        #[cfg(feature = "std")] {
+            extern crate std;
+            std::dbg!($e)
+        }
+    });
+}
+
 use crate::ThreadEvent;
 use super::{WaitNode, SpinWait, CoreMutex};
 use core::{
@@ -5,6 +15,7 @@ use core::{
     cell::Cell,
     sync::atomic::{Ordering, AtomicUsize},
 };
+use lock_api::RawMutex;
 
 #[cfg(feature = "os")]
 pub use self::if_os::*;
@@ -27,7 +38,6 @@ pub type RawRwLock<T, E> = lock_api::RwLock<CoreRwLock<E>, T>;
 pub type RawRwLockReadGuard<'a, T, E> = lock_api::RwLockReadGuard<'a, CoreRwLock<E>, T>;
 pub type RawRwLockWriteGuard<'a, T, E> = lock_api::RwLockWriteGuard<'a, CoreRwLock<E>, T>;
 
-
 const PARKED: usize = 0b001;
 const WRITE: usize = 0b010;
 const READ: usize = 0b100;
@@ -36,6 +46,23 @@ const READ: usize = 0b100;
 enum Tag {
     Reader,
     Writer,
+}
+
+struct MutexLockGuard<'a, E: ThreadEvent> {
+    mutex: &'a CoreMutex<E>,
+}
+
+impl<'a, E: ThreadEvent> MutexLockGuard<'a, E> {
+    fn new(mutex: &'a CoreMutex<E>) -> Self {
+        mutex.lock();
+        Self { mutex }
+    }
+}
+
+impl<'a, E: ThreadEvent> Drop for MutexLockGuard<'a, E> {
+    fn drop(&mut self) {
+        self.mutex.unlock();
+    }
 }
 
 pub struct CoreRwLock<E: ThreadEvent> {
@@ -51,7 +78,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawRwLock for CoreRwLock<E> {
     const INIT: Self = Self {
         state: AtomicUsize::new(0),
         mutex: CoreMutex::INIT,
-        queue: Cell::new(0),
+        queue: Cell::new(null()),
     };
 
     type GuardMarker = lock_api::GuardSend;
@@ -67,7 +94,7 @@ unsafe impl<E: ThreadEvent> lock_api::RawRwLock for CoreRwLock<E> {
     fn lock_exclusive(&self) {
         if self
             .state
-            .compare_exchange(0, WRITE, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(0, WRITE, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             self.lock_exclusive_slow();
@@ -107,57 +134,6 @@ unsafe impl<E: ThreadEvent> lock_api::RawRwLock for CoreRwLock<E> {
 }
 
 impl<E: ThreadEvent> CoreRwLock<E> {
-    fn lock_common(
-        &self,
-        tag: Tag,
-        node_tag: usize,
-        try_lock: impl Fn(&mut usize) -> bool,
-    ) {
-        let wait_node = WaitNode::<E, Tag>::new(tag);
-        let mut spin_wait = SpinWait::new();
-        let mut state = self.state.load(Ordering::Relaxed);
-
-        loop {
-            if try_lock(&mut state) {
-                return;
-            }
-
-            if (state & PARKED == 0) && spin_wait.spin() {
-                state = self.state.load(Ordering::Relaxed);
-                continue;
-            }
-
-            if state & PARKED == 0 {
-                if let Err(s) = self.state.compare_exchange_weak(
-                    state,
-                    state | PARKED,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    state = s;
-                    continue;
-                }
-            }
-
-            self.mutex.lock();
-            state = self.state.load(Ordering::Relaxed);
-
-            if state & (WRITE | PARKED) == 0 {
-                self.mutex.unlock();
-            } else {
-                let head = self.queue.get();
-                let new_head = wait_node.push(head);
-                self.queue.set(new_head);
-                self.mutex.unlock();
-                wait_node.wait();
-            }
-            
-            wait_node.reset();
-            spin_wait.reset();
-            state = self.state.load(Ordering::Relaxed);
-        }
-    }
-
     #[cold]
     fn lock_exclusive_slow(&self) {
         self.lock_common(Tag::Writer, |state: &mut usize| {
@@ -175,18 +151,65 @@ impl<E: ThreadEvent> CoreRwLock<E> {
                     Err(s) => *state = s,
                 }
             }
-        });
+        })
     }
 
     #[cold]
     fn unlock_exclusive_slow(&self) {
-        self.mutex.lock();
+        let wait_nodes = {
+            let _lock = MutexLockGuard::new(&self.mutex);
+            let head = self.queue.get();
+            if head.is_null() {
+                self.state.store(0, Ordering::Release);
+                return;
+            }
 
-        let head = unsafe { &*self.queue };
-        let tail = head.tail();
-        let new_tail = head.pop(tail);
+            let mut nodes = null::<WaitNode<E, Tag>>();
+            let head = unsafe { &*head };
+            let mut tail = head.tail();
 
+            loop {
+                match tail.tag {
+                    Tag::Writer => {
+                        if nodes.is_null() {
+                            head.pop(tail.next());
+                            nodes = tail.push(nodes);
+                        }
+                        break;
+                    },
+                    Tag::Reader => {
+                        let new_tail = tail.next();
+                        head.pop(new_tail);
+                        nodes = tail.push(nodes);
+                        if new_tail.is_null() {
+                            break;
+                        } else {
+                            tail = unsafe { &*new_tail };
+                        }
+                    },
+                }
+            }
 
+            if tail.next().is_null() {
+                self.queue.set(null());
+                self.state.store(0, Ordering::Release);
+            } else {
+                self.state.store(PARKED, Ordering::Release);
+            }
+            unsafe { &*nodes }
+        };
+
+        let mut tail = wait_nodes.tail();
+        loop {
+            let new_tail = tail.next();
+            wait_nodes.pop(new_tail);
+            tail.notify();
+            if new_tail.is_null() {
+                break;
+            } else {
+                tail = unsafe { &*new_tail };
+            }
+        }
     }
 
     #[inline(always)]
@@ -226,11 +249,86 @@ impl<E: ThreadEvent> CoreRwLock<E> {
 
     #[cold]
     fn lock_shared_slow(&self) {
-        unimplemented!();
+        self.lock_common(Tag::Reader, |state: &mut usize| {
+            let mut spin_wait = SpinWait::new();
+            loop {
+                if *state & WRITE != 0 {
+                    return false;
+                }
+                
+                if self
+                    .state
+                    .compare_exchange_weak(
+                        *state,
+                        state.checked_add(READ)
+                            .expect("RwLock reader count overflow"),
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return true;
+                }
+
+                spin_wait.force_spin();
+                *state = self.state.load(Ordering::Relaxed);
+            }
+        });
     }
 
     #[cold]
     fn unlock_shared_slow(&self) {
-        unimplemented!();
+        unimplemented!()
+    }
+
+    fn lock_common(
+        &self,
+        tag: Tag,
+        try_lock: impl Fn(&mut usize) -> bool,
+    ) {
+        let mut spin_wait = SpinWait::new();
+        let wait_node = WaitNode::<E, Tag>::new(tag);
+        let mut state = self.state.load(Ordering::Relaxed);
+
+        loop {
+            if try_lock(&mut state) {
+                return;
+            }
+
+            if state & PARKED == 0 {
+                if spin_wait.spin() {
+                    state = self.state.load(Ordering::Relaxed);
+                    continue;
+                } else if let Err(s) = self.state.compare_exchange_weak(
+                    state,
+                    state | PARKED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    state = s;
+                    continue;
+                }
+            }
+            
+            let should_park = {
+                let _lock = MutexLockGuard::new(&self.mutex);
+                let state = self.state.load(Ordering::Relaxed);
+                if state & (WRITE | PARKED) == 0 {
+                    false
+                } else {
+                    let head = self.queue.get();
+                    let new_head = wait_node.push(head);
+                    self.queue.set(new_head);
+                    true
+                }
+            };
+
+            if should_park {
+                wait_node.wait();
+                wait_node.reset();
+            }
+            spin_wait.reset();
+            state = self.state.load(Ordering::Relaxed);
+        }
     }
 }

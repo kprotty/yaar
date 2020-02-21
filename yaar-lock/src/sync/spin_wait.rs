@@ -13,6 +13,11 @@ impl SpinWait {
         self.spin = 0;
     }
 
+    pub fn force_spin(&mut self) {
+        self.spin = (self.spin + 1).min(10);
+        (0..(1 << self.spin)).for_each(|_| spin_loop_hint());
+    }
+
     pub fn spin(&mut self) -> bool {
         let SpinConfig { max_spin, back_off } = SpinConfig::new();
         if self.spin <= max_spin {

@@ -71,7 +71,6 @@ impl<T> RwLock<T> for parking_lot::RwLock<T> {
     }
 }
 
-/*
 impl<T> RwLock<T> for yaar_lock::sync::RwLock<T> {
     const NAME: &'static str = "yaar_lock::RwLock";
 
@@ -93,7 +92,6 @@ impl<T> RwLock<T> for yaar_lock::sync::RwLock<T> {
         f(&mut *self.write())
     }
 }
-*/
 
 #[cfg(unix)]
 mod pthread {
@@ -281,7 +279,7 @@ fn run_all(
         seconds_per_test,
         test_iterations,
     );
-    /*
+
     run_benchmark_iterations::<yaar_lock::sync::RwLock<f64>>(
         num_writer_threads,
         num_reader_threads,
@@ -290,7 +288,7 @@ fn run_all(
         seconds_per_test,
         test_iterations,
     );
-    */
+
     run_benchmark_iterations::<std::sync::RwLock<f64>>(
         num_writer_threads,
         num_reader_threads,
@@ -332,14 +330,18 @@ fn bench_all(name: &'static str, readers: usize, writers: usize) {
 fn main() {
     let max_threads = num_cpus::get();
 
+    /*
     bench_all("Only Readers - Contention", max_threads, 0);
     bench_all("Only Readers - Uncontended", 1, 0);
+    */
 
     bench_all("Only Writers - Contention", 0, max_threads);
     bench_all("Only Writers - Uncontended", 0, 1);
 
+    /*
     bench_all("Many Readers - One Writer", max_threads.max(2), 1);
     bench_all("Many Writers - One Reader", 1, max_threads.max(2));
 
     bench_all("Equal Readers & Writers", max_threads, max_threads);
+    */
 }
