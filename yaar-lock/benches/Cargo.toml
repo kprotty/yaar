@@ -5,10 +5,10 @@ edition = "2018"
 authors = ["kprotty"]
 
 [features]
-sync_rwlock = ["sync", "libc"]
+sync_rwlock = ["sync", "libc", "winapi/synchapi"]
 sync_mutex = ["sync", "libc"]
 sync = [
-    "yaar-lock/std",
+    "yaar-lock/os",
     "yaar-lock/sync",
     "parking_lot",
     "crossbeam-utils"
@@ -24,6 +24,9 @@ async = [
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", optional = true, default-features = false }
 
 [dependencies]
 yaar-lock = { path = "../", features = ["os"] }

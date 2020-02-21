@@ -1,13 +1,3 @@
-macro_rules! dbg {
-    ($e:expr) => ({
-        #[cfg(not(feature = "std"))] { $e }
-        #[cfg(feature = "std")] {
-            extern crate std;
-            std::dbg!($e)
-        }
-    });
-}
-
 use crate::ThreadEvent;
 use super::{WaitNode, SpinWait, CoreMutex};
 use core::{
@@ -156,7 +146,7 @@ impl<E: ThreadEvent> CoreRwLock<E> {
 
     #[cold]
     fn unlock_exclusive_slow(&self) {
-        let wait_nodes = {
+        let node = {
             let _lock = MutexLockGuard::new(&self.mutex);
             let head = self.queue.get();
             if head.is_null() {
@@ -164,52 +154,22 @@ impl<E: ThreadEvent> CoreRwLock<E> {
                 return;
             }
 
-            let mut nodes = null::<WaitNode<E, Tag>>();
             let head = unsafe { &*head };
-            let mut tail = head.tail();
+            let tail = head.tail();
+            let new_tail = tail.next();
+            head.pop(new_tail);
 
-            loop {
-                match tail.tag {
-                    Tag::Writer => {
-                        if nodes.is_null() {
-                            head.pop(tail.next());
-                            nodes = tail.push(nodes);
-                        }
-                        break;
-                    },
-                    Tag::Reader => {
-                        let new_tail = tail.next();
-                        head.pop(new_tail);
-                        nodes = tail.push(nodes);
-                        if new_tail.is_null() {
-                            break;
-                        } else {
-                            tail = unsafe { &*new_tail };
-                        }
-                    },
-                }
-            }
-
-            if tail.next().is_null() {
+            if new_tail.is_null() {
                 self.queue.set(null());
                 self.state.store(0, Ordering::Release);
             } else {
                 self.state.store(PARKED, Ordering::Release);
             }
-            unsafe { &*nodes }
+
+            tail
         };
 
-        let mut tail = wait_nodes.tail();
-        loop {
-            let new_tail = tail.next();
-            wait_nodes.pop(new_tail);
-            tail.notify();
-            if new_tail.is_null() {
-                break;
-            } else {
-                tail = unsafe { &*new_tail };
-            }
-        }
+        node.notify();
     }
 
     #[inline(always)]

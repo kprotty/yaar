@@ -18,7 +18,6 @@ nightly = []
 full = ["os", "sync", "future"]
 
 # Main features for yaar-lock
-std = ["os"]
 sync = ["lock_api"]
 future = ["sync", "futures-intrusive"]
 os = [

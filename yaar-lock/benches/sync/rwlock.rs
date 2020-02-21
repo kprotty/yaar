@@ -103,6 +103,7 @@ mod pthread {
     }
 
     unsafe impl<T> Sync for RwLock<T> {}
+    unsafe impl<T> Send for RwLock<T> {}
 
     impl<T> Drop for RwLock<T> {
         fn drop(&mut self) {
@@ -142,6 +143,62 @@ mod pthread {
                 libc::pthread_rwlock_wrlock(self.lock.get());
                 let res = f(&mut *self.value.get());
                 libc::pthread_rwlock_unlock(self.lock.get());
+                res
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+mod srwlock {
+    use std::cell::UnsafeCell;
+    use winapi::um::synchapi::{
+        SRWLOCK,
+        SRWLOCK_INIT,
+        AcquireSRWLockShared,
+        ReleaseSRWLockShared,
+        AcquireSRWLockExclusive,
+        ReleaseSRWLockExclusive,
+    };
+
+    pub struct RwLock<T> {
+        value: UnsafeCell<T>,
+        lock: UnsafeCell<SRWLOCK>,
+    }
+
+    unsafe impl<T> Sync for RwLock<T> {}
+    unsafe impl<T> Send for RwLock<T> {}
+
+    impl<T> super::RwLock<T> for RwLock<T> {
+        const NAME: &'static str = "SRWLOCK";
+
+        fn new(v: T) -> Self {
+            Self {
+                value: UnsafeCell::new(v),
+                lock: UnsafeCell::new(SRWLOCK_INIT),
+            }
+        }
+
+        fn read<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce(&T) -> R,
+        {
+            unsafe {
+                AcquireSRWLockShared(self.lock.get());
+                let res = f(&*self.value.get());
+                ReleaseSRWLockShared(self.lock.get());
+                res
+            }
+        }
+    
+        fn write<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce(&mut T) -> R,
+        {
+            unsafe {
+                AcquireSRWLockExclusive(self.lock.get());
+                let res = f(&mut *self.value.get());
+                ReleaseSRWLockExclusive(self.lock.get());
                 res
             }
         }
@@ -297,8 +354,20 @@ fn run_all(
         seconds_per_test,
         test_iterations,
     );
-    if cfg!(unix) {
+
+    #[cfg(unix)] {
         run_benchmark_iterations::<pthread::RwLock<f64>>(
+            num_writer_threads,
+            num_reader_threads,
+            work_per_critical_section,
+            work_between_critical_sections,
+            seconds_per_test,
+            test_iterations,
+        );
+    }
+
+    #[cfg(windows)] {
+        run_benchmark_iterations::<srwlock::RwLock<f64>>(
             num_writer_threads,
             num_reader_threads,
             work_per_critical_section,
@@ -330,10 +399,8 @@ fn bench_all(name: &'static str, readers: usize, writers: usize) {
 fn main() {
     let max_threads = num_cpus::get();
 
-    /*
     bench_all("Only Readers - Contention", max_threads, 0);
     bench_all("Only Readers - Uncontended", 1, 0);
-    */
 
     bench_all("Only Writers - Contention", 0, max_threads);
     bench_all("Only Writers - Uncontended", 0, 1);
