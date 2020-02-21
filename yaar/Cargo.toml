@@ -23,7 +23,7 @@ io = ["yaar-reactor"]
 
 [dependencies]
 lock_api = "0.3"
-yaar-lock = { path = "../yaar-lock", features = ["sync"] }
+yaar-lock = { path = "../yaar-lock" }
 yaar-reactor = { path = "../yaar-reactor", optional = true }
 
 [target.'cfg(unix)'.dependencies]
