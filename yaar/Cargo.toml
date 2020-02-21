@@ -25,6 +25,7 @@ io = ["yaar-reactor"]
 lock_api = "0.3"
 yaar-lock = { path = "../yaar-lock" }
 yaar-reactor = { path = "../yaar-reactor", optional = true }
+crossbeam-utils = { version = "0.7", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true, default-features = false }

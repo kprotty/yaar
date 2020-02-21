@@ -1,5 +1,4 @@
 use core::{
-    ptr::null,
     cell::Cell,
 };
 
@@ -23,7 +22,7 @@ pub struct Task {
 impl Task {
     pub fn new(resume: unsafe fn(*const Self)) -> Self {
         Self {
-            next: Cell::new(null()),
+            next: Cell::new(Priority::Normal as usize),
             resume: Cell::new(resume as usize),
         }
     }

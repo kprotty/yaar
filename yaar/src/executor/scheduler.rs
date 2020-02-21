@@ -1,17 +1,18 @@
 use super::{
     Node,
     Task,
+    Thread,
+    Platform,
 };
 use core::{
-    ptr::{null_mut, NonNull},
+    ptr::NonNull,
     slice::from_raw_parts,
-    sync::atomic::{Ordering, AtomicPtr},
 };
+use yaar_lock::ThreadEvent;
 
 pub enum RunError {
     EmptyNodes,
     InvalidStartNode,
-    SchedulerAlreadyRunning,
     NodeWithoutWorkers(usize),
 }
 
@@ -31,11 +32,6 @@ impl<P: Platform> Scheduler<P> {
 
     fn nodes(&self) -> &[&Node<P>] {
         unsafe { from_raw_parts(self.nodes_ptr.as_ptr() as *const _, self.nodes_len) }
-    }
-
-    fn current() -> &'static AtomicPtr<Self> {
-        static CURRENT_SCHEDULER: AtomicPtr<Self> = AtomicPtr::new(null_mut());
-        &CURRENT_SCHEDULER
     }
 
     pub fn run(
@@ -60,32 +56,20 @@ impl<P: Platform> Scheduler<P> {
             stop_event: P::ThreadEvent::default(),
         };
 
-        // Try to mark this executor at the global scope
         let scheduler = NonNull::new(&this as *const _ as *mut _).unwrap();
-        if Self::current()
-            .compare_exchange(
-                null_mut(),
-                scheduler.as_ptr(),
-                Ordering::Release,
-                Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            return Err(RunError::SchedulerAlreadyRunning);
-        }
-
         if nodes.len() == 1 && this.nodes()[0].workers().len() == 1 {
             unimplemented!("TODO: handle specialization for single threaded execution");
         }
 
-        for (node_index, node) in this.nodes().enumerate() {
+        for (node_index, node) in this.nodes().iter().enumerate() {
             node.scheduler.set(Some(scheduler.clone()));
             if node.workers().len() == 0 {
                 return Err(RunError::NodeWithoutWorkers(node_index));
             }
             let mut pool = node.pool.lock();
             for worker in node.workers() {
-                pool.put_worker(worker)
+                worker.node.set(NonNull::new(node as *const _ as *mut _));
+                pool.put_worker(node, worker);
             }
         }
 
@@ -93,11 +77,10 @@ impl<P: Platform> Scheduler<P> {
         Thread::<P>::run({
             let mut pool = node.pool.lock();
             pool.free_threads -= 1;
-            pool.find_worker().unwrap()
+            pool.find_worker(node).unwrap()
         });
 
         this.stop_event.wait();
-        Self::current().store(null_mut(), Ordering::Relaxed);
         Ok(())
     }
 }
