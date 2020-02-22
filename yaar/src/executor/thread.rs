@@ -1,8 +1,5 @@
 use super::{Platform, Worker};
-use core::{
-    cell::Cell,
-    ptr::NonNull,
-};
+use core::{cell::Cell, ptr::NonNull};
 
 pub enum ThreadState {
     Idle,

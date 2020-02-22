@@ -1,21 +1,17 @@
-use super::{
-    Thread,
-    Worker,
-    Platform,
-    Scheduler,
-};
+use super::{GlobalQueue, Platform, Scheduler, Thread, Worker};
 use core::{
     cell::Cell,
-    ptr::NonNull,
     num::NonZeroUsize,
+    ptr::NonNull,
     slice::from_raw_parts,
-    sync::atomic::{compiler_fence, Ordering, AtomicUsize},
+    sync::atomic::{compiler_fence, AtomicUsize, Ordering},
 };
-use lock_api::Mutex;
 use crossbeam_utils::CachePadded;
+use lock_api::Mutex;
 
 pub struct Node<P: Platform> {
     pub data: P::NodeLocalData,
+    pub(crate) run_queue: GlobalQueue<P::RawMutex>,
     pub(crate) pool: Mutex<P::RawMutex, CachePadded<Pool<P>>>,
     pub(crate) scheduler: Cell<Option<NonNull<Scheduler<P>>>>,
 
@@ -64,7 +60,7 @@ impl<P: Platform> Pool<P> {
         self.idle_workers.map(|worker_ptr| {
             let worker = unsafe { &*worker_ptr.as_ptr() };
             self.idle_workers = worker.next.get();
-            
+
             let workers_idle = Self::unsync_load_workers_idle(node);
             debug_assert!(workers_idle > 0 && workers_idle < node.workers().len());
             node.workers_idle.store(workers_idle - 1, Ordering::Relaxed);

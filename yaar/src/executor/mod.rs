@@ -1,13 +1,15 @@
-mod task;
 mod node;
+mod platform;
+mod queue;
+mod scheduler;
+mod task;
 mod thread;
 mod worker;
-mod platform;
-mod scheduler;
 
-use self::task::*;
 use self::node::*;
+use self::platform::*;
+use self::queue::*;
+use self::scheduler::*;
+use self::task::*;
 use self::thread::*;
 use self::worker::*;
-use self::platform::*;
-use self::scheduler::*;

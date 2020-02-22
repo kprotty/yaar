@@ -1,13 +1,5 @@
-use super::{
-    Node,
-    Task,
-    Thread,
-    Platform,
-};
-use core::{
-    ptr::NonNull,
-    slice::from_raw_parts,
-};
+use super::{Node, Platform, Task, Thread};
+use core::{ptr::NonNull, slice::from_raw_parts};
 use yaar_lock::ThreadEvent;
 
 pub enum RunError {
