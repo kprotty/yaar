@@ -1,18 +1,93 @@
 use core::{
     cell::Cell,
+    hint::unreachable_unchecked,
+    marker::PhantomData,
     mem::{align_of, transmute},
     ptr::{null, NonNull},
 };
 
+pub(crate) struct TaggedPtr<Ptr, Tag> {
+    value: usize,
+    phantom: PhantomData<*mut (Ptr, Tag)>,
+}
+
+impl<Ptr, Tag> Copy for TaggedPtr<Ptr, Tag> {}
+impl<Ptr, Tag> Clone for TaggedPtr<Ptr, Tag> {
+    fn clone(&self) -> Self {
+        Self::from(self.value)
+    }
+}
+
+impl<Ptr, Tag> Into<usize> for TaggedPtr<Ptr, Tag> {
+    fn into(self) -> usize {
+        self.value
+    }
+}
+
+impl<Ptr, Tag> From<usize> for TaggedPtr<Ptr, Tag> {
+    fn from(value: usize) -> Self {
+        Self {
+            value,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<Ptr, Tag> TaggedPtr<Ptr, Tag>
+where
+    Tag: From<usize> + Into<usize>,
+{
+    pub fn new(ptr: *const Ptr, tag: Tag) -> Self {
+        let tag = tag.into();
+        debug_assert!(align_of::<Ptr>() > tag);
+        ((ptr as usize) | tag).into()
+    }
+
+    pub fn as_ptr(self) -> Option<NonNull<Ptr>> {
+        NonNull::new((self.value & !(align_of::<Ptr>() - 1)) as *mut Ptr)
+    }
+
+    pub fn as_tag(self) -> Tag {
+        Tag::from(self.value & (align_of::<Ptr>() - 1))
+    }
+
+    pub fn with_ptr(self, ptr: Option<NonNull<Ptr>>) -> Self {
+        let ptr = ptr.map(|p| p.as_ptr() as *const _).unwrap_or(null());
+        Self::new(ptr, self.as_tag())
+    }
+
+    pub fn with_tag(self, tag: Tag) -> Self {
+        let ptr = self
+            .as_ptr()
+            .map(|p| p.as_ptr() as *const _)
+            .unwrap_or(null());
+        Self::new(ptr, tag)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Kind {
     Local = 0,
     Global = 1,
 }
 
-impl Kind {
-    const MASK: usize = 0b1;
+impl Into<usize> for Kind {
+    fn into(self) -> usize {
+        self as usize
+    }
 }
 
+impl From<usize> for Kind {
+    fn from(value: usize) -> Self {
+        match value & 1 {
+            0 => Kind::Local,
+            1 => Kind::Global,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Priority {
     Low = 0,
     Normal = 1,
@@ -20,37 +95,15 @@ pub enum Priority {
     Critical = 3,
 }
 
-impl Priority {
-    const MASK: usize = 0b11;
+impl Into<usize> for Priority {
+    fn into(self) -> usize {
+        self as usize
+    }
 }
 
-pub struct Task {
-    next: Cell<usize>,
-    resume: Cell<usize>,
-}
-
-impl Task {
-    pub fn new(resume: unsafe fn(*const Self)) -> Self {
-        assert!(align_of::<Self>() > Priority::MASK.max(Kind::MASK));
-        Self {
-            next: Cell::new(Priority::Normal as usize),
-            resume: Cell::new(resume as usize),
-        }
-    }
-
-    pub fn next(&self) -> Option<NonNull<Self>> {
-        NonNull::new((self.next.get() & !Priority::MASK) as *mut _)
-    }
-
-    pub unsafe fn set_next(&self, next_ptr: Option<NonNull<Self>>) {
-        let ptr = next_ptr
-            .map(|p| p.as_ptr() as usize)
-            .unwrap_or(null::<Self>() as usize);
-        self.next.set(ptr | (self.priority() as usize));
-    }
-
-    pub fn priority(&self) -> Priority {
-        match self.next.get() & Priority::MASK {
+impl From<usize> for Priority {
+    fn from(value: usize) -> Self {
+        match value & 0b11 {
             0 => Priority::Low,
             1 => Priority::Normal,
             2 => Priority::High,
@@ -58,19 +111,54 @@ impl Task {
             _ => unreachable!(),
         }
     }
+}
 
-    pub unsafe fn resume(&self) {
-        let resume_fn = self.resume.get() & !Kind::MASK;
-        let resume_fn: unsafe fn(*const Self) = transmute(resume_fn);
-        resume_fn(self)
+pub struct Task {
+    next: Cell<TaggedPtr<Self, Priority>>,
+    resume: Cell<TaggedPtr<(), Kind>>,
+}
+
+impl Task {
+    pub fn new(resume: unsafe fn(*const Self)) -> Self {
+        Self {
+            next: Cell::new(TaggedPtr::new(null(), Priority::Normal)),
+            resume: Cell::new(TaggedPtr::new(resume as *const (), Kind::Local)),
+        }
+    }
+
+    pub fn next(&self) -> Option<NonNull<Self>> {
+        self.next.get().as_ptr()
+    }
+
+    pub unsafe fn set_next(&self, next_ptr: Option<NonNull<Self>>) {
+        self.next.set(self.next.get().with_ptr(next_ptr));
+    }
+
+    pub fn priority(&self) -> Priority {
+        self.next.get().as_tag()
+    }
+
+    pub unsafe fn set_priority(&self, priority: Priority) {
+        self.next.set(self.next.get().with_tag(priority));
     }
 
     pub fn kind(&self) -> Kind {
-        match self.resume.get() & Kind::MASK {
-            0 => Kind::Local,
-            1 => Kind::Global,
-            _ => unreachable!(),
-        }
+        self.resume.get().as_tag()
+    }
+
+    pub unsafe fn set_kind(&self, kind: Kind) {
+        self.resume.set(self.resume.get().with_tag(kind));
+    }
+
+    pub unsafe fn resume(&self) {
+        let resume_fn: unsafe fn(*const Self) = transmute(
+            self.resume
+                .get()
+                .as_ptr()
+                .unwrap_or_else(|| unreachable_unchecked())
+                .as_ptr(),
+        );
+        resume_fn(self)
     }
 }
 

@@ -1,6 +1,7 @@
-use super::{Worker, Thread};
+use super::{Thread, Worker};
+use core::ptr::NonNull;
 
-pub unsafe trait Platform: Sized {
+pub unsafe trait Platform: Sized + Sync {
     type RawMutex: lock_api::RawMutex;
     type ThreadEvent: yaar_lock::ThreadEvent;
 

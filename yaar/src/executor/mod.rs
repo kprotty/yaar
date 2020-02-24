@@ -6,10 +6,10 @@ mod task;
 mod thread;
 mod worker;
 
-use self::node::*;
-use self::platform::*;
+pub use self::node::*;
+pub use self::platform::*;
 use self::queue::*;
-use self::scheduler::*;
-use self::task::*;
-use self::thread::*;
-use self::worker::*;
+pub use self::scheduler::*;
+pub use self::task::*;
+pub use self::thread::*;
+pub use self::worker::*;

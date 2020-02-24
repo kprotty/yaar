@@ -1,42 +1,77 @@
-use super::{Platform, Worker};
-use core::{cell::Cell, ptr::NonNull};
+use super::{Node, Platform, TaggedPtr, Task, Worker};
+use core::{
+    cell::Cell,
+    ptr::{null, NonNull},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+use yaar_lock::ThreadEvent;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ThreadState {
-    Idle,
-    Polling,
-    Searching,
-    Running,
+    Idle = 0,
+    Polling = 1,
+    Searching = 2,
+    Running = 3,
+}
+
+impl Into<usize> for ThreadState {
+    fn into(self) -> usize {
+        self as usize
+    }
+}
+
+impl From<usize> for ThreadState {
+    fn from(value: usize) -> Self {
+        match value & 0b11 {
+            0 => ThreadState::Idle,
+            1 => ThreadState::Polling,
+            2 => ThreadState::Searching,
+            3 => ThreadState::Running,
+            _ => unreachable!(),
+        }
+    }
 }
 
 pub struct Thread<P: Platform> {
     pub data: P::ThreadLocalData,
-    pub(crate) state: Cell<ThreadState>,
+    pub(crate) prev: Cell<Option<NonNull<Self>>>,
     pub(crate) next: Cell<Option<NonNull<Self>>>,
-    pub(crate) worker: Cell<Option<NonNull<Worker<P>>>>,
+    pub(crate) worker_state: AtomicUsize,
     pub(crate) event: P::ThreadEvent,
 }
 
+pub(crate) type TaggedWorker<P> = TaggedPtr<Worker<P>, ThreadState>;
+
 impl<P: Platform> Thread<P> {
+    #[inline]
+    pub fn current<'a>() -> Option<&'a Self> {
+        P::get_tls_thread().map(|p| unsafe { &*p.as_ptr() })
+    }
+
+    #[inline]
     pub fn state(&self) -> ThreadState {
-        self.state.get();
+        TaggedWorker::<P>::from(self.worker_state.load(Ordering::Relaxed)).as_tag()
     }
 
+    #[inline]
     pub fn worker(&self) -> Option<&Worker<P>> {
-        self.worker.get().map(|ptr| unsafe { &*ptr.as_ptr() })
+        TaggedWorker::from(self.worker_state.load(Ordering::Relaxed))
+            .as_ptr()
+            .map(|ptr| unsafe { &*ptr.as_ptr() })
     }
 
-    pub extern "C" fn run(worker: &Worker<P>) {
+    pub(crate) extern "C" fn run(worker: &Worker<P>) {
         let node = worker.node().expect("Thread running without a Node");
+        let state = match node.workers_searching.load(Ordering::Relaxed) {
+            0 => ThreadState::Idle,
+            _ => ThreadState::Searching,
+        };
 
         let this = Self {
             data: P::ThreadLocalData::default(),
-            state: Cell::new(match node.workers_searching.load(Ordering::Relaxed) {
-                0 => ThreadState::Idle,
-                _ => ThreadState::Searching,
-            }),
+            prev: Cell::new(None),
             next: Cell::new(None),
-            worker: Cell::new(NonNull::new(worker as *const _ as *mut _)),
+            worker_state: AtomicUsize::new(TaggedWorker::new(worker, state).into()),
             event: P::ThreadEvent::default(),
         };
 
@@ -45,9 +80,15 @@ impl<P: Platform> Thread<P> {
         P::set_tls_thread(this_ptr);
 
         let mut tick = 0;
-        while let Some(task) = self.poll(node, tick) {
-            let old_state = self.state.replace(ThreadState::Running);
-            if old_state == ThreadState::Searching {
+        while let Some(task) = this.poll(node, tick) {
+            // Transition into running after finding a runnable task.
+            // If we we're the last to come out of searching, spawn
+            // another worker to handle future incoming tasks as soon
+            // as possible for maximum worker utilization.
+            let worker_state = TaggedWorker::<P>::from(this.worker_state.load(Ordering::Relaxed));
+            let new_state = worker_state.with_tag(ThreadState::Running);
+            this.worker_state.store(new_state.into(), Ordering::Relaxed);
+            if worker_state.as_tag() == ThreadState::Searching {
                 if node.workers_searching.fetch_sub(1, Ordering::Release) == 1 {
                     node.spawn_worker();
                 }
@@ -55,6 +96,34 @@ impl<P: Platform> Thread<P> {
 
             unsafe { task.as_ref().resume() };
             tick += 1;
+        }
+
+        // Thread is exitting, set the stop_event if this was the last thread.
+        let scheduler = node
+            .scheduler()
+            .expect("Thread::run: Node without a scheduler");
+        node.pool.lock().free_threads += 1;
+        if scheduler.active_threads.fetch_sub(1, Ordering::Relaxed) == 1 {
+            scheduler.stop_event.set();
+        }
+    }
+
+    fn poll(&self, node: &Node<P>, tick: usize) -> Option<NonNull<Task>> {
+        loop {
+            let worker = match self.worker() {
+                Some(worker) => worker,
+                None => return None,
+            };
+
+            // When giving up worker:
+            let new_state = TaggedWorker::<P>::new(null(), ThreadState::Polling);
+            self.worker_state.store(new_state.into(), Ordering::Relaxed);
+            worker
+                .last_thread
+                .set(NonNull::new(self as *const _ as *mut _));
+            node.pool.lock().put_worker(node, worker);
+
+            unimplemented!()
         }
     }
 }

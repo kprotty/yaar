@@ -1,5 +1,5 @@
 use super::{Node, Platform, Task, Thread};
-use core::{ptr::NonNull, slice::from_raw_parts};
+use core::{ptr::NonNull, slice::from_raw_parts, sync::atomic::AtomicUsize};
 use yaar_lock::ThreadEvent;
 
 pub enum RunError {
@@ -12,17 +12,20 @@ pub struct Scheduler<P: Platform> {
     platform: NonNull<P>,
     nodes_ptr: NonNull<NonNull<Node<P>>>,
     nodes_len: usize,
-    stop_event: P::ThreadEvent,
+    pub(crate) active_threads: AtomicUsize,
+    pub(crate) stop_event: P::ThreadEvent,
 }
 
 unsafe impl<P: Platform> Sync for Scheduler<P> {}
 
 impl<P: Platform> Scheduler<P> {
-    fn platform(&self) -> &P {
+    #[inline]
+    pub fn platform(&self) -> &P {
         unsafe { self.platform.as_ref() }
     }
 
-    fn nodes(&self) -> &[&Node<P>] {
+    #[inline]
+    pub fn nodes(&self) -> &[&Node<P>] {
         unsafe { from_raw_parts(self.nodes_ptr.as_ptr() as *const _, self.nodes_len) }
     }
 
@@ -45,6 +48,7 @@ impl<P: Platform> Scheduler<P> {
             platform: NonNull::new(platform as *const _ as *mut _).unwrap(),
             nodes_ptr: NonNull::new(nodes.as_ptr() as *mut _).unwrap(),
             nodes_len: nodes.len(),
+            active_threads: AtomicUsize::new(0),
             stop_event: P::ThreadEvent::default(),
         };
 

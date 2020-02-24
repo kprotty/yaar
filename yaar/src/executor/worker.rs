@@ -6,14 +6,17 @@ pub struct Worker<P: Platform> {
     pub(crate) next: Cell<Option<NonNull<Self>>>,
     pub(crate) node: Cell<Option<NonNull<Node<P>>>>,
     pub(crate) thread: Cell<Option<NonNull<Thread<P>>>>,
+    pub(crate) last_thread: Cell<Option<NonNull<Thread<P>>>>,
     pub(crate) run_queue: LocalQueue,
 }
 
 impl<P: Platform> Worker<P> {
+    #[inline]
     pub fn node(&self) -> Option<&Node<P>> {
         self.node.get().map(|ptr| unsafe { &*ptr.as_ptr() })
     }
 
+    #[inline]
     pub fn thread(&self) -> Option<&Thread<P>> {
         self.thread.get().map(|ptr| unsafe { &*ptr.as_ptr() })
     }
