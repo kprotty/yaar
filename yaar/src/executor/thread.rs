@@ -1,8 +1,9 @@
-use super::{Node, Platform, TaggedPtr, Task, Worker};
+use super::{Node, Platform, TaggedPtr, Task, TaskScope, TaskList, Worker};
 use core::{
     cell::Cell,
     ptr::{null, NonNull},
     sync::atomic::{AtomicUsize, Ordering},
+    hint::unreachable_unchecked,
 };
 use yaar_lock::ThreadEvent;
 
@@ -32,6 +33,8 @@ impl From<usize> for ThreadState {
     }
 }
 
+pub(crate) type TaggedWorker<P> = TaggedPtr<Worker<P>, ThreadState>;
+
 pub struct Thread<P: Platform> {
     pub data: P::ThreadLocalData,
     pub(crate) prev: Cell<Option<NonNull<Self>>>,
@@ -39,8 +42,6 @@ pub struct Thread<P: Platform> {
     pub(crate) worker_state: AtomicUsize,
     pub(crate) event: P::ThreadEvent,
 }
-
-pub(crate) type TaggedWorker<P> = TaggedPtr<Worker<P>, ThreadState>;
 
 impl<P: Platform> Thread<P> {
     #[inline]
@@ -58,6 +59,45 @@ impl<P: Platform> Thread<P> {
         TaggedWorker::from(self.worker_state.load(Ordering::Relaxed))
             .as_ptr()
             .map(|ptr| unsafe { &*ptr.as_ptr() })
+    }
+
+    pub(crate) fn schedule(&self, task_ptr: NonNull<Task>) {
+        unsafe {
+            let task = task_ptr.as_ref();
+            let worker = self.worker().unwrap_or_else(|| unreachable_unchecked());
+            let node = worker.node().unwrap_or_else(|| unreachable_unchecked());
+
+            match task.scope() {
+                TaskScope::Local => {
+                    worker.run_queue.push(task, &node.run_queue);
+                },
+                TaskScope::Global => {
+                    worker.run_queue.push(task, &node.run_queue);
+                    if node.workers_searching.load(Ordering::Relaxed) == 0 {
+                        node.spawn_worker();
+                    }
+                },
+                TaskScope::System => {
+                    let scheduler = node.scheduler().unwrap_or_else(|| unreachable_unchecked());
+                    let nodes = scheduler.nodes();
+
+                    let node_index = scheduler.next_node.fetch_add(1, Ordering::Relaxed);
+                    let remote_node = nodes.get_unchecked(node_index % nodes.len());
+                    remote_node.run_queue.push({
+                        let mut list = TaskList::default();
+                        list.push(task_ptr);
+                        list
+                    });
+
+                    if remote_node.workers_searching.load(Ordering::Relaxed) == 0 {
+                        remote_node.spawn_worker();
+                    }
+                },
+                TaskScope::Remote => {
+                    unimplemented!();
+                },
+            };
+        }
     }
 
     pub(crate) extern "C" fn run(worker: &Worker<P>) {

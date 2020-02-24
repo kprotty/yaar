@@ -1,4 +1,4 @@
-use super::{Priority, PriorityTaskList, Task, TaskList};
+use super::{TaskPriority, TaskQueue, Task, TaskList};
 use core::{
     cell::{Cell, UnsafeCell},
     convert::TryInto,
@@ -11,10 +11,10 @@ use core::{
 use crossbeam_utils::{atomic::AtomicConsume, CachePadded};
 use lock_api::RawMutex;
 
-pub(crate) struct GlobalQueue<Mutex: RawMutex> {
+pub struct GlobalQueue<Mutex: RawMutex> {
     mutex: CachePadded<Mutex>,
     pub size: AtomicUsize,
-    list: UnsafeCell<TaskList>,
+    list: UnsafeCell<TaskQueue>,
 }
 
 impl<Mutex: RawMutex> Default for GlobalQueue<Mutex> {
@@ -22,7 +22,7 @@ impl<Mutex: RawMutex> Default for GlobalQueue<Mutex> {
         Self {
             mutex: CachePadded::new(Mutex::INIT),
             size: AtomicUsize::new(0),
-            list: UnsafeCell::new(TaskList::default()),
+            list: UnsafeCell::new(TaskQueue::default()),
         }
     }
 }
@@ -36,8 +36,8 @@ impl<Mutex: RawMutex> GlobalQueue<Mutex> {
         self.size.load_consume()
     }
 
-    pub fn push(&self, batch: PriorityTaskList) {
-        let PriorityTaskList { front, back, size } = batch;
+    pub fn push(&self, batch: TaskList) {
+        let TaskList { front, back, size } = batch;
         if size == 0 {
             return;
         }
@@ -118,7 +118,7 @@ mod atomic_index {
     pub type Index = u16;
 }
 
-pub(crate) struct LocalQueue {
+pub struct LocalQueue {
     pos: AtomicUsize,
     tasks: CachePadded<[Cell<MaybeUninit<NonNull<Task>>>; Self::SIZE]>,
 }
@@ -164,8 +164,8 @@ impl LocalQueue {
         let priority = task.priority();
         let task = NonNull::new(task as *const _ as *mut _).unwrap();
         match priority {
-            Priority::Low | Priority::Normal => self.push_back(task, global),
-            Priority::High | Priority::Critical => self.push_front(task, global),
+            TaskPriority::Low | TaskPriority::Normal => self.push_back(task, global),
+            TaskPriority::High | TaskPriority::Critical => self.push_front(task, global),
         }
     }
 
@@ -240,7 +240,7 @@ impl LocalQueue {
             Ordering::Relaxed,
         )?;
 
-        let mut list = PriorityTaskList::default();
+        let mut list = TaskList::default();
         unsafe {
             list.push(task);
             for i in 0..batch {

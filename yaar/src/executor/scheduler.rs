@@ -1,5 +1,5 @@
-use super::{Node, Platform, Task, Thread};
-use core::{ptr::NonNull, slice::from_raw_parts, sync::atomic::AtomicUsize};
+use super::{Node, Platform, Task, Thread, TaskList};
+use core::{ptr::NonNull, slice::from_raw_parts, sync::atomic::{Ordering, AtomicUsize}};
 use yaar_lock::ThreadEvent;
 
 pub enum RunError {
@@ -12,6 +12,7 @@ pub struct Scheduler<P: Platform> {
     platform: NonNull<P>,
     nodes_ptr: NonNull<NonNull<Node<P>>>,
     nodes_len: usize,
+    pub(crate) next_node: AtomicUsize,
     pub(crate) active_threads: AtomicUsize,
     pub(crate) stop_event: P::ThreadEvent,
 }
@@ -27,6 +28,12 @@ impl<P: Platform> Scheduler<P> {
     #[inline]
     pub fn nodes(&self) -> &[&Node<P>] {
         unsafe { from_raw_parts(self.nodes_ptr.as_ptr() as *const _, self.nodes_len) }
+    }
+
+    pub(crate) fn schedule(&self, task: NonNull<Task>) {
+        if let Some(thread) = Thread::<P>::current() {
+            thread.schedule(task);
+        }
     }
 
     pub fn run(
@@ -48,6 +55,7 @@ impl<P: Platform> Scheduler<P> {
             platform: NonNull::new(platform as *const _ as *mut _).unwrap(),
             nodes_ptr: NonNull::new(nodes.as_ptr() as *mut _).unwrap(),
             nodes_len: nodes.len(),
+            next_node: AtomicUsize::new(0),
             active_threads: AtomicUsize::new(0),
             stop_event: P::ThreadEvent::default(),
         };
@@ -69,14 +77,25 @@ impl<P: Platform> Scheduler<P> {
             }
         }
 
+        // Prepare the task to be executed on the start node
         let node = this.nodes()[start_node];
+        node.run_queue.push(unsafe {
+            let task = NonNull::new_unchecked(task as *const _ as *mut _);
+            let mut list = TaskList::default();
+            list.push(task);
+            list
+        });
+
+        // Run a worker using the main thread to execute the task
         Thread::<P>::run({
             let mut pool = node.pool.lock();
             pool.free_threads -= 1;
             pool.find_worker(node).unwrap()
         });
 
+        // Wait for all spawned threads to come to a halt before exitting. 
         this.stop_event.wait();
+        debug_assert_eq!(this.active_threads.load(Ordering::Relaxed), 0);
         Ok(())
     }
 }
