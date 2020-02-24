@@ -1,19 +1,18 @@
-use super::Worker;
-use core::num::NonZeroUsize;
+use super::{Worker, Thread};
 
-pub trait Platform: Sized {
+pub unsafe trait Platform: Sized {
     type RawMutex: lock_api::RawMutex;
     type ThreadEvent: yaar_lock::ThreadEvent;
 
     type WorkerLocalData;
-    type ThreadLocalData;
+    type ThreadLocalData: Default;
     type NodeLocalData: Sync;
 
-    unsafe fn get_tls() -> Option<NonZeroUsize>;
+    fn get_tls_thread() -> Option<NonNull<Thread<Self>>>;
 
-    unsafe fn set_tls(new_value: NonZeroUsize);
+    fn set_tls_thread(thread: Option<NonNull<Thread<Self>>>);
 
-    unsafe fn spawn_thread(
+    fn spawn_thread(
         &self,
         worker: &Worker<Self>,
         run: extern "C" fn(worker: &Worker<Self>),

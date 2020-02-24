@@ -31,6 +31,26 @@ impl<P: Platform> Node<P> {
     pub fn scheduler(&self) -> Option<&Scheduler<P>> {
         self.scheduler.get().map(|ptr| unsafe { &*ptr.as_ptr() })
     }
+
+    pub(crate) fn spawn_worker(&self) {
+        if self
+            .workers_searching
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        {
+            let mut pool = self.pool.lock();
+            if let Some(worker) = pool.find_worker(self) {
+                
+            }
+        }
+
+        let workers_searching = self.workers_searching.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(workers_searching >= 1 && workers_searching < self.workers().len());
+    }
 }
 
 pub(crate) struct Pool<P: Platform> {
