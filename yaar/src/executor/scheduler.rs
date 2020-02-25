@@ -13,7 +13,7 @@ pub struct Scheduler<P: Platform> {
     nodes_ptr: NonNull<NonNull<Node<P>>>,
     nodes_len: usize,
     pub(crate) next_node: AtomicUsize,
-    pub(crate) active_threads: AtomicUsize,
+    pub(crate) active_nodes: AtomicUsize,
     pub(crate) stop_event: P::ThreadEvent,
 }
 
@@ -49,22 +49,24 @@ impl<P: Platform> Scheduler<P> {
         }
 
         // Create the scheduler on the stack so that it shares the lifetime
-        // of both the nodes slice as well as the platform, this allows the
-        // helper functions (`platform()`, `nodes()`) to be safe.
+        // of both the nodes slice as well as the platform; This allows the
+        // helper functions `platform()` and `nodes()` to be safe.
         let this = Self {
             platform: NonNull::new(platform as *const _ as *mut _).unwrap(),
             nodes_ptr: NonNull::new(nodes.as_ptr() as *mut _).unwrap(),
             nodes_len: nodes.len(),
             next_node: AtomicUsize::new(0),
-            active_threads: AtomicUsize::new(0),
+            active_nodes: AtomicUsize::new(0),
             stop_event: P::ThreadEvent::default(),
         };
 
+        // TODO: specialize execution for single threaded cases
         let scheduler = NonNull::new(&this as *const _ as *mut _).unwrap();
         if nodes.len() == 1 && this.nodes()[0].workers().len() == 1 {
-            unimplemented!("TODO: handle specialization for single threaded execution");
+            unimplemented!();
         }
 
+        // Prepare all the nodes and their workers 
         for (node_index, node) in this.nodes().iter().enumerate() {
             node.scheduler.set(Some(scheduler.clone()));
             if node.workers().len() == 0 {
@@ -87,15 +89,15 @@ impl<P: Platform> Scheduler<P> {
         });
 
         // Run a worker using the main thread to execute the task
-        Thread::<P>::run({
+        Thread::<P>::start({
             let mut pool = node.pool.lock();
-            pool.free_threads -= 1;
+            pool.on_thread_spawn(node, &this);
             pool.find_worker(node).unwrap()
         });
 
         // Wait for all spawned threads to come to a halt before exitting. 
         this.stop_event.wait();
-        debug_assert_eq!(this.active_threads.load(Ordering::Relaxed), 0);
+        debug_assert_eq!(this.active_nodes.load(Ordering::Relaxed), 0);
         Ok(())
     }
 }

@@ -160,10 +160,8 @@ impl LocalQueue {
         tail.wrapping_sub(head) as usize
     }
 
-    pub unsafe fn push<M: RawMutex>(&self, task: &Task, global: &GlobalQueue<M>) {
-        let priority = task.priority();
-        let task = NonNull::new(task as *const _ as *mut _).unwrap();
-        match priority {
+    pub unsafe fn push<M: RawMutex>(&self, task: NonNull<Task>, global: &GlobalQueue<M>) {
+        match task.as_ref().priority() {
             TaskPriority::Low | TaskPriority::Normal => self.push_back(task, global),
             TaskPriority::High | TaskPriority::Critical => self.push_front(task, global),
         }
