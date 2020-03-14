@@ -18,24 +18,13 @@ nightly = []
 full = ["os", "sync", "future"]
 
 # Main features for yaar-lock
+os = []
+future = []
 sync = ["lock_api"]
-future = ["sync", "futures-intrusive"]
-os = [
-    "libc",
-    "winapi/winbase",
-    "winapi/handleapi",
-    "winapi/libloaderapi",
-]
 
-[target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true, default-features = false }
-
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", optional = true, default-features = false }
-
-[dependencies]
-lock_api = { version = "0.3", optional = true }
-futures-intrusive = { version = "0.3", optional = true, default-features = false }
+[dependencies.lock_api]
+version = "0.3"
+optional = true
 
 [package.metadata.docs.rs]
 features = ["full", "nightly"]
