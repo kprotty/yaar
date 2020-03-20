@@ -17,7 +17,8 @@ default = []
 full = ["os", "sync"]
 
 # Main features for yaar-lock
-os = []
+condvar = []
+os = ["condvar"]
 sync = ["lock_api"]
 
 [dependencies.lock_api]
