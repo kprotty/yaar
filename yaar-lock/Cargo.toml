@@ -6,7 +6,7 @@ edition = "2018"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/kprotty/yaar/tree/master/yaar-lock"
-categories = ["concurrency", "no-std"]
+categories = ["concurrency", "no-std", "data-structures"]
 keywords = ["no-std", "thread", "mutex"]
 description = """
 Fast, no_std synchronization primitives.
@@ -14,16 +14,15 @@ Fast, no_std synchronization primitives.
 
 [features]
 default = []
-full = ["os", "sync", "future"]
+full = ["os", "sync"]
 
 # Main features for yaar-lock
 os = []
 sync = ["lock_api"]
-future = ["sync", "futures-intrusive"]
 
-[dependencies]
-lock_api = { optional = true, version = "0.3" }
-futures-intrusive = { optional = true, version = "0.3", default-features = false }
+[dependencies.lock_api]
+optional = true
+version = "0.3"
 
 [package.metadata.docs.rs]
 features = ["full", "nightly"]

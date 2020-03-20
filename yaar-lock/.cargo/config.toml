@@ -1,18 +1,6 @@
 [alias]
-bench_async_mutex = [
-    "bench", "--bench",
-    "async_mutex", "--features=async_mutex",
-    "--manifest-path", "./benches/Cargo.toml",
-]
-
-bench_sync_mutex = [
+bench_mutex = [
     "run", "--release", "--bin",
-    "sync_mutex", "--features=sync_mutex",
-    "--manifest-path", "./benches/Cargo.toml",
-]
-
-bench_sync_rwlock = [
-    "run", "--release", "--bin",
-    "sync_rwlock", "--features=sync_rwlock",
+    "mutex", "--features=mutex",
     "--manifest-path", "./benches/Cargo.toml",
 ]

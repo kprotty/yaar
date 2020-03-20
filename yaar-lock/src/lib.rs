@@ -6,6 +6,3 @@ pub use signal::*;
 
 #[cfg(feature = "sync")]
 pub mod sync;
-
-#[cfg(feature = "future")]
-pub mod future;
