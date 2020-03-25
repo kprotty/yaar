@@ -14,16 +14,17 @@ Fast, no_std synchronization primitives.
 
 [features]
 default = []
-full = ["os", "sync"]
+nightly = []
+full = ["os", "sync", "future"]
 
 # Main features for yaar-lock
-condvar = []
-os = ["condvar"]
+os = []
 sync = ["lock_api"]
+future = ["futures-core"]
 
-[dependencies.lock_api]
-optional = true
-version = "0.3"
+[dependencies]
+lock_api = { version = "0.3", optional = true, default-features = false }
+futures-core = { version = "0.3", optional = true, default-features = false }
 
 [package.metadata.docs.rs]
 features = ["full", "nightly"]

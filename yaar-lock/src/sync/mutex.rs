@@ -1,9 +1,9 @@
-use crate::Signal;
+use crate::{AutoResetEvent, AutoResetEventTimed};
+use super::GenericSignal;
 use core::{
     cell::Cell,
     fmt,
     hint::unreachable_unchecked,
-    marker::PhantomData,
     mem::MaybeUninit,
     ptr::{drop_in_place, NonNull},
     sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
@@ -14,28 +14,28 @@ pub use if_os::*;
 #[cfg(feature = "os")]
 mod if_os {
     use super::*;
-    use crate::OsSignal;
+    use crate::OsAutoResetEvent;
 
-    /// A [`GenericMutex`] backed by [`OsSignal`].
-    pub type Mutex<T> = GenericMutex<T, OsSignal>;
+    /// A [`GenericMutex`] backed by [`OsAutoResetEvent`].
+    pub type Mutex<T> = GenericMutex<T, OsAutoResetEvent>;
 
     /// A [`GenericMutexGuard`] for [`GenericMutex`]
-    pub type MutexGuard<'a, T> = GenericMutexGuard<'a, T, OsSignal>;
+    pub type MutexGuard<'a, T> = GenericMutexGuard<'a, T, OsAutoResetEvent>;
 }
 
-/// A [`RawMutex`] which uses a [`Signal`] implementation for thread blocking.
-pub type GenericMutex<T, Signal> = lock_api::Mutex<RawMutex<Signal>, T>;
+/// A [`RawMutex`] which uses a [`AutoResetEvent`] implementation for thread blocking.
+pub type GenericMutex<T, E> = lock_api::Mutex<RawMutex<E>, T>;
 
 /// A MutexGuard for some [`GenericMutex`] implementation.
-pub type GenericMutexGuard<'a, T, Signal> = lock_api::MutexGuard<'a, GenericMutex<T, Signal>, T>;
+pub type GenericMutexGuard<'a, T, E> = lock_api::MutexGuard<'a, GenericMutex<T, E>, T>;
 
 const MUTEX_LOCK: usize = 1 << 0;
 const QUEUE_LOCK: usize = 1 << 1;
 const QUEUE_MASK: usize = !(QUEUE_LOCK | MUTEX_LOCK);
 
 #[repr(align(4))]
-struct Waiter<Signal> {
-    signal: Cell<MaybeUninit<Signal>>,
+struct Waiter<E> {
+    event: Cell<MaybeUninit<E>>,
     prev: Cell<MaybeUninit<Option<NonNull<Self>>>>,
     next: Cell<MaybeUninit<Option<NonNull<Self>>>>,
     tail: Cell<MaybeUninit<Option<NonNull<Self>>>>,
@@ -45,21 +45,27 @@ struct Waiter<Signal> {
 /// [`WordLock`]
 // [`WordLock`]: https://github.com/Amanieu/parking_lot/blob/master/core/src/word_lock.rs
 #[derive(Default)]
-pub struct RawMutex<S: Signal> {
+pub struct RawMutex<E: AutoResetEvent> {
     state: AtomicUsize,
-    _phantom: PhantomData<S>,
+    signal: GenericSignal<E>,
 }
 
-impl<S: Signal> fmt::Debug for RawMutex<S> {
+impl<E: AutoResetEvent> fmt::Debug for RawMutex<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RawMutex").finish()
     }
 }
 
-unsafe impl<S: Signal + Default> lock_api::RawMutex for RawMutex<S> {
+impl<E: AutoResetEvent + Default> Default for RawMutex<E> {
+    fn default() -> Self {
+        Self::INIT
+    }
+}
+
+unsafe impl<E: AutoResetEvent + Default> lock_api::RawMutex for RawMutex<E> {
     const INIT: Self = Self {
         state: AtomicUsize::new(0),
-        _phantom: PhantomData,
+        signal: GenericSignal::new(),
     };
 
     type GuardMarker = lock_api::GuardSend;
@@ -78,7 +84,10 @@ unsafe impl<S: Signal + Default> lock_api::RawMutex for RawMutex<S> {
             .compare_exchange_weak(0, MUTEX_LOCK, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            self.lock_slow();
+            self.lock_slow(|event| {
+                event.wait();
+                false
+            });
         }
     }
 
@@ -94,12 +103,41 @@ unsafe impl<S: Signal + Default> lock_api::RawMutex for RawMutex<S> {
     }
 }
 
-impl<S: Signal + Default> RawMutex<S> {
+unsafe impl<E: AutoResetEventTimed + Default> lock_api::RawMutexTimed for RawMutex<E> {
+    type Duration = <E as AutoResetEventTimed>::Duration;
+    type Instant = <E as AutoResetEventTimed>::Instant;
+
+    #[inline]
+    fn try_lock_for(&self, mut timeout: Self::Duration) {
+        self.state
+            .compare_exchange_weak(0, MUTEX_LOCK, Ordering::Acquire, Ordering::Relaxed)
+            .map(|_| true)
+            .unwrap_or_else(|_| {
+                self.lock_slow(|event| {
+                    event.try_wait_for(&mut timeout)
+                })
+            })
+    }
+
+    #[inline]
+    fn try_lock_until(&self, mut timeout: Self::Instant) {
+        self.state
+            .compare_exchange_weak(0, MUTEX_LOCK, Ordering::Acquire, Ordering::Relaxed)
+            .map(|_| true)
+            .unwrap_or_else(|_| {
+                self.lock_slow(|event| {
+                    event.try_wait_until(&mut timeout)
+                })
+            })
+    }
+}
+
+impl<E: AutoResetEvent + Default> RawMutex<E> {
     #[cold]
-    fn lock_slow(&self) {
-        let mut signal_initialized = false;
+    fn lock_slow(&self, wait: impl Fn(&E) -> bool) -> bool {
+        let mut event_initialized = false;
         let waiter = Waiter {
-            signal: Cell::new(MaybeUninit::uninit()),
+            event: Cell::new(MaybeUninit::uninit()),
             prev: Cell::new(MaybeUninit::uninit()),
             next: Cell::new(MaybeUninit::uninit()),
             tail: Cell::new(MaybeUninit::uninit()),
@@ -119,16 +157,16 @@ impl<S: Signal + Default> RawMutex<S> {
                 ) {
                     Err(s) => state = s,
                     Ok(_) => {
-                        if signal_initialized {
+                        if event_initialized {
                             // Safety:
-                            // - Guaranteed not uninit() by signal_initialized.
+                            // - Guaranteed not uninit() by event_initialized.
                             // - Not in the wait queue so can only be accessed by our thread.
                             unsafe {
-                                let signal_ptr = (&mut *waiter.signal.as_ptr()).as_mut_ptr();
-                                drop_in_place(signal_ptr);
+                                let event_ptr = (&mut *waiter.event.as_ptr()).as_mut_ptr();
+                                drop_in_place(event_ptr);
                             }
                         }
-                        return;
+                        return true;
                     }
                 }
                 continue;
@@ -136,20 +174,19 @@ impl<S: Signal + Default> RawMutex<S> {
 
             // Spin the mutex in a backoff fashion
             // if theres no one waiting in queue & if we haven't spun too much.
-            let head = NonNull::new((state & QUEUE_MASK) as *mut Waiter<S>);
-            if head.is_none() && spin < 6 {
-                spin += 1;
-                (0..(1 << spin)).for_each(|_| spin_loop_hint());
+            let head = NonNull::new((state & QUEUE_MASK) as *mut Waiter<E>);
+            if head.is_none() && !E::yield_now(spin) {
+                spin = spin.wrapping_add(1);
                 state = self.state.load(Ordering::Relaxed);
                 continue;
             }
 
-            // Lazy initialize the signal as it could be potentially expensive to init on
+            // Lazy initialize the event as it could be potentially expensive to init on
             // fast path (e.g. some PTHREAD_MUTEX/COND_INITIALIERs)
-            if !signal_initialized {
-                signal_initialized = true;
+            if !event_initialized {
+                event_initialized = true;
                 waiter.prev.set(MaybeUninit::new(None));
-                waiter.signal.set(MaybeUninit::new(S::default()));
+                waiter.event.set(MaybeUninit::new(E::default()));
             }
 
             // Prepare the waiter node to be enqueued.
@@ -175,11 +212,19 @@ impl<S: Signal + Default> RawMutex<S> {
                 continue;
             }
 
-            // Wait for the waiter's signal to be notified.
+            // Wait for the waiter's reset event to be notified.
+            // If the wait times out, try to cancel the lock request.
+            // 
             // Safety: Guaranteed initialization from higher code path on
-            // signal_initialized.
-            let signal = unsafe { &*(&*waiter.signal.as_ptr()).as_ptr() };
-            signal.wait();
+            // event_initialized.
+            unsafe {
+                let event_ptr = (&*waiter.event.as_ptr()).as_ptr();
+                if !wait(&*event_ptr) {
+                    self.cancel(waiter, &*event_ptr);
+                    drop_in_place(event_ptr as *mut _);
+                    return false;
+                }
+            }
 
             // Retry the mutex acquire loop.
             spin = 0;
@@ -211,7 +256,7 @@ impl<S: Signal + Default> RawMutex<S> {
             }
         }
 
-        // QUEUE_LOCK is acquired, try to dequeue a waiter and notify its signal.
+        // QUEUE_LOCK is acquired, try to dequeue a waiter and notify its reset event.
         'outer: loop {
             unsafe {
                 // Acquire fence synchronizes with both the Release CAS in lock_slow()
@@ -291,11 +336,41 @@ impl<S: Signal + Default> RawMutex<S> {
                 }
 
                 // The tail waiter has officially been dequeued and the queue lock released.
-                // Notify its signal so that it can retry to acquire the mutex.
-                let signal = &*(&*tail.signal.as_ptr()).as_ptr();
-                signal.notify();
+                // Notify its reset event so that it can retry to acquire the mutex.
+                let event = &*(&*tail.event.as_ptr()).as_ptr();
+                event.set();
                 return;
             }
+        }
+    }
+
+    #[cold]
+    fn cancel(waiter: &Waiter<E>, event: &E) {
+        let mut state = self.state.load(Ordering::Relaxed);
+        loop {
+            if event.is_set() || (state & QUEUE_MASK == 0) {
+                return;
+            }
+
+            if state & QUEUE_LOCK == 0 {
+                match self.state.compare_exchange_weak(
+                    state,
+                    state | QUEUE_LOCK,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(e) => state = e,
+                }
+                continue;
+            }
+
+            self.signal.wait();
+            state = self.state.load(Ordering::Relaxed);
+        }
+
+        'outer: loop {
+
         }
     }
 }
