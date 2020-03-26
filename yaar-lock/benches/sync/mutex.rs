@@ -127,7 +127,7 @@ mod posix_lock {
     unsafe impl<T> Sync for Mutex<T> {}
 
     impl<T> super::Mutex<T> for Mutex<T> {
-        const NAME: &'static str = "spin::sched_yield";
+        const NAME: &'static str = "sched_yield";
 
         fn new(v: T) -> Self {
             Self {
@@ -174,10 +174,129 @@ mod posix_lock {
     }
 }
 
-#[cfg(all(windows, target_env = "msvc"))]
+#[cfg(windows)]
+mod sleep_lock {
+    use std::{
+        cell::UnsafeCell,
+        sync::atomic::{Ordering, AtomicBool},
+    };
+
+    pub struct Mutex<T> {
+        locked: AtomicBool,
+        value: UnsafeCell<T>,
+    }
+
+    unsafe impl<T> Sync for Mutex<T> {}
+
+    impl<T> super::Mutex<T> for Mutex<T> {
+        const NAME: &'static str = "Sleep(0)";
+
+        fn new(v: T) -> Self {
+            Self {
+                locked: AtomicBool::new(false),
+                value: UnsafeCell::new(v),
+            }
+        }
+
+        fn lock<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce(&mut T) -> R,
+        {
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                self.lock_slow();
+            }
+            let res = f(unsafe { &mut *self.value.get() });
+            self.locked.store(false, Ordering::Release);
+            res
+        }
+    }
+
+    impl<T> Mutex<T> {
+        #[cold]
+        fn lock_slow(&self) {
+            loop {
+                if !self.locked.load(Ordering::Relaxed) {
+                    if self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                        return;
+                    }
+                }
+
+                #[link(name = "kernel32")]
+                extern "stdcall" { fn Sleep(ms: u32); }
+                unsafe { Sleep(0) };
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+mod yield_lock {
+    use std::{
+        cell::UnsafeCell,
+        sync::atomic::{Ordering, AtomicBool},
+    };
+
+    pub struct Mutex<T> {
+        locked: AtomicBool,
+        value: UnsafeCell<T>,
+    }
+
+    unsafe impl<T> Sync for Mutex<T> {}
+
+    impl<T> super::Mutex<T> for Mutex<T> {
+        const NAME: &'static str = "SwitchToThread";
+
+        fn new(v: T) -> Self {
+            Self {
+                locked: AtomicBool::new(false),
+                value: UnsafeCell::new(v),
+            }
+        }
+
+        fn lock<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce(&mut T) -> R,
+        {
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                self.lock_slow();
+            }
+            let res = f(unsafe { &mut *self.value.get() });
+            self.locked.store(false, Ordering::Release);
+            res
+        }
+    }
+
+    impl<T> Mutex<T> {
+        #[cold]
+        fn lock_slow(&self) {
+            loop {
+                if !self.locked.load(Ordering::Relaxed) {
+                    if self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                        return;
+                    }
+                }
+
+                #[link(name = "kernel32")]
+                extern "stdcall" { fn SwitchToThread() -> u32; }
+                unsafe { let _ = SwitchToThread(); };
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
 mod ntlock {
     use std::{
         cell::UnsafeCell,
+        mem::transmute,
         sync::atomic::{spin_loop_hint, AtomicU32, AtomicU8, AtomicUsize, Ordering},
     };
 
@@ -205,7 +324,15 @@ mod ntlock {
         where
             F: FnOnce(&mut T) -> R,
         {
-            if self.locked().swap(1, Ordering::Acquire) != 0 {
+            if self.locked().load(Ordering::Relaxed) == 0 {
+                if self
+                    .locked()
+                    .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_err()
+                {
+                    self.lock_slow();
+                }
+            } else {
                 self.lock_slow();
             }
             let res = f(unsafe { &mut *self.value.get() });
@@ -226,7 +353,11 @@ mod ntlock {
             loop {
                 let waiters = self.waiters.load(Ordering::Relaxed);
                 if waiters & 1 == 0 {
-                    if self.locked().swap(1, Ordering::Acquire) == 0 {
+                    if self
+                        .locked()
+                        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                    {
                         return;
                     }
                 } else if self
@@ -239,17 +370,25 @@ mod ntlock {
                     )
                     .is_ok()
                 {
-                    let ret =
-                        unsafe { NtWaitForKeyedEvent(handle, self as *const _ as usize, 0, 0) };
-                    debug_assert_eq!(ret, 0);
-                    self.waiters.fetch_sub(WAKE, Ordering::Relaxed);
+                    unsafe {
+                        let wait: NtInvoke = transmute(NT_WAIT.load(Ordering::Relaxed));
+                        let status = wait(handle, self as *const _ as usize, 0, 0);
+                        debug_assert_eq!(status, 0, "NtWaitForKeyedEvent failed");
+                        self.waiters.fetch_sub(WAKE, Ordering::Relaxed);
+                    }
                 }
-                spin_loop_hint();
+                
             }
         }
 
+        #[inline]
         fn unlock(&self) {
             self.locked().store(0, Ordering::Release);
+            self.unlock_slow();
+        }
+
+        #[cold]
+        fn unlock_slow(&self) {
             loop {
                 let waiters = self.waiters.load(Ordering::Relaxed);
                 if (waiters < WAIT) || (waiters & 1 != 0) || (waiters & WAKE != 0) {
@@ -265,23 +404,19 @@ mod ntlock {
                     )
                     .is_ok()
                 {
-                    let ret = unsafe {
-                        NtReleaseKeyedEvent(Self::get_handle(), self as *const _ as usize, 0, 0)
+                    return unsafe {
+                        let handle = Self::get_handle();
+                        let notify: NtInvoke = transmute(NT_NOTIFY.load(Ordering::Relaxed));
+                        let status = notify(handle, self as *const _ as usize, 0, 0);
+                        debug_assert_eq!(status, 0, "NtReleaseKeyedEvent failed");
                     };
-                    debug_assert_eq!(ret, 0);
-                    return;
                 }
                 spin_loop_hint();
             }
         }
 
-        fn handle_ref() -> &'static AtomicUsize {
-            static HANDLE: AtomicUsize = AtomicUsize::new(0);
-            &HANDLE
-        }
-
         fn get_handle() -> usize {
-            let handle = Self::handle_ref().load(Ordering::Relaxed);
+            let handle = NT_HANDLE.load(Ordering::Acquire);
             if handle != 0 {
                 return handle;
             }
@@ -290,36 +425,76 @@ mod ntlock {
 
         #[cold]
         fn get_handle_slow() -> usize {
-            let mut handle = 0;
-            const MASK: u32 = 0x80000000 | 0x40000000; // GENERIC_READ | GENERIC_WRITE
-            let ret = unsafe { NtCreateKeyedEvent(&mut handle, MASK, 0, 0) };
-            assert_eq!(ret, 0, "Nt Keyed Events not available");
-            match Self::handle_ref().compare_exchange(
-                0,
-                handle,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => handle,
-                Err(new_handle) => {
-                    let ret = unsafe { CloseHandle(handle) };
-                    debug_assert_eq!(ret, 0);
-                    new_handle
+            unsafe {
+                let dll = GetModuleHandleW((&[
+                    b'n' as u16,
+                    b't' as u16,
+                    b'd' as u16,
+                    b'l' as u16,
+                    b'l' as u16,
+                    b'.' as u16,
+                    b'd' as u16,
+                    b'l' as u16,
+                    b'l' as u16,
+                    0 as u16,
+                ]).as_ptr());
+                assert_ne!(dll, 0, "Failed to load ntdll.dll");
+
+                let notify = GetProcAddress(dll, b"NtReleaseKeyedEvent\0".as_ptr());
+                assert_ne!(notify, 0, "Failed to load NtReleaseKeyedEvent");
+                NT_NOTIFY.store(notify, Ordering::Relaxed);
+
+                let wait = GetProcAddress(dll, b"NtWaitForKeyedEvent\0".as_ptr());
+                assert_ne!(wait, 0, "Failed to load NtWaitForKeyedEvent");
+                NT_WAIT.store(wait, Ordering::Relaxed);
+
+                let create = GetProcAddress(dll, b"NtCreateKeyedEvent\0".as_ptr());
+                assert_ne!(create, 0, "Failed to load NtCreateKeyedEvent");
+                let create: NtCreate = transmute(create);
+
+                let mut handle = 0;
+                let status = create(&mut handle, 0x80000000 | 0x40000000, 0, 0);
+                assert_eq!(status, 0, "Failed to create NT Keyed Event Handle");
+
+                match NT_HANDLE.compare_exchange(
+                    0,
+                    handle,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => handle,
+                    Err(new_handle) => {
+                        let status = CloseHandle(handle);
+                        assert_eq!(status, 1, "Failed to close extra NT Keyed Event Handle");
+                        new_handle
+                    }
                 }
             }
         }
     }
 
+    static NT_WAIT: AtomicUsize = AtomicUsize::new(0);
+    static NT_NOTIFY: AtomicUsize = AtomicUsize::new(0);
+    static NT_HANDLE: AtomicUsize = AtomicUsize::new(0);
+
+    type NtCreate = extern "stdcall" fn(
+        handle: &mut usize,
+        mask: u32,
+        unused: usize,
+        unused: usize,
+    ) -> u32;
+    type NtInvoke = extern "stdcall" fn(
+        handle: usize,
+        key: usize,
+        block: usize,
+        timeout: usize,
+    ) -> u32;
+
     #[link(name = "kernel32")]
     extern "stdcall" {
-        fn CloseHandle(handle: usize) -> u32;
-    }
-
-    #[link(name = "ntdll")]
-    extern "stdcall" {
-        fn NtCreateKeyedEvent(handle_ptr: &mut usize, mask: u32, x: usize, y: usize) -> usize;
-        fn NtWaitForKeyedEvent(handle: usize, key: usize, block: usize, timeout: usize) -> usize;
-        fn NtReleaseKeyedEvent(handle: usize, key: usize, block: usize, timeout: usize) -> usize;
+        fn CloseHandle(handle: usize) -> i32;
+        fn GetModuleHandleW(moduleName: *const u16) -> usize;
+        fn GetProcAddress(module: usize, procName: *const u8) -> usize;
     }
 }
 
@@ -513,14 +688,29 @@ fn run_all(
         );
     }
 
-    #[cfg(all(windows, target_env = "msvc"))]
-    run_benchmark_iterations::<ntlock::Mutex<f64>>(
-        num_threads,
-        work_per_critical_section,
-        work_between_critical_sections,
-        seconds_per_test,
-        test_iterations,
-    );
+    #[cfg(windows)] {
+        run_benchmark_iterations::<ntlock::Mutex<f64>>(
+            num_threads,
+            work_per_critical_section,
+            work_between_critical_sections,
+            seconds_per_test,
+            test_iterations,
+        );
+        run_benchmark_iterations::<sleep_lock::Mutex<f64>>(
+            num_threads,
+            work_per_critical_section,
+            work_between_critical_sections,
+            seconds_per_test,
+            test_iterations,
+        );
+        run_benchmark_iterations::<yield_lock::Mutex<f64>>(
+            num_threads,
+            work_per_critical_section,
+            work_between_critical_sections,
+            seconds_per_test,
+            test_iterations,
+        );
+    }
 
     run_benchmark_iterations::<spinlock::Mutex<f64>>(
         num_threads,
