@@ -557,6 +557,24 @@ mod spinlock {
     }
 }
 
+mod std_lock;
+impl<T> Mutex<T> for std_lock::Mutex<T> {
+    const NAME: &'static str = "std_lock";
+
+    fn new(v: T) -> Self {
+        Self::new(v)
+    }
+
+    fn lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        let mut guard = self.lock();
+        f(&mut *guard)
+    }
+}
+
+
 fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
     num_threads: usize,
     work_per_critical_section: usize,
@@ -648,6 +666,14 @@ fn run_all(
     );
 
     run_benchmark_iterations::<parking_lot::Mutex<f64>>(
+        num_threads,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+    );
+    
+    run_benchmark_iterations::<std_lock::Mutex<f64>>(
         num_threads,
         work_per_critical_section,
         work_between_critical_sections,
