@@ -1,7 +1,7 @@
-use crate::AutoResetEvent;
-use super::parker::{
+use crate::parker::{
     Parker,
     ParkResult,
+    AutoResetEvent,
 };
 use core::{
     task::Poll,
@@ -16,7 +16,7 @@ const HANDOFF_TOKEN: usize = 1 << 1;
 
 pub struct RawMutex<Event> {
     state: AtomicUsize,
-    parker: Parker<Event, usize>,
+    parker: Parker<Event>,
 }
 
 impl<Event: AutoResetEvent + Default> RawMutex<Event> {
@@ -51,7 +51,7 @@ impl<Event: AutoResetEvent + Default> RawMutex<Event> {
             .is_ok()
     }
 
-    pub unsafe async fn lock_slow(
+    pub async unsafe fn lock_slow(
         &self,
         park: impl Fn(&Event) -> Poll<bool>,
     ) -> bool {
@@ -90,31 +90,28 @@ impl<Event: AutoResetEvent + Default> RawMutex<Event> {
                 }
             }
 
-            let validate = |_, _| self.state.load(Ordering::Relaxed) == LOCKED | PARKED;
-            let enqueued = |waiters, _| waiters += 1;
-            let cancelled = |waiters, _| {
-                waiters -= 1;
-                if *waiters == 0 {
+            let validate = || {
+                if self.state.load(Ordering::Relaxed) == (LOCKED | PARKED) {
+                    Ok(DEFAULT_TOKEN)
+                } else {
+                    Err(())
+                }
+            };
+            let timed_out = |_token, was_last| {
+                if was_last {
                     self.state.fetch_and(!PARKED, Ordering::Relaxed);
                 }
             };
 
             match self.parker.park(
-                || Event::default(),
-                |event| park(event),
-                || {
-                    if self.state.load(Ordering::Relaxed) == (LOCKED | PARKED) {
-                        Ok(DEFAULT_TOKEN)
-                    } else {
-                        Err(())
-                    }
-                },
-                |_| {},
+                park,
+                validate,
+                timed_out,
             ).await {
                 ParkResult::Unparked(HANDOFF_TOKEN) => return true,
                 ParkResult::Unparked(_) => {},
-                ParkResult::Invalid => {},
-                ParkResult::Cancelled => return false, 
+                ParkResult::Cancelled(_) => return false, 
+                ParkResult::Unprepared => {},
             }
 
             spin = 0;
@@ -122,7 +119,21 @@ impl<Event: AutoResetEvent + Default> RawMutex<Event> {
         }
     }
 
-    pub unsafe fn unlock(&self, is_fair: bool) {
-        self.parker.unpark()
+    pub unsafe fn unlock(
+        &self,
+        be_fair: bool,
+        unpark: impl Fn(&Event),
+    ) {
+        self.parker.unpark_one(unpark, |ctx, token| {
+            if ctx.unparked > 0 && be_fair {
+                *token = HANDOFF_TOKEN;
+                if !ctx.has_more {
+                    self.state.store(LOCKED, Ordering::Relaxed);
+                }
+            } else {
+                let new_state = if ctx.has_more { PARKED } else { 0 };
+                self.state.store(new_state, Ordering::Release);
+            }
+        })
     }
 } 

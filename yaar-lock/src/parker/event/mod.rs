@@ -1,6 +1,6 @@
 
 
-pub unsafe trait AutoResetEvent: Sync {    
+pub unsafe trait AutoResetEvent: Sync + Default {    
     fn set(&self);
 
     fn wait(&self);

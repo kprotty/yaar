@@ -1,5 +1,5 @@
 mod lock;
-pub use lock::*;
+pub(crate) use lock::*;
 
 mod parker;
 pub use parker::*;

@@ -1,6 +1,5 @@
 use super::AutoResetEvent;
 use core::{
-    mem::MaybeUninit,
     ptr::NonNull,
     marker::PhantomData,
     cell::{Cell, UnsafeCell},
@@ -9,40 +8,24 @@ use core::{
 };
 
 #[repr(align(4))]
-pub(crate) struct Node<Event> {
-    pub event: Cell<MaybeUninit<Event>>,
-    pub prev: Cell<MaybeUninit<Option<NonNull<Self>>>>,
-    pub next: Cell<MaybeUninit<Option<NonNull<Self>>>>,
-    pub tail: Cell<MaybeUninit<Option<NonNull<Self>>>>,
-}
-
-impl<Event> Node<Event> {
-    pub fn new() -> Self {
-        Self {
-            event: Cell::new(MaybeUninit::uninit()),
-            prev: Cell::new(MaybeUninit::uninit()),
-            next: Cell::new(MaybeUninit::uninit()),
-            tail: Cell::new(MaybeUninit::uninit()),
-        }
-    }
-
-    pub unsafe fn event(&self) -> &Event {
-        let maybe_event = &*self.event.as_ptr();
-        &*maybe_event.as_ptr()
-    }
+struct Node<Event> {
+    event: NonNull<Event>,
+    prev: Cell<Option<NonNull<Self>>>,
+    next: Cell<Option<NonNull<Self>>>,
+    tail: Cell<Option<NonNull<Self>>>,
 }
 
 const MUTEX_LOCK: usize = 1 << 0;
 const QUEUE_LOCK: usize = 1 << 1;
 const QUEUE_MASK: usize = !(MUTEX_LOCK | QUEUE_LOCK);
 
-pub(crate) struct Lock<Event, T> {
+pub struct Lock<Event, T> {
     state: AtomicUsize,
     value: UnsafeCell<T>,
-    _phantom: PhantomData<E>,
+    _phantom: PhantomData<Event>,
 }
 
-impl<Event: AutoResetEvent, T> Lock<Event, T> {
+impl<Event, T> Lock<Event, T> {
     pub const fn new(value: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
@@ -50,36 +33,42 @@ impl<Event: AutoResetEvent, T> Lock<Event, T> {
             _phantom: PhantomData,
         }
     }
+}
 
+impl<Event: AutoResetEvent, T> Lock<Event, T> {
     pub fn locked<R>(
         &self,
-        node: &Node<Event>,
-        init_event: impl FnOnce() -> Event,
+        event: &Event,
         critical_section: impl FnOnce(&mut T) -> R,
     ) -> R {
-        self.lock(init_event);
-        let result = f(unsafe { &mut *self.value.get() });
+        self.lock(event);
+        let result = critical_section(unsafe {
+            &mut *self.value.get()
+        });
         self.unlock();
         result
     }
 
     #[inline]
-    fn lock<F: impl FnOnce() -> Event>(&self, init_event: Option<F>) {
+    fn lock(&self, event: &Event) {
         if self
             .state
             .compare_exchange_weak(0, MUTEX_LOCK, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            self.lock_slow(node, init_event);
+            self.lock_slow(event);
         }
     }
 
     #[cold]
-    fn lock_slow<F: impl FnOnce() -> Event>(
-        &self,
-        node: &Node<Event>,
-        mut init_event: Option<F>,
-    ) {
+    fn lock_slow(&self, event: &Event) {
+        let node = Node {
+            event: NonNull::new(event as *const _ as *mut _).unwrap(),
+            prev: Cell::new(None),
+            next: Cell::new(None),
+            tail: Cell::new(None),
+        };
+
         let mut spin: usize = 0;
         let mut state = self.state.load(Ordering::Relaxed);
 
@@ -104,23 +93,16 @@ impl<Event: AutoResetEvent, T> Lock<Event, T> {
                 continue;
             }
 
-            if let Some(init_event) = init_event.take() {
-                node.event.set(MaybeUninit::new(init_event()));
-            }
-
-            node.prev.set(MaybeUninit::new(None));
-            node.next.set(MaybeUninit::new(head));
-            node.tail.set(MaybeUninit::new(
-                if head.is_none() {
-                    NonNull::new(node as *const _ as *mut _)
-                } else {
-                    None
-                }
-            ));
+            node.prev.set(None);
+            node.next.set(head);
+            node.tail.set(match head {
+                Some(_) => None,
+                None => NonNull::new(&node as *const _ as *mut _),
+            });
 
             if let Err(e) = self.state.compare_exchange_weak(
                 state,
-                (node as *const _ as usize) | (state & !QUEUE_MASK),
+                (&node as *const _ as usize) | (state & !QUEUE_MASK),
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
@@ -128,9 +110,8 @@ impl<Event: AutoResetEvent, T> Lock<Event, T> {
                 continue;
             }
 
-            node.event().wait();
+            event.wait();
             spin = 0;
-            node.prev.set(MaybeUninit::new(None));
             state = self.state.load(Ordering::Relaxed);
         }
     }
@@ -167,17 +148,16 @@ impl<Event: AutoResetEvent, T> Lock<Event, T> {
                 let tail = {
                     let mut current = head;
                     loop {
-                        match current.tail.get().assume_init() {
+                        match current.tail.get() {
                             Some(tail) => {
-                                head.tail.set(MaybeUninit::new(Some(tail)));
+                                head.tail.set(Some(tail));
                                 break &*tail.as_ptr();
                             },
                             None => {
-                                let next = current.next.get().assume_init();
+                                let next = current.next.get();
                                 let next = next.unwrap_or_else(|| unreachable_unchecked());
                                 let next = &*next.as_ptr();
-                                let current_ptr = NonNull::new(current as *const _ as *mut _);
-                                next.prev.set(MaybeUninit::new(current_ptr));
+                                next.prev.set(NonNull::new(current as *const _ as *mut _));
                                 current = next;
                             },
                         }
@@ -198,9 +178,9 @@ impl<Event: AutoResetEvent, T> Lock<Event, T> {
                     continue;
                 }
 
-                match tail.prev.get().assume_init() {
+                match tail.prev.get() {
                     Some(new_tail) => {
-                        head.tail.set(MaybeUninit::new(Some(new_tail)));
+                        head.tail.set(Some(new_tail));
                         self.state.fetch_and(!QUEUE_LOCK, Ordering::Release);
                     },
                     None => loop {
@@ -215,12 +195,12 @@ impl<Event: AutoResetEvent, T> Lock<Event, T> {
                         }
                         if state & QUEUE_MASK != 0 {
                             fence(Ordering::Acquire);
-                            continue;
+                            continue 'outer;
                         }
                     },
                 }
 
-                tail.event().set();
+                (&*tail.event.as_ptr()).set();
                 return;
             }
         }
