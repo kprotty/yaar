@@ -1,11 +1,7 @@
-use crate::parker::{
-    Parker,
-    ParkResult,
-    AutoResetEvent,
-};
+use crate::parker::{AutoResetEvent, ParkResult, Parker};
 use core::{
+    sync::atomic::{AtomicUsize, Ordering},
     task::Poll,
-    sync::atomic::{Ordering, AtomicUsize},
 };
 
 const LOCKED: usize = 1 << 0;
@@ -53,10 +49,7 @@ impl<Event: AutoResetEvent> RawMutex<Event> {
             .is_ok()
     }
 
-    pub async unsafe fn lock_slow(
-        &self,
-        park: impl Fn(&Event) -> Poll<bool>,
-    ) -> bool {
+    pub async unsafe fn lock_slow(&self, park: impl Fn(&Event) -> Poll<bool>) -> bool {
         let mut spin: usize = 0;
         let mut state = self.state.load(Ordering::Relaxed);
 
@@ -105,15 +98,15 @@ impl<Event: AutoResetEvent> RawMutex<Event> {
                 }
             };
 
-            match self.parker.park(
-                |event| park(event),
-                validate,
-                timed_out,
-            ).await {
+            match self
+                .parker
+                .park(|event| park(event), validate, timed_out)
+                .await
+            {
                 ParkResult::Unparked(HANDOFF_TOKEN) => return true,
-                ParkResult::Unparked(_) => {},
-                ParkResult::Cancelled(_) => return false, 
-                ParkResult::Unprepared => {},
+                ParkResult::Unparked(_) => {}
+                ParkResult::Cancelled(_) => return false,
+                ParkResult::Unprepared => {}
             }
 
             spin = 0;
@@ -121,11 +114,7 @@ impl<Event: AutoResetEvent> RawMutex<Event> {
         }
     }
 
-    pub unsafe fn unlock(
-        &self,
-        be_fair: bool,
-        unpark: impl Fn(&Event),
-    ) {
+    pub unsafe fn unlock(&self, be_fair: bool, unpark: impl Fn(&Event)) {
         self.parker.unpark_one(unpark, |ctx, token| {
             if ctx.unparked > 0 && be_fair {
                 *token = HANDOFF_TOKEN;
@@ -138,4 +127,4 @@ impl<Event: AutoResetEvent> RawMutex<Event> {
             }
         })
     }
-} 
+}

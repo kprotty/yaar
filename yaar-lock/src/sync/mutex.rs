@@ -1,13 +1,13 @@
 use crate::{
-    parker::{AutoResetEvent},
+    parker::AutoResetEvent,
     shared::{poll_sync, RawMutex},
 };
 use core::{
-    fmt,
-    ptr::NonNull,
-    mem::forget,
     cell::UnsafeCell,
+    fmt,
+    mem::forget,
     ops::{Deref, DerefMut},
+    ptr::NonNull,
     task::Poll,
 };
 
@@ -18,7 +18,7 @@ struct BlockingMutex<E> {
 impl<E> BlockingMutex<E> {
     pub const fn new() -> Self {
         Self {
-            raw: RawMutex::new()
+            raw: RawMutex::new(),
         }
     }
 }
@@ -84,7 +84,7 @@ impl<E: AutoResetEvent, T> GenericMutex<E, T> {
     #[inline]
     pub fn try_lock(&self) -> Option<GenericMutexGuard<'_, E, T>> {
         if self.blocking.try_lock() {
-            Some(GenericMutexGuard{ mutex: self })
+            Some(GenericMutexGuard { mutex: self })
         } else {
             None
         }
@@ -93,7 +93,7 @@ impl<E: AutoResetEvent, T> GenericMutex<E, T> {
     #[inline]
     pub fn lock(&self) -> GenericMutexGuard<'_, E, T> {
         unsafe { self.blocking.lock() };
-        GenericMutexGuard{ mutex: self }
+        GenericMutexGuard { mutex: self }
     }
 
     #[inline]
@@ -110,14 +110,8 @@ impl<E: AutoResetEvent, T> GenericMutex<E, T> {
 impl<E: AutoResetEvent, T: fmt::Debug> fmt::Debug for GenericMutex<E, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.try_lock() {
-            Some(guard) => f
-                .debug_struct("Mutex")
-                .field("data", &&*guard)
-                .finish(),
-            None => f
-                .debug_struct("Mutex")
-                .field("data", &"<locked>")
-                .finish()
+            Some(guard) => f.debug_struct("Mutex").field("data", &&*guard).finish(),
+            None => f.debug_struct("Mutex").field("data", &"<locked>").finish(),
         }
     }
 }

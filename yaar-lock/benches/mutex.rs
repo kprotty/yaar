@@ -116,7 +116,7 @@ mod pthread {
 mod posix_lock {
     use std::{
         cell::UnsafeCell,
-        sync::atomic::{spin_loop_hint, Ordering, AtomicBool},
+        sync::atomic::{spin_loop_hint, AtomicBool, Ordering},
     };
 
     pub struct Mutex<T> {
@@ -159,7 +159,11 @@ mod posix_lock {
             let mut spin = 4;
             loop {
                 if !self.locked.load(Ordering::Relaxed) {
-                    if self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    if self
+                        .locked
+                        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                    {
                         return;
                     }
                 }
@@ -326,7 +330,7 @@ mod ntlock {
 mod spinlock {
     use std::{
         cell::UnsafeCell,
-        sync::atomic::{spin_loop_hint, Ordering, AtomicBool},
+        sync::atomic::{spin_loop_hint, AtomicBool, Ordering},
     };
 
     pub struct Mutex<T> {
@@ -369,7 +373,11 @@ mod spinlock {
             let mut spin = 0;
             loop {
                 if !self.locked.load(Ordering::Relaxed) {
-                    if self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    if self
+                        .locked
+                        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                    {
                         return;
                     }
                 }
@@ -496,7 +504,8 @@ fn run_all(
         test_iterations,
     );
 
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         run_benchmark_iterations::<pthread::Mutex<f64>>(
             num_threads,
             work_per_critical_section,

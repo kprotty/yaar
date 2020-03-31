@@ -1,4 +1,7 @@
-use core::{fmt, ops::{Deref, DerefMut}};
+use core::{
+    fmt,
+    ops::{Deref, DerefMut},
+};
 
 #[cfg_attr(target_arch = "x86_64", repr(align(128)))]
 #[cfg_attr(not(target_arch = "x86_64"), repr(align(64)))]

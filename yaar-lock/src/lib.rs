@@ -1,8 +1,8 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(feature = "nightly", feature(doc_cfg))]
 
-pub mod utils;
 pub mod parker;
+pub mod utils;
 
 pub(crate) mod shared;
 

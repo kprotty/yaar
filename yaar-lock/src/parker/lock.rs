@@ -1,10 +1,10 @@
 use super::AutoResetEvent;
 use core::{
-    ptr::NonNull,
-    marker::PhantomData,
     cell::{Cell, UnsafeCell},
     hint::unreachable_unchecked,
-    sync::atomic::{fence, Ordering, AtomicUsize},
+    marker::PhantomData,
+    ptr::NonNull,
+    sync::atomic::{fence, AtomicUsize, Ordering},
 };
 
 #[repr(align(4))]
@@ -36,15 +36,9 @@ impl<Event, T> Lock<Event, T> {
 }
 
 impl<Event: AutoResetEvent, T> Lock<Event, T> {
-    pub fn locked<R>(
-        &self,
-        event: &Event,
-        critical_section: impl FnOnce(&mut T) -> R,
-    ) -> R {
+    pub fn locked<R>(&self, event: &Event, critical_section: impl FnOnce(&mut T) -> R) -> R {
         self.lock(event);
-        let result = critical_section(unsafe {
-            &mut *self.value.get()
-        });
+        let result = critical_section(unsafe { &mut *self.value.get() });
         self.unlock();
         result
     }
@@ -152,14 +146,14 @@ impl<Event: AutoResetEvent, T> Lock<Event, T> {
                             Some(tail) => {
                                 head.tail.set(Some(tail));
                                 break &*tail.as_ptr();
-                            },
+                            }
                             None => {
                                 let next = current.next.get();
                                 let next = next.unwrap_or_else(|| unreachable_unchecked());
                                 let next = &*next.as_ptr();
                                 next.prev.set(NonNull::new(current as *const _ as *mut _));
                                 current = next;
-                            },
+                            }
                         }
                     }
                 };
@@ -182,7 +176,7 @@ impl<Event: AutoResetEvent, T> Lock<Event, T> {
                     Some(new_tail) => {
                         head.tail.set(Some(new_tail));
                         self.state.fetch_and(!QUEUE_LOCK, Ordering::Release);
-                    },
+                    }
                     None => loop {
                         match self.state.compare_exchange_weak(
                             state,

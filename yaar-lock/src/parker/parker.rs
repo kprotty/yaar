@@ -1,13 +1,13 @@
-use super::{Lock, AutoResetEvent};
+use super::{AutoResetEvent, Lock};
 use core::{
-    pin::Pin,
     cell::Cell,
-    ptr::NonNull,
-    mem::MaybeUninit,
     future::Future,
     marker::PhantomPinned,
-    task::{Poll, Waker, Context},
-    sync::atomic::{Ordering, AtomicUsize},
+    mem::MaybeUninit,
+    pin::Pin,
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::{Context, Poll, Waker},
 };
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -47,14 +47,13 @@ impl<Event: AutoResetEvent> Parker<Event> {
         &self,
         wait: impl FnOnce(&Event) -> Poll<bool>,
         prepare: impl FnOnce() -> Result<usize, ()>,
-        cancel: impl FnOnce(usize, bool), 
+        cancel: impl FnOnce(usize, bool),
     ) -> ParkResult {
         let future = ParkFuture::new(self, wait, cancel);
         let node = &future.node;
 
-        match self.queue.locked(
-            &node.event,
-            |head| prepare().map(|token| {
+        match self.queue.locked(&node.event, |head| {
+            prepare().map(|token| {
                 let node_ptr = NonNull::new(node as *const _ as *mut _);
                 node.next.set(*head);
                 node.prev.set(None);
@@ -67,8 +66,8 @@ impl<Event: AutoResetEvent> Parker<Event> {
                 });
                 node.token.set(token);
                 *head = node_ptr;
-            }),
-        ) {
+            })
+        }) {
             Ok(_) => future.await,
             Err(_) => ParkResult::Unprepared,
         }
@@ -95,42 +94,39 @@ impl<Event: AutoResetEvent> Parker<Event> {
         mut notify: impl FnMut(&Event),
         mut filter: impl FnMut(&UnparkContext, &mut usize) -> UnparkResult,
     ) {
-        let notify_list = self.queue.locked(
-            &Event::default(),
-            |head| {
-                let mut current = *head;
-                let mut notify_list = UnparkList::new();
-                let mut context = UnparkContext {
-                    has_more: true,
-                    unparked: 0,
-                };
+        let notify_list = self.queue.locked(&Event::default(), |head| {
+            let mut current = *head;
+            let mut notify_list = UnparkList::new();
+            let mut context = UnparkContext {
+                has_more: true,
+                unparked: 0,
+            };
 
-                while let Some(node) = current {
-                    let node = &*node.as_ptr();
-                    current = node.prev.get();
-                    context.has_more = current.is_some();
+            while let Some(node) = current {
+                let node = &*node.as_ptr();
+                current = node.prev.get();
+                context.has_more = current.is_some();
 
-                    match filter(&context, &mut *node.token.as_ptr()) {
-                        UnparkResult::Stop => break,
-                        UnparkResult::Skip => {},
-                        UnparkResult::Unpark => {
-                            Self::remove(head, node).unwrap();
-                            context.unparked += 1;
-                            if let ParkState::Waiting = ParkState::from(node.state.swap(
-                                ParkState::Unparked as usize,
-                                Ordering::Acquire,
-                            )) {
-                                let ptr = node as *const _ as *mut _;
-                                notify_list.push(NonNull::new_unchecked(ptr));
-                            }
-                        },
+                match filter(&context, &mut *node.token.as_ptr()) {
+                    UnparkResult::Stop => break,
+                    UnparkResult::Skip => {}
+                    UnparkResult::Unpark => {
+                        Self::remove(head, node).unwrap();
+                        context.unparked += 1;
+                        if let ParkState::Waiting = ParkState::from(
+                            node.state
+                                .swap(ParkState::Unparked as usize, Ordering::Acquire),
+                        ) {
+                            let ptr = node as *const _ as *mut _;
+                            notify_list.push(NonNull::new_unchecked(ptr));
+                        }
                     }
                 }
+            }
 
-                notify_list
-            },
-        );
-        
+            notify_list
+        });
+
         for node in notify_list.iter() {
             let node = &*node.as_ptr();
             notify(&node.event);
@@ -140,7 +136,7 @@ impl<Event: AutoResetEvent> Parker<Event> {
         }
     }
 
-    pub(in self) unsafe fn remove(
+    pub(self) unsafe fn remove(
         head: &mut Option<NonNull<ParkNode<Event>>>,
         node: &ParkNode<Event>,
     ) -> Result<bool, ()> {
@@ -166,7 +162,7 @@ impl<Event: AutoResetEvent> Parker<Event> {
                 (&*head_node.as_ptr()).tail.set(prev);
             }
         }
-        
+
         let was_last = (*head).is_none();
         Ok(was_last)
     }
@@ -203,7 +199,7 @@ struct ParkNode<Event> {
     tail: Cell<Option<NonNull<Self>>>,
 }
 
-struct ParkFuture<'a, Event, WaitFn, CancelFn> 
+struct ParkFuture<'a, Event, WaitFn, CancelFn>
 where
     Event: AutoResetEvent,
     WaitFn: FnOnce(&Event) -> Poll<bool>,
@@ -221,11 +217,7 @@ where
     WaitFn: FnOnce(&Event) -> Poll<bool>,
     CancelFn: FnOnce(usize, bool),
 {
-    pub fn new(
-        parker: &'a Parker<Event>,
-        wait_fn: WaitFn,
-        cancel_fn: CancelFn,
-    ) -> Self {
+    pub fn new(parker: &'a Parker<Event>, wait_fn: WaitFn, cancel_fn: CancelFn) -> Self {
         Self {
             node: ParkNode {
                 _pin: PhantomPinned,
@@ -253,16 +245,13 @@ where
     fn drop(&mut self) {
         let state = self.node.state.load(Ordering::Relaxed);
         if ParkState::from(state) == ParkState::Waiting {
-            self.parker.queue.locked(
-                &self.node.event,
-                |head| unsafe {
-                    if let Ok(was_last) = Parker::remove(head, &self.node) {
-                        if let Some(cancel) = self.cancel_fn.replace(None) {
-                            cancel(self.node.token.get(), was_last);
-                        }
+            self.parker.queue.locked(&self.node.event, |head| unsafe {
+                if let Ok(was_last) = Parker::remove(head, &self.node) {
+                    if let Some(cancel) = self.cancel_fn.replace(None) {
+                        cancel(self.node.token.get(), was_last);
                     }
-                },
-            );
+                }
+            });
         }
     }
 }
@@ -283,13 +272,11 @@ where
             match ParkState::from(state) {
                 ParkState::Waiting => match this.wait_fn.replace(None) {
                     Some(wait) => match wait(&this.node.event) {
-                        Poll::Pending | 
-                        Poll::Ready(true) => {
+                        Poll::Pending | Poll::Ready(true) => {
                             state = this.node.state.load(Ordering::Relaxed);
-                        },
-                        Poll::Ready(false) => this.parker.queue.locked(
-                            &this.node.event,
-                            |head| unsafe {
+                        }
+                        Poll::Ready(false) => {
+                            this.parker.queue.locked(&this.node.event, |head| unsafe {
                                 if let Ok(was_last) = Parker::remove(head, &this.node) {
                                     if let Some(cancel) = this.cancel_fn.replace(None) {
                                         cancel(this.node.token.get(), was_last);
@@ -299,14 +286,14 @@ where
                                 } else {
                                     state = this.node.state.load(Ordering::Relaxed);
                                 }
-                            },
-                        ),
+                            })
+                        }
                     },
                     None => match this.node.state.compare_exchange_weak(
                         state,
                         ParkState::Updating as usize,
                         Ordering::Relaxed,
-                        Ordering::Relaxed,  
+                        Ordering::Relaxed,
                     ) {
                         Err(e) => state = e,
                         Ok(_) => {
@@ -327,20 +314,20 @@ where
                             } else {
                                 this.node.waker.replace(None);
                             }
-                        },
+                        }
                     },
                 },
                 ParkState::Updating => {
                     unreachable!("ParkFuture being polled in parallel");
-                },
+                }
                 ParkState::Unparked => {
                     let token = this.node.token.get();
                     return Poll::Ready(ParkResult::Unparked(token));
-                },
+                }
                 ParkState::Cancelled => {
                     let token = this.node.token.get();
                     return Poll::Ready(ParkResult::Cancelled(token));
-                },
+                }
             }
         }
     }
