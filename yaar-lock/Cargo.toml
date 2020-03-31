@@ -19,11 +19,10 @@ full = ["os", "sync", "future"]
 
 # Main features for yaar-lock
 os = []
-sync = ["lock_api"]
+sync = []
 future = ["futures-core"]
 
 [dependencies]
-lock_api = { version = "0.3", optional = true, default-features = false }
 futures-core = { version = "0.3", optional = true, default-features = false }
 
 [package.metadata.docs.rs]

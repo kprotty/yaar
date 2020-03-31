@@ -19,14 +19,16 @@ pub struct RawMutex<Event> {
     parker: Parker<Event>,
 }
 
-impl<Event: AutoResetEvent + Default> RawMutex<Event> {
-    pub fn new() -> Self {
+impl<Event> RawMutex<Event> {
+    pub const fn new() -> Self {
         Self {
             state: AtomicUsize::new(0),
             parker: Parker::new(),
         }
     }
+}
 
+impl<Event: AutoResetEvent> RawMutex<Event> {
     pub fn try_lock(&self) -> bool {
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
@@ -104,7 +106,7 @@ impl<Event: AutoResetEvent + Default> RawMutex<Event> {
             };
 
             match self.parker.park(
-                park,
+                |event| park(event),
                 validate,
                 timed_out,
             ).await {

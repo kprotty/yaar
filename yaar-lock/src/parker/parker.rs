@@ -77,7 +77,7 @@ impl<Event: AutoResetEvent> Parker<Event> {
     pub unsafe fn unpark_one(
         &self,
         notify: impl FnMut(&Event),
-        callback: impl FnMut(&UnparkContext, &mut usize),
+        mut callback: impl FnMut(&UnparkContext, &mut usize),
     ) {
         let mut has_unparked = false;
         self.unpark(notify, |context, token| {
@@ -92,13 +92,13 @@ impl<Event: AutoResetEvent> Parker<Event> {
 
     pub unsafe fn unpark(
         &self,
-        notify: impl FnMut(&Event),
-        filter: impl FnMut(&UnparkContext, &mut usize) -> UnparkResult,
+        mut notify: impl FnMut(&Event),
+        mut filter: impl FnMut(&UnparkContext, &mut usize) -> UnparkResult,
     ) {
         let notify_list = self.queue.locked(
             &Event::default(),
             |head| {
-                let mut current = head;
+                let mut current = *head;
                 let mut notify_list = UnparkList::new();
                 let mut context = UnparkContext {
                     has_more: true,
@@ -107,14 +107,14 @@ impl<Event: AutoResetEvent> Parker<Event> {
 
                 while let Some(node) = current {
                     let node = &*node.as_ptr();
-                    *current = node.prev.get();
+                    current = node.prev.get();
                     context.has_more = current.is_some();
 
                     match filter(&context, &mut *node.token.as_ptr()) {
                         UnparkResult::Stop => break,
                         UnparkResult::Skip => {},
                         UnparkResult::Unpark => {
-                            Self::remove(head, node);
+                            Self::remove(head, node).unwrap();
                             context.unparked += 1;
                             if let ParkState::Waiting = ParkState::from(node.state.swap(
                                 ParkState::Unparked as usize,
@@ -140,7 +140,7 @@ impl<Event: AutoResetEvent> Parker<Event> {
         }
     }
 
-    pub(super) unsafe fn remove(
+    pub(in self) unsafe fn remove(
         head: &mut Option<NonNull<ParkNode<Event>>>,
         node: &ParkNode<Event>,
     ) -> Result<bool, ()> {
@@ -221,7 +221,7 @@ where
     WaitFn: FnOnce(&Event) -> Poll<bool>,
     CancelFn: FnOnce(usize, bool),
 {
-    pub const fn new(
+    pub fn new(
         parker: &'a Parker<Event>,
         wait_fn: WaitFn,
         cancel_fn: CancelFn,
@@ -255,7 +255,7 @@ where
         if ParkState::from(state) == ParkState::Waiting {
             self.parker.queue.locked(
                 &self.node.event,
-                |head| {
+                |head| unsafe {
                     if let Ok(was_last) = Parker::remove(head, &self.node) {
                         if let Some(cancel) = self.cancel_fn.replace(None) {
                             cancel(self.node.token.get(), was_last);
@@ -289,7 +289,7 @@ where
                         },
                         Poll::Ready(false) => this.parker.queue.locked(
                             &this.node.event,
-                            |head| {
+                            |head| unsafe {
                                 if let Ok(was_last) = Parker::remove(head, &this.node) {
                                     if let Some(cancel) = this.cancel_fn.replace(None) {
                                         cancel(this.node.token.get(), was_last);
@@ -354,7 +354,7 @@ struct UnparkList<Event> {
 }
 
 impl<Event> UnparkList<Event> {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             overflow_head: None,
             overflow_tail: None,
