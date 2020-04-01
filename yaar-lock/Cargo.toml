@@ -18,12 +18,12 @@ nightly = []
 full = ["os", "sync", "future"]
 
 # Main features for yaar-lock
-os = []
+os = ["yaar-sys"]
 sync = []
-future = ["futures-core"]
+future = []
 
 [dependencies]
-futures-core = { version = "0.3", optional = true, default-features = false }
+yaar-sys = { path = "../yaar-sys", optional = true }
 
 [package.metadata.docs.rs]
 features = ["full", "nightly"]

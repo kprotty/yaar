@@ -1,6 +1,7 @@
 use super::{AutoResetEvent, Lock};
 use core::{
     cell::Cell,
+    fmt,
     future::Future,
     marker::PhantomPinned,
     mem::MaybeUninit,
@@ -10,28 +11,35 @@ use core::{
     task::{Context, Poll, Waker},
 };
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 pub enum ParkResult {
     Unprepared,
     Unparked(usize),
     Cancelled(usize),
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 pub enum UnparkResult {
     Stop,
     Skip,
     Unpark,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash)]
 pub struct UnparkContext {
     pub has_more: bool,
     pub unparked: usize,
+    pub skipped: usize,
 }
 
 pub struct Parker<Event> {
     queue: Lock<Event, Option<NonNull<ParkNode<Event>>>>,
+}
+
+impl<Event> fmt::Debug for Parker<Event> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Parker").finish()
+    }
 }
 
 impl<Event> Parker<Event> {
@@ -45,8 +53,8 @@ impl<Event> Parker<Event> {
 impl<Event: AutoResetEvent> Parker<Event> {
     pub async unsafe fn park(
         &self,
-        wait: impl FnOnce(&Event) -> Poll<bool>,
         prepare: impl FnOnce() -> Result<usize, ()>,
+        wait: impl FnOnce(&Event) -> Poll<bool>,
         cancel: impl FnOnce(usize, bool),
     ) -> ParkResult {
         let future = ParkFuture::new(self, wait, cancel);
@@ -75,48 +83,58 @@ impl<Event: AutoResetEvent> Parker<Event> {
 
     pub unsafe fn unpark_one(
         &self,
+        mut modify: impl FnMut(&UnparkContext, &mut usize),
+        before_notify: impl FnOnce(&UnparkContext),
         notify: impl FnMut(&Event),
-        mut callback: impl FnMut(&UnparkContext, &mut usize),
     ) {
-        let mut has_unparked = false;
-        self.unpark(notify, |context, token| {
-            if core::mem::replace(&mut has_unparked, false) {
-                callback(context, token);
-                UnparkResult::Unpark
-            } else {
-                UnparkResult::Stop
-            }
-        })
+        let mut should_unpark = true;
+        self.unpark(
+            |context, token| {
+                if core::mem::replace(&mut should_unpark, false) {
+                    modify(context, token);
+                    UnparkResult::Unpark
+                } else {
+                    UnparkResult::Stop
+                }
+            },
+            before_notify,
+            notify,
+        );
     }
 
     pub unsafe fn unpark(
         &self,
-        mut notify: impl FnMut(&Event),
         mut filter: impl FnMut(&UnparkContext, &mut usize) -> UnparkResult,
+        before_notify: impl FnOnce(&UnparkContext),
+        mut notify: impl FnMut(&Event),
     ) {
-        let notify_list = self.queue.locked(&Event::default(), |head| {
-            let mut current = *head;
+        let (mut context, notify_list) = self.queue.locked(&Event::default(), |head| {
             let mut notify_list = UnparkList::new();
             let mut context = UnparkContext {
                 has_more: true,
                 unparked: 0,
+                skipped: 0,
             };
+
+            let mut current = (*head)
+                .map(|p| &*p.as_ptr())
+                .and_then(|p| p.tail.get());
 
             while let Some(node) = current {
                 let node = &*node.as_ptr();
                 current = node.prev.get();
                 context.has_more = current.is_some();
-
+                
                 match filter(&context, &mut *node.token.as_ptr()) {
                     UnparkResult::Stop => break,
-                    UnparkResult::Skip => {}
+                    UnparkResult::Skip => context.skipped += 1,
                     UnparkResult::Unpark => {
                         Self::remove(head, node).unwrap();
                         context.unparked += 1;
-                        if let ParkState::Waiting = ParkState::from(
-                            node.state
-                                .swap(ParkState::Unparked as usize, Ordering::Acquire),
-                        ) {
+                        if let ParkState::Waiting = ParkState::from({
+                            let new_state = ParkState::Unparked as usize;
+                            node.state.swap(new_state, Ordering::Acquire)
+                        }) {
                             let ptr = node as *const _ as *mut _;
                             notify_list.push(NonNull::new_unchecked(ptr));
                         }
@@ -124,8 +142,11 @@ impl<Event: AutoResetEvent> Parker<Event> {
                 }
             }
 
-            notify_list
+            (context, notify_list)
         });
+
+        context.has_more = context.has_more || (context.skipped > 0);
+        before_notify(&context);
 
         for node in notify_list.iter() {
             let node = &*node.as_ptr();
@@ -136,35 +157,11 @@ impl<Event: AutoResetEvent> Parker<Event> {
         }
     }
 
-    pub(self) unsafe fn remove(
+    unsafe fn remove(
         head: &mut Option<NonNull<ParkNode<Event>>>,
         node: &ParkNode<Event>,
     ) -> Result<bool, ()> {
-        let tail = node.tail.replace(None);
-        if tail.is_none() {
-            return Err(());
-        }
-
-        let prev = node.prev.get();
-        let next = node.next.get();
-        if let Some(prev) = prev {
-            (&*prev.as_ptr()).next.set(next);
-        }
-        if let Some(next) = next {
-            (&*next.as_ptr()).prev.set(prev);
-        }
-
-        if let Some(head_node) = *head {
-            let node_ptr = NonNull::new_unchecked(node as *const _ as *mut _);
-            if head_node == node_ptr {
-                *head = next;
-            } else if tail == Some(node_ptr) {
-                (&*head_node.as_ptr()).tail.set(prev);
-            }
-        }
-
-        let was_last = (*head).is_none();
-        Ok(was_last)
+        
     }
 }
 
@@ -217,7 +214,7 @@ where
     WaitFn: FnOnce(&Event) -> Poll<bool>,
     CancelFn: FnOnce(usize, bool),
 {
-    pub fn new(parker: &'a Parker<Event>, wait_fn: WaitFn, cancel_fn: CancelFn) -> Self {
+    fn new(parker: &'a Parker<Event>, wait_fn: WaitFn, cancel_fn: CancelFn) -> Self {
         Self {
             node: ParkNode {
                 _pin: PhantomPinned,
@@ -341,7 +338,7 @@ struct UnparkList<Event> {
 }
 
 impl<Event> UnparkList<Event> {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             overflow_head: None,
             overflow_tail: None,
@@ -350,7 +347,7 @@ impl<Event> UnparkList<Event> {
         }
     }
 
-    pub fn push(&mut self, node: NonNull<ParkNode<Event>>) {
+    fn push(&mut self, node: NonNull<ParkNode<Event>>) {
         if self.array_size < self.array.len() {
             self.array[self.array_size] = MaybeUninit::new(node);
             self.array_size += 1;
@@ -368,7 +365,7 @@ impl<Event> UnparkList<Event> {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = NonNull<ParkNode<Event>>> + '_ {
+    fn iter(&self) -> impl Iterator<Item = NonNull<ParkNode<Event>>> + '_ {
         struct NodeIter<'a, Event> {
             array_pos: usize,
             list: &'a UnparkList<Event>,

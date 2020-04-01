@@ -5,7 +5,7 @@ edition = "2018"
 authors = ["kprotty"]
 
 [features]
-mutex = ["sync", "libc"]
+sync_mutex = ["sync", "libc"]
 sync = ["yaar-lock", "parking_lot"]
 
 [target.'cfg(unix)'.dependencies]
@@ -17,6 +17,6 @@ parking_lot = { version = "0.10", optional = true }
 yaar-lock = { path = "../", features = ["full"], optional = true }
 
 [[bin]]
-name = "mutex"
-path = "./mutex.rs"
-required-features = ["mutex"]
+name = "sync_mutex"
+path = "./sync/mutex.rs"
+required-features = ["sync_mutex"]

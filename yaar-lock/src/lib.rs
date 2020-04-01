@@ -1,4 +1,4 @@
-#![cfg_attr(not(test), no_std)]
+//#![cfg_attr(not(test), no_std)]
 #![cfg_attr(feature = "nightly", feature(doc_cfg))]
 
 pub mod parker;

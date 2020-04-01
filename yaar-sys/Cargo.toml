@@ -1,0 +1,8 @@
+[package]
+name = "yaar-sys"
+version = "0.1.0"
+authors = ["kprotty"]
+edition = "2018"
+description = """
+System definitions for platforms supported by the yaar crate ecosystem
+"""

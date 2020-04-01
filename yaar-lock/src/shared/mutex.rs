@@ -67,13 +67,13 @@ impl<Event: AutoResetEvent> RawMutex<Event> {
                 continue;
             }
 
-            if (state & PARKED == 0) && !Event::yield_now(spin) {
-                spin = spin.wrapping_add(1);
-                state = self.state.load(Ordering::Relaxed);
-                continue;
-            }
-
             if state & PARKED == 0 {
+                if !Event::yield_now(spin) {
+                    spin = spin.wrapping_add(1);
+                    state = self.state.load(Ordering::Relaxed);
+                    continue;
+                }
+
                 if let Err(e) = self.state.compare_exchange_weak(
                     state,
                     state | PARKED,
@@ -85,24 +85,23 @@ impl<Event: AutoResetEvent> RawMutex<Event> {
                 }
             }
 
-            let validate = || {
-                if self.state.load(Ordering::Relaxed) == (LOCKED | PARKED) {
-                    Ok(DEFAULT_TOKEN)
-                } else {
-                    Err(())
-                }
-            };
-            let timed_out = |_token, was_last| {
-                if was_last {
-                    self.state.fetch_and(!PARKED, Ordering::Relaxed);
-                }
-            };
-
-            match self
-                .parker
-                .park(|event| park(event), validate, timed_out)
-                .await
-            {
+            match self.parker.park(
+                || {
+                    if self.state.load(Ordering::Relaxed) == (LOCKED | PARKED) {
+                        Ok(DEFAULT_TOKEN)
+                    } else {
+                        Err(())
+                    }
+                },
+                |event| {
+                    park(event)
+                },
+                |_token, was_last| {
+                    if was_last {
+                        self.state.fetch_and(!PARKED, Ordering::Relaxed);
+                    }
+                },
+            ).await {
                 ParkResult::Unparked(HANDOFF_TOKEN) => return true,
                 ParkResult::Unparked(_) => {}
                 ParkResult::Cancelled(_) => return false,
@@ -115,16 +114,23 @@ impl<Event: AutoResetEvent> RawMutex<Event> {
     }
 
     pub unsafe fn unlock(&self, be_fair: bool, unpark: impl Fn(&Event)) {
-        self.parker.unpark_one(unpark, |ctx, token| {
-            if ctx.unparked > 0 && be_fair {
-                *token = HANDOFF_TOKEN;
-                if !ctx.has_more {
-                    self.state.store(LOCKED, Ordering::Relaxed);
+        self.parker.unpark_one(
+            |_ctx, token| {
+                *token = if be_fair { HANDOFF_TOKEN } else { DEFAULT_TOKEN };
+            },
+            |ctx| {
+                if ctx.unparked > 0 && be_fair {
+                    if !ctx.has_more {
+                        self.state.store(LOCKED, Ordering::Release);
+                    }
+                } else {
+                    let new_state = if ctx.has_more { PARKED } else { 0 };
+                    self.state.store(new_state, Ordering::Release);
                 }
-            } else {
-                let new_state = if ctx.has_more { PARKED } else { 0 };
-                self.state.store(new_state, Ordering::Release);
-            }
-        })
+            },
+            |event| {
+                unpark(event);
+            },
+        );
     }
 }

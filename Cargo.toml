@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "yaar",
+    "yaar-sys",
     "yaar-lock",
     "yaar-reactor",
     "yaar-lock/benches",
