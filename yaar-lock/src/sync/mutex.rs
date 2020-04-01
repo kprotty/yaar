@@ -1,6 +1,6 @@
 use crate::{
-    parker::{AutoResetEvent, AutoResetEventTimed},
     shared::{poll_sync, RawMutex},
+    parker::{AutoResetEvent, AutoResetEventTimed},
 };
 use core::{
     cell::UnsafeCell,
@@ -9,6 +9,7 @@ use core::{
     ops::{Deref, DerefMut},
     ptr::NonNull,
     task::Poll,
+    hint::unreachable_unchecked,
 };
 
 #[cfg(feature = "os")]
@@ -39,45 +40,46 @@ impl<E> BlockingMutex<E> {
 }
 
 impl<E: AutoResetEvent> BlockingMutex<E> {
-    #[inline]
-    pub fn try_lock(&self) -> bool {
+    fn try_lock(&self) -> bool {
         self.raw.try_lock()
     }
 
-    #[inline]
-    pub unsafe fn unlock(&self, be_fair: bool) {
+    unsafe fn lock(&self) {
+        let acquired = self.acquire(|event| {
+            event.wait();
+            true
+        });
+        debug_assert!(acquired);
+    }
+
+    unsafe fn unlock(&self, be_fair: bool) {
         self.raw.unlock(be_fair, |event| event.set());
     }
 
-    #[inline]
-    pub unsafe fn lock(&self) {
-        if !self.raw.lock_fast() {
-            self.lock_slow();
-        }
+    unsafe fn acquire(&self, park: impl FnOnce(&E) -> bool) -> bool {
+        self.raw.lock_fast() || self.acquire_slow(park)
     }
 
     #[cold]
-    unsafe fn lock_slow(&self) {
-        let locked = poll_sync(self.raw.lock_slow(|event| {
-            event.wait();
-            Poll::Ready(true)
-        }));
-        debug_assert!(locked);
+    unsafe fn acquire_slow(&self, park: impl FnOnce(&E) -> bool) -> bool {
+        let mut park = Some(park);
+        poll_sync(self.raw.lock_slow(|event| Poll::Ready(
+            park.take()
+                .unwrap_or_else(|| unreachable_unchecked())
+                (event)
+        )))
     }
 }
 
 impl<E: AutoResetEventTimed> BlockingMutex<E> {
     #[inline]
-    pub unsafe fn try_lock_for(&self, timeout: <E as AutoResetEventTimed>::Duration) -> bool {
-        self.raw.lock_fast() || self.try_lock_for_slow(timeout)
+    pub unsafe fn try_lock_for(&self, timeout: E::Duration) -> bool {
+        self.acquire(|event| event.try_wait_for(timeout))
     }
 
-    #[cold]
-    unsafe fn try_lock_for_slow(&self, timeout: <E as AutoResetEventTimed>::Duration) -> bool {
-        poll_sync(
-            self.raw
-                .lock_slow(|event| Poll::Ready(event.try_wait(timeout.clone()))),
-        )
+    #[inline]
+    pub unsafe fn try_lock_until(&self, timeout: E::Instant) -> bool {
+        self.acquire(|event| event.try_wait_until(timeout))
     }
 }
 
@@ -141,7 +143,7 @@ impl<E: AutoResetEvent, T> GenericMutex<E, T> {
 
     #[inline]
     pub unsafe fn force_unlock_fair(&self) {
-        self.blocking.unlock(false)
+        self.blocking.unlock(true)
     }
 }
 
@@ -149,10 +151,24 @@ impl<E: AutoResetEventTimed, T> GenericMutex<E, T> {
     #[inline]
     pub fn try_lock_for(
         &self,
-        timeout: <E as AutoResetEventTimed>::Duration,
+        timeout: E::Duration,
     ) -> Option<GenericMutexGuard<'_, E, T>> {
         unsafe {
             if self.blocking.try_lock_for(timeout) {
+                Some(GenericMutexGuard { mutex: self })
+            } else {
+                None
+            }
+        }
+    }
+
+    #[inline]
+    pub fn try_lock_until(
+        &self,
+        timeout: E::Instant,
+    ) -> Option<GenericMutexGuard<'_, E, T>> {
+        unsafe {
+            if self.blocking.try_lock_until(timeout) {
                 Some(GenericMutexGuard { mutex: self })
             } else {
                 None

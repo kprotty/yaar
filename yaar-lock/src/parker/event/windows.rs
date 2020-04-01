@@ -17,102 +17,52 @@ use yaar_sys::{
     STATUS_SUCCESS, STATUS_TIMEOUT, TRUE,
 };
 
-const EMPTY: usize = 0;
-const WAITING: usize = 1;
-const NOTIFIED: usize = 2;
-
-pub struct AutoResetEvent {
-    state: AtomicUsize,
+pub fn yield_now(iteration: usize) -> bool {
+    spin_loop_hint();
+    iteration < 40
 }
 
-impl AutoResetEvent {
-    pub fn new() -> Self {
-        Self {
-            state: AtomicUsize::new(EMPTY),
-        }
-    }
+pub unsafe fn futex_wake(ptr: &AtomicUsize) {
+    Backend::wake(ptr)
+}
 
-    pub fn yield_now(iteration: usize, is_amd_ryzen: bool) -> bool {
-        spin_loop_hint();
-        is_amd_ryzen || (iteration >= 1000)
-    }
+pub unsafe fn futex_wait(
+    ptr: &AtomicUsize,
+    expect: usize,
+    reset: usize,
+    timeout: Option<Duration>,
+) -> bool {
+    Backend::wait(ptr, expect, reset, timeout)
+}
 
-    pub fn set(&self) {
-        let mut state = self.state.load(Ordering::Relaxed);
-        while state != NOTIFIED {
-            debug_assert!(state == EMPTY || state == WAITING);
+pub unsafe fn timestamp() -> Duration {
+    let frequency = {
+        static mut FREQUENCY: LARGE_INTEGER = 0;
+        static STATE: AtomicUsize = AtomicUsize::new(0);
 
-            match self.state.compare_exchange_weak(
-                state,
-                if state == EMPTY { NOTIFIED } else { EMPTY },
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Err(e) => state = e,
-                Ok(_) => unsafe {
-                    if state == WAITING {
-                        Backend::get().wake(&self.state);
-                    }
-                    return;
-                },
-            }
-        }
-    }
-
-    pub fn try_wait(&self, timeout: Option<Duration>) -> bool {
-        let mut state = self.state.load(Ordering::Relaxed);
-        loop {
-            debug_assert!(state == EMPTY || state == NOTIFIED);
-
-            match self.state.compare_exchange_weak(
-                state,
-                if state == EMPTY { WAITING } else { EMPTY },
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Err(e) => state = e,
-                Ok(_) => unsafe {
-                    return if state == EMPTY {
-                        Backend::get().wait(&self.state, timeout)
-                    } else {
-                        true
-                    };
-                },
-            }
-        }
-    }
-
-    pub fn now() -> Duration {
-        unsafe {
-            let frequency = {
-                static mut FREQUENCY: LARGE_INTEGER = 0;
-                static STATE: AtomicUsize = AtomicUsize::new(0);
-
-                if STATE.load(Ordering::Acquire) == 2 {
-                    FREQUENCY
-                } else {
-                    let mut frequency = 0;
-                    let status = QueryPerformanceFrequency(&mut frequency);
-                    debug_assert_eq!(status, TRUE);
-
-                    if STATE.compare_and_swap(0, 1, Ordering::Relaxed) == 0 {
-                        FREQUENCY = frequency;
-                        STATE.store(2, Ordering::Release);
-                    }
-
-                    frequency
-                }
-            };
-
-            let mut counter = 0;
-            let status = QueryPerformanceCounter(&mut counter);
+        if STATE.load(Ordering::Acquire) == 2 {
+            FREQUENCY
+        } else {
+            let mut frequency = 0;
+            let status = QueryPerformanceFrequency(&mut frequency);
             debug_assert_eq!(status, TRUE);
 
-            const NANOS_PER_SEC: i64 = 1_000_000_000;
-            let ns = counter / (frequency / NANOS_PER_SEC);
-            Duration::from_nanos(ns as u64)
+            if STATE.compare_and_swap(0, 1, Ordering::Relaxed) == 0 {
+                FREQUENCY = frequency;
+                STATE.store(2, Ordering::Release);
+            }
+
+            frequency
         }
-    }
+    };
+
+    let mut counter = 0;
+    let status = QueryPerformanceCounter(&mut counter);
+    debug_assert_eq!(status, TRUE);
+
+    const NANOS_PER_SEC: i64 = 1_000_000_000;
+    let ns = counter / (frequency / (NANOS_PER_SEC / 100));
+    Duration::from_nanos(ns as u64)
 }
 
 const WAIT_ON_ADDRESS: usize = INVALID_HANDLE_VALUE;
@@ -124,20 +74,19 @@ static _NtReleaseKeyedEvent: AtomicUsize = AtomicUsize::new(0);
 static _WaitOnAddress: AtomicUsize = AtomicUsize::new(0);
 static _WakeByAddressSingle: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Copy, Clone)]
 enum Backend {
     WaitOnAddress,
     KeyedEvent(HANDLE),
 }
 
 impl Backend {
-    pub unsafe fn get() -> Self {
+    unsafe fn get() -> Self {
         match HANDLE.load(Ordering::Acquire) {
             0 => {
-                if Self::load_wait_on_address() {
-                    Self::WaitOnAddress
-                } else if let Some(handle) = Self::load_keyed_event() {
+                if let Some(handle) = Self::load_keyed_event() {
                     Self::KeyedEvent(handle.get())
+                } else if Self::load_wait_on_address() {
+                    Self::WaitOnAddress
                 } else {
                     unreachable!("OsAutoResetEvent requires either WaitOnAddress (Win8+) or NT Keyed Events (WinXP+)");
                 }
@@ -147,8 +96,8 @@ impl Backend {
         }
     }
 
-    pub unsafe fn wake(self, ptr: &AtomicUsize) {
-        match self {
+    pub unsafe fn wake(ptr: &AtomicUsize) {
+        match Self::get() {
             Self::KeyedEvent(handle) => {
                 let NtReleaseKeyedEvent = _NtReleaseKeyedEvent.load(Ordering::Relaxed);
                 let NtReleaseKeyedEvent: NtReleaseKeyedEventFn = transmute(NtReleaseKeyedEvent);
@@ -163,8 +112,13 @@ impl Backend {
         }
     }
 
-    pub unsafe fn wait(self, ptr: &AtomicUsize, mut timeout: Option<Duration>) -> bool {
-        match self {
+    pub unsafe fn wait(
+        ptr: &AtomicUsize,
+        expect: usize,
+        reset: usize,
+        mut timeout: Option<Duration>,
+    ) -> bool {
+        match Self::get() {
             Self::KeyedEvent(handle) => {
                 let NtWaitForKeyedEvent = _NtWaitForKeyedEvent.load(Ordering::Relaxed);
                 let NtWaitForKeyedEvent: NtWaitForKeyedEventFn = transmute(NtWaitForKeyedEvent);
@@ -187,29 +141,29 @@ impl Backend {
                     }
                 }
 
-                if ptr.load(Ordering::Relaxed) == WAITING {
-                    if ptr.compare_and_swap(WAITING, EMPTY, Ordering::Relaxed) == WAITING {
+                if ptr.load(Ordering::Relaxed) == expect {
+                    if ptr.compare_and_swap(expect, reset, Ordering::Relaxed) == expect {
                         return false;
                     }
                 }
 
                 let status = NtWaitForKeyedEvent(handle, key, FALSE, null());
                 debug_assert_eq!(status, STATUS_SUCCESS);
-                false
+                true
             }
             Self::WaitOnAddress => {
                 let WaitOnAddress = _WaitOnAddress.load(Ordering::Relaxed);
                 let WaitOnAddress: WaitOnAddressFn = transmute(WaitOnAddress);
-                let timeout_timestamp = timeout.map(|t| AutoResetEvent::now() + t);
+                let timeout_timestamp = timeout.map(|t| timestamp() + t);
 
-                while ptr.load(Ordering::Acquire) == WAITING {
+                while ptr.load(Ordering::Acquire) == expect {
                     let timeout_ms = timeout
                         .map(|t| t.as_millis().try_into().unwrap_or(INFINITE - 1))
                         .unwrap_or(INFINITE);
 
                     if timeout_ms == 0 {
-                        if ptr.load(Ordering::Acquire) == WAITING {
-                            if ptr.compare_and_swap(WAITING, EMPTY, Ordering::Relaxed) == WAITING {
+                        if ptr.load(Ordering::Acquire) == expect {
+                            if ptr.compare_and_swap(expect, reset, Ordering::Relaxed) == expect {
                                 return false;
                             }
                         }
@@ -218,7 +172,7 @@ impl Backend {
 
                     let status = WaitOnAddress(
                         ptr as *const _ as PVOID,
-                        &WAITING as *const _ as PVOID,
+                        &expect as *const _ as PVOID,
                         size_of::<usize>(),
                         timeout_ms,
                     );
@@ -227,7 +181,7 @@ impl Backend {
                     if status == FALSE {
                         debug_assert_eq!(GetLastError(), ERROR_TIMEOUT);
                         if let Some(t) = timeout_timestamp {
-                            let t = t.checked_sub(AutoResetEvent::now());
+                            let t = t.checked_sub(timestamp());
                             let t = t.unwrap_or(Duration::from_secs(0));
                             timeout = Some(t);
                         }

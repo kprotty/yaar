@@ -4,7 +4,7 @@ use core::{
     fmt,
     future::Future,
     marker::PhantomPinned,
-    mem::MaybeUninit,
+    mem::{MaybeUninit, replace},
     pin::Pin,
     ptr::NonNull,
     sync::atomic::{AtomicUsize, Ordering},
@@ -63,17 +63,18 @@ impl<Event: AutoResetEvent> Parker<Event> {
         match self.queue.locked(&node.event, |head| {
             prepare().map(|token| {
                 let node_ptr = NonNull::new(node as *const _ as *mut _);
-                node.next.set(*head);
+                let head = replace(head, node_ptr);
+                node.token.set(token);
                 node.prev.set(None);
+                node.next.set(head);
                 node.tail.set(match head.map(|p| &*p.as_ptr()) {
                     None => node_ptr,
                     Some(head) => {
                         head.prev.set(node_ptr);
                         head.tail.get()
-                    }
+                    },
                 });
-                node.token.set(token);
-                *head = node_ptr;
+                #[cfg(feature = "os")] println!("{:?} parking on {:p}", std::thread::current().id(), node);
             })
         }) {
             Ok(_) => future.await,
@@ -90,7 +91,7 @@ impl<Event: AutoResetEvent> Parker<Event> {
         let mut should_unpark = true;
         self.unpark(
             |context, token| {
-                if core::mem::replace(&mut should_unpark, false) {
+                if replace(&mut should_unpark, false) {
                     modify(context, token);
                     UnparkResult::Unpark
                 } else {
@@ -129,7 +130,9 @@ impl<Event: AutoResetEvent> Parker<Event> {
                     UnparkResult::Stop => break,
                     UnparkResult::Skip => context.skipped += 1,
                     UnparkResult::Unpark => {
-                        Self::remove(head, node).unwrap();
+                        Self::remove(head, node)
+                            .expect("Failed to remove ParkNode expected in queue");
+                        #[cfg(feature = "os")] println!("{:?} waking {:p}", std::thread::current().id(), node);
                         context.unparked += 1;
                         if let ParkState::Waiting = ParkState::from({
                             let new_state = ParkState::Unparked as usize;
@@ -158,10 +161,39 @@ impl<Event: AutoResetEvent> Parker<Event> {
     }
 
     unsafe fn remove(
-        head: &mut Option<NonNull<ParkNode<Event>>>,
+        head_ref: &mut Option<NonNull<ParkNode<Event>>>,
         node: &ParkNode<Event>,
     ) -> Result<bool, ()> {
+        let head = match *head_ref {
+            Some(head) => &*head.as_ptr(),
+            None => return Err(()),
+        };
+
+        if node.tail.replace(None).is_none() {
+            return Err(());
+        }
         
+        let prev = node.prev.get();
+        let next = node.next.get();
+        if let Some(prev) = prev.map(|p| &*p.as_ptr()) {
+            prev.next.set(next);
+        }
+        if let Some(next) = next.map(|p| &*p.as_ptr()) {
+            next.prev.set(prev);
+        }
+
+        let node_ptr = NonNull::new_unchecked(node as *const _ as *mut _);
+        if head.tail.get() == Some(node_ptr) {
+            head.tail.set(prev);
+        }
+        
+        let head_ptr = NonNull::new_unchecked(head as *const _ as *mut _);
+        Ok(if head_ptr == node_ptr {
+            *head_ref = None;
+            true
+        } else {
+            false
+        })
     }
 }
 
@@ -318,6 +350,7 @@ where
                     unreachable!("ParkFuture being polled in parallel");
                 }
                 ParkState::Unparked => {
+                    #[cfg(feature = "os")] println!("{:?} unparked on {:p}", std::thread::current().id(), &this.node);
                     let token = this.node.token.get();
                     return Poll::Ready(ParkResult::Unparked(token));
                 }

@@ -49,7 +49,10 @@ impl<Event: AutoResetEvent> RawMutex<Event> {
             .is_ok()
     }
 
-    pub async unsafe fn lock_slow(&self, park: impl Fn(&Event) -> Poll<bool>) -> bool {
+    pub async unsafe fn lock_slow(
+        &self,
+        mut park: impl FnMut(&Event) -> Poll<bool>,
+    ) -> bool {
         let mut spin: usize = 0;
         let mut state = self.state.load(Ordering::Relaxed);
 
