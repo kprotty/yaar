@@ -574,6 +574,22 @@ impl<T> Mutex<T> for std_lock::Mutex<T> {
     }
 }
 
+mod prot_lock;
+impl<T> Mutex<T> for prot_lock::Mutex<T> {
+    const NAME: &'static str = "prot_lock";
+
+    fn new(v: T) -> Self {
+        Self::new(v)
+    }
+
+    fn lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        let mut guard = self.lock();
+        f(&mut *guard)
+    }
+}
 
 fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
     num_threads: usize,
@@ -672,7 +688,15 @@ fn run_all(
         seconds_per_test,
         test_iterations,
     );
-    
+
+    run_benchmark_iterations::<yaar_lock::sync::Mutex<f64>>(
+        num_threads,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+    );
+
     run_benchmark_iterations::<std_lock::Mutex<f64>>(
         num_threads,
         work_per_critical_section,
@@ -681,7 +705,7 @@ fn run_all(
         test_iterations,
     );
 
-    run_benchmark_iterations::<yaar_lock::sync::Mutex<f64>>(
+    run_benchmark_iterations::<prot_lock::Mutex<f64>>(
         num_threads,
         work_per_critical_section,
         work_between_critical_sections,
@@ -766,6 +790,7 @@ fn bench_all(name: &'static str, num_threads: usize) {
 
 fn main() {
     let num_threads = num_cpus::get();
+    bench_all("Extreme Contention", num_threads * 2);
     bench_all("High Contention", num_threads);
     if num_threads > 3 {
         bench_all("Some Contention", num_threads / 2);

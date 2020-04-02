@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use std::{
     fmt,
     cell::{Cell, UnsafeCell},
