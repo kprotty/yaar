@@ -36,7 +36,6 @@ impl<E: Default, T> WaitNode<E, T> {
             self.event.set(MaybeUninit::new(E::default()));
         }
 
-        debug_assert_eq!(self.state.get(), State::Waiting);
         self.next.set(MaybeUninit::new(head));
         if head.is_null() {
             self.tail.set(MaybeUninit::new(self));
@@ -50,7 +49,6 @@ impl<E: Default, T> WaitNode<E, T> {
 
     pub fn tail<'a>(&self) -> &'a Self {
         unsafe {
-            debug_assert_eq!(self.state.get(), State::Waiting);
             let head = self;
             let mut tail = head.tail.get().assume_init();
 
@@ -70,7 +68,6 @@ impl<E: Default, T> WaitNode<E, T> {
     }
 
     pub fn next(&self) -> *const Self {
-        debug_assert_eq!(self.state.get(), State::Waiting);
         let tail = self;
         unsafe { tail.prev.get().assume_init() }
     }
@@ -86,23 +83,19 @@ impl<E: Default, T> WaitNode<E, T> {
 impl<E: ThreadEvent, T> WaitNode<E, T> {
     #[inline(always)]
     fn event(&self) -> &E {
-        debug_assert_ne!(self.state.get(), State::Uninit);
         unsafe { &*(&*self.event.as_ptr()).as_ptr() }
     }
 
     pub fn reset(&self) {
-        debug_assert_eq!(self.state.get(), State::Notified);
         self.prev.set(MaybeUninit::new(null()));
         self.event().reset();
     }
 
     pub fn wait(&self) {
-        debug_assert_eq!(self.state.get(), State::Waiting);
         self.event().wait();
     }
 
     pub fn notify(&self) {
-        debug_assert_eq!(self.state.get(), State::Waiting);
         self.state.set(State::Notified);
         self.event().set();
     }
