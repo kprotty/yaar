@@ -89,7 +89,7 @@ mod pthread {
     }
 
     impl<T> super::Mutex<T> for Mutex<T> {
-        const NAME: &'static str = "pthread_rwlock_t";
+        const NAME: &'static str = "pthread_mutex_t";
 
         fn new(v: T) -> Self {
             Self {
@@ -586,8 +586,7 @@ impl<T> Mutex<T> for prot_lock::Mutex<T> {
     where
         F: FnOnce(&mut T) -> R,
     {
-        let mut guard = self.lock();
-        f(&mut *guard)
+        self.locked(f)
     }
 }
 
@@ -793,7 +792,8 @@ fn main() {
     bench_all("Extreme Contention", num_threads * 2);
     bench_all("High Contention", num_threads);
     if num_threads > 3 {
-        bench_all("Some Contention", num_threads / 2);
+        bench_all("Medium Contention", num_threads / 2);
     }
+    bench_all("Low Contention", 2);
     bench_all("Uncontended", 1);
 }

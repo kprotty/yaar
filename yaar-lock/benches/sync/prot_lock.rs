@@ -2,107 +2,33 @@
 
 use std::{
     fmt,
-    mem::replace,
-    ptr::NonNull,
+    mem::{replace, MaybeUninit},
+    ptr::{null, NonNull},
     cell::{Cell, UnsafeCell},
     ops::{Deref, DerefMut},
+    hint::unreachable_unchecked,
     sync::{
         Condvar,
         Mutex as StdMutex,
-        atomic::{fence, spin_loop_hint, Ordering, AtomicUsize},
+        atomic::{fence, spin_loop_hint, Ordering, AtomicU8, AtomicUsize},
     },
 };
 
-const EMPTY: usize = 0;
-const WAITING: usize = 1;
-const NOTIFIED: usize = 2;
+const UNLOCKED: usize = 0;
+const LOCKED: usize   = 1;
+const WAKING: usize   = 1 << 8;
+const WAITING: usize  = 1 << 9;
 
-#[repr(align(4))]
 struct Node {
-    state: AtomicUsize,
-    mutex: StdMutex<usize>,
-    condvar: Condvar,
-    prev: Cell<Option<NonNull<Self>>>,
-    next: Cell<Option<NonNull<Self>>>,
-    tail: Cell<Option<NonNull<Self>>>,
+    state: Cell<MaybeUninit<AtomicUsize>>,
+    prev: Cell<MaybeUninit<Option<NonNull<Self>>>>,
+    next: Cell<MaybeUninit<Option<NonNull<Self>>>>,
+    tail: Cell<MaybeUninit<Option<NonNull<Self>>>>,
 }
-
-impl Node {
-    fn with_local<T>(f: impl FnOnce(&Self) -> T) -> T {
-        thread_local!(static NODE: Node = Node {
-            state: AtomicUsize::new(EMPTY),
-            mutex: StdMutex::new(EMPTY),
-            condvar: Condvar::new(),
-            prev: Cell::new(None),
-            next: Cell::new(None),
-            tail: Cell::new(None),
-        });
-        NODE.with(f)
-    }
-
-    fn notify(&self) {
-        let mut state = EMPTY;
-        loop {
-            if state == NOTIFIED {
-                return;
-            }
-            match self.state.compare_exchange_weak(
-                state,
-                if state == EMPTY { NOTIFIED } else { EMPTY },
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Err(e) => state = e,
-                Ok(WAITING) => break,
-                Ok(_) => return,
-            }
-        }
-
-        let mut state = self.mutex.lock().unwrap();
-        if *state == EMPTY {
-            *state = NOTIFIED;
-            return;
-        }
-
-        *state = EMPTY;
-        self.condvar.notify_one();
-    }
-
-    fn wait(&self) {
-        let mut state = NOTIFIED;
-        loop {
-            match self.state.compare_exchange_weak(
-                state,
-                if state == EMPTY { WAITING } else { EMPTY },
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Err(e) => state = e,
-                Ok(NOTIFIED) => return,
-                Ok(_) => break,
-            }
-        }
-
-        let mut state = self.mutex.lock().unwrap();
-        if *state == NOTIFIED {
-            *state = EMPTY;
-            return;
-        }
-
-        *state = WAITING;
-        while *state == WAITING {
-            state = self.condvar.wait(state).unwrap();
-        }
-    }
-}
-
-const UNLOCKED: usize = 0 << 0;
-const LOCKED:   usize = 1 << 0;
-const WAKING:   usize = 1 << 1;
-const MASK:     usize = !(UNLOCKED | LOCKED | WAKING);
 
 pub struct Mutex<T> {
     state: AtomicUsize,
+    futex: AtomicUsize,
     value: UnsafeCell<T>,
 }
 
@@ -114,171 +40,171 @@ impl<T> Mutex<T> {
     pub const fn new(value: T) -> Self {
         Self {
             state: AtomicUsize::new(UNLOCKED),
+            futex: AtomicUsize::new(UNLOCKED),
             value: UnsafeCell::new(value),
         }
     }
 
-    #[inline]
-    pub fn into_inner(self) -> T {
-        self.value.into_inner()
+    fn byte_state(&self) -> &AtomicU8 {
+        unsafe { &*(&self.state as *const _ as *const _) }
     }
 
-    #[inline]
-    pub fn get_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.value.get() }
-    }
+    pub fn locked<U>(&self, f: impl FnOnce(&mut T) -> U) -> U {
+        unsafe {
+            if let Err(_) = self.byte_state().compare_exchange_weak(
+                0,
+                1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                self.lock_slow();
+            }
 
-    #[inline]
-    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        let state = self.state.fetch_or(LOCKED, Ordering::Acquire);
-        if state & LOCKED == 0 {
-            Some(MutexGuard{ mutex: self })
-        } else {
-            None
+            let result = f(&mut *self.value.get());
+
+            self.byte_state().store(0, Ordering::Release);
+            self.unlock_slow();
+
+            result
         }
-    }
-
-    #[inline]
-    pub fn lock(&self) -> MutexGuard<'_, T> {
-        let state = self.state.fetch_or(LOCKED, Ordering::Acquire);
-        if state & LOCKED != 0 {
-            self.lock_slow(state);
-        }
-        MutexGuard{ mutex: self }
     }
 
     #[cold]
-    fn lock_slow(&self, mut state: usize) {
-        Node::with_local(|node| {
-            let mut waking = false;
-            let mut spin: usize = 0;
-            
-            loop {
-                if state & LOCKED == 0 {
-                    state = self.state.fetch_or(LOCKED, Ordering::Acquire);
-                    if state & LOCKED == 0 {
-                        return;
-                    }
-                    continue;
-                }
-
-                let head = NonNull::new((state & MASK) as *mut Node);
-                if head.is_none() && spin < 100 {
-                    spin_loop_hint();
-                    spin = spin.wrapping_add(1);
-                    state = self.state.load(Ordering::Relaxed);
-                    continue;
-                }
-
-                node.prev.set(None);
-                node.next.set(head);
-                node.tail.set(match head {
-                    Some(_) => None,
-                    None => NonNull::new(node as *const _ as *mut _),
-                });
-
-                if let Err(e) = self.state.compare_exchange_weak(
-                    state,
-                    (node as *const _ as usize) | (state & !MASK),
-                    Ordering::Release,
+    unsafe fn lock_slow(&self) {
+        let mut spin: usize = 0;
+        let max_spin = Self::max_spin();
+        let mut state = self.state.load(Ordering::Relaxed);
+        loop {
+            if state & LOCKED == 0 {
+                if let Ok(_) = self.byte_state().compare_exchange_weak(
+                    0,
+                    1,
+                    Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
-                    state = e;
+                    return;
+                }
+                spin_loop_hint();
+                state = self.state.load(Ordering::Relaxed);
+                continue;
+            }
+
+            if (state & WAITING == 0) && spin < max_spin {
+                spin += 1;
+                spin_loop_hint();
+                state = self.state.load(Ordering::Relaxed);
+                continue;
+            }
+
+            if let Err(e) = self.state.compare_exchange_weak(
+                state,
+                state + WAITING,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                state = e;
+                continue;
+            }
+            
+            let mut wait_spin: usize = 0;
+            loop {
+                state = self.futex.load(Ordering::Relaxed);
+                if state == LOCKED {
+                    match self.futex.compare_exchange_weak(
+                        LOCKED,
+                        UNLOCKED,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(e) => state = e,
+                    }
+                    spin_loop_hint();
                     continue;
                 }
-
-                node.wait();
-                spin = 0;
-                state = self.state.fetch_and(!WAKING, Ordering::Relaxed) & !WAKING;
+                if wait_spin < max_spin {
+                    wait_spin += 1;
+                    spin_loop_hint();
+                    state = self.futex.load(Ordering::Relaxed);
+                    continue;
+                }
+                let _ = libc::syscall(
+                    libc::SYS_futex,
+                    &self.futex as *const _ as *const usize,
+                    libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                    UNLOCKED,
+                    0,
+                );
             }
-        });
-    }
 
-    #[inline]
-    pub unsafe fn force_unlock(&self) {
-        let state = self.state.fetch_and(!LOCKED, Ordering::Release);
-        if (state & WAKING == 0) && (state & MASK != 0) {
-            self.unlock_slow(state & !LOCKED);
+            state = self.state.fetch_sub(WAKING, Ordering::Relaxed);
+            state -= WAKING;
+            spin = 0;
         }
     }
 
     #[cold]
-    unsafe fn unlock_slow(&self, mut state: usize) {
+    unsafe fn unlock_slow(&self) {
+        let mut state = self.state.load(Ordering::Relaxed);
         loop {
-            if (state & MASK == 0) || (state & WAKING != 0) || (state & LOCKED != 0) {
+            if (state < WAITING) || (state & LOCKED != 0) || (state & WAKING != 0) {
                 return;
             }
             match self.state.compare_exchange_weak(
                 state,
-                state | WAKING,
-                Ordering::Acquire,
+                (state - WAITING) + WAKING,
+                Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Err(e) => state = e,
-                Ok(_) => {
-                    state |= WAKING;
-                    break;
+                Ok(_) => break,
+            }
+        }
+
+        self.futex.store(LOCKED, Ordering::Relaxed);
+        let _ = libc::syscall(
+            libc::SYS_futex,
+            &self.futex as *const _ as *const u32,
+            libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+            1,
+        );
+    }   
+
+    fn max_spin() -> usize {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::{__cpuid, CpuidResult};
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{__cpuid, CpuidResult};
+
+        use core::{
+            slice::from_raw_parts,
+            str::from_utf8_unchecked,
+            hint::unreachable_unchecked,
+        };
+
+        static IS_AMD: AtomicUsize = AtomicUsize::new(0);
+        let is_amd = unsafe {
+            match IS_AMD.load(Ordering::Relaxed) {
+                0 => {
+                    let CpuidResult { ebx, ecx, edx, .. } = __cpuid(0);
+                    let vendor = &[ebx, edx, ecx] as *const _ as *const u8;
+                    let vendor = from_utf8_unchecked(from_raw_parts(vendor, 3 * 4));
+                    let is_amd = vendor == "AuthenticAMD";
+                    IS_AMD.store((is_amd as usize) + 1, Ordering::Relaxed);
+                    is_amd
                 },
+                1 => false,
+                2 => true,
+                _ => unreachable_unchecked(),
             }
-        }
+        };
 
-        'outer: loop {
-            let head = &*((state & MASK) as *const Node);
-            let tail = {
-                let mut current = head;
-                loop {
-                    match current.tail.get() {
-                        Some(tail) => {
-                            head.tail.set(Some(tail));
-                            break &*tail.as_ptr()
-                        },
-                        None => {
-                            let next = &*current.next.get().unwrap().as_ptr();
-                            let ptr = current as *const _ as *mut _; 
-                            next.prev.set(NonNull::new(ptr));
-                            current = next;
-                        },
-                    }
-                }
-            };
+        if is_amd { 2 } else { 40 } 
+    }
 
-            if state & LOCKED != 0 {
-                match self.state.compare_exchange_weak(
-                    state,
-                    state & !WAKING,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return,
-                    Err(e) => state = e,
-                }
-                continue;
-            }
-
-            if let Some(new_tail) = tail.prev.get() {
-                head.tail.set(Some(new_tail));
-                fence(Ordering::Release);
-            } else {
-                loop {
-                    match self.state.compare_exchange_weak(
-                        state,
-                        state & !MASK,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => { state &= !MASK; break;},
-                        Err(e) => state = e,
-                    }
-                    if state & MASK != 0 {
-                        fence(Ordering::Acquire);
-                        continue 'outer;
-                    }
-                }
-            }
-
-            tail.notify();
-            return;
-        }
+    #[inline]
+    pub unsafe fn force_unlock(&self) {
+        unreachable!()
     }
 }
 
