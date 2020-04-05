@@ -21,6 +21,7 @@ pub const STATUS_TIMEOUT: NTSTATUS = 0x00000102;
 pub const ERROR_TIMEOUT: DWORD = STATUS_TIMEOUT;
 
 pub const INFINITE: DWORD = !0;
+pub const TLS_OUT_OF_INDEXES: DWORD = !0;
 pub const GENERIC_READ: DWORD = 0x80000000;
 pub const GENERIC_WRITE: DWORD = 0x40000000;
 
@@ -34,6 +35,11 @@ extern "stdcall" {
 
     pub fn QueryPerformanceCounter(lpPerformanceCounter: &mut LARGE_INTEGER) -> BOOL;
     pub fn QueryPerformanceFrequency(lpPerformanceFrequency: &mut LARGE_INTEGER) -> BOOL;
+
+    pub fn TlsAlloc() -> DWORD;
+    pub fn TlsFree(dwTlsIndex: DWORD) -> BOOL;
+    pub fn TlsGetValue(dwTlsIndex: DWORD) -> PVOID;
+    pub fn TlsSetValue(dwTlsIndex: DWORD, lpTlsValue: PVOID) -> BOOL;
 }
 
 pub type NtCreateKeyedEventFn = extern "stdcall" fn(

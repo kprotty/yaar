@@ -1,13 +1,18 @@
-pub unsafe trait AutoResetEvent: Sync + Default {
+
+
+pub struct YieldContext {
+    pub contended: bool,
+    pub iteration: usize,
+}
+
+pub unsafe trait AutoResetEvent: Sync + Sized {
+    fn new() -> Self;
+
     fn set(&self);
 
     fn wait(&self);
 
-    /// Hint to the platform that a thread is spinning, similar to
-    /// [`spin_loop_hint`].
-    ///
-    /// Returns whether the thread should continue spinning or not.
-    fn yield_now(iteration: usize) -> bool;
+    fn yield_now(context: YieldContext) -> bool;
 }
 
 pub unsafe trait AutoResetEventTimed: AutoResetEvent {
@@ -34,12 +39,9 @@ mod if_os {
     #[cfg_attr(windows, path = "../windows.rs")]
     mod os;
 
-    const EMPTY: usize = 0;
-    const WAITING: usize = 1;
-    const NOTIFIED: usize = 2;
-
+    #[derive(Hash, Debug)]
     pub struct OsAutoResetEvent {
-        state: AtomicUsize,
+        signal: os::Signal,
     }
 
     unsafe impl Sync for OsAutoResetEvent {}
@@ -51,82 +53,40 @@ mod if_os {
         }
     }
 
-    unsafe impl AutoResetEventTimed for OsAutoResetEvent {
-        type Instant = OsInstant;
-        type Duration = Duration;
-
-        fn try_wait_for(&self, timeout: Self::Duration) -> bool {
-            self.try_wait(Some(timeout))
-        }
-
-        fn try_wait_until(&self, timeout: Self::Instant) -> bool {
-            let timeout = OsInstant::now().saturating_duration_since(timeout);
-            timeout.as_nanos() != 0 && self.try_wait(Some(timeout))
+    impl OsAutoResetEvent {
+        pub const fn new() -> Self {
+            Self {
+                signal: os::Signal::new(),
+            }
         }
     }
 
     unsafe impl AutoResetEvent for OsAutoResetEvent {
         fn set(&self) {
-            self.notify();
+            self.signal.notify();
         }
 
         fn wait(&self) {
-            let notified = self.try_wait(None);
+            let notified = self.signal.wait(None);
             debug_assert!(notified);
         }
 
-        fn yield_now(iteration: usize) -> bool {
-            os::yield_now(iteration)
+        fn yield_now(context: YieldContext) -> bool {
+            os::yield_now(context)
         }
     }
 
-    impl OsAutoResetEvent {
-        pub const fn new() -> Self {
-            Self {
-                state: AtomicUsize::new(EMPTY)
-            }
+    unsafe impl AutoResetEventTimed for OsAutoResetEvent {
+        type Instant = OsInstant;
+        type Duration = Duration;
+
+        fn try_wait_for(&self, timeout: Self::Duration) -> bool {
+            self.signal.wait(Some(timeout))
         }
 
-        fn notify(&self) {
-            #[cold]
-            fn wake(ptr: &AtomicUsize) {
-                unsafe { os::futex_wake(ptr) }
-            }
-
-            let mut state = EMPTY;
-            while state != NOTIFIED {
-                match self.state.compare_exchange_weak(
-                    state,
-                    if state == EMPTY { NOTIFIED } else { EMPTY },
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Err(e) => state = e,
-                    Ok(WAITING) => return wake(&self.state),
-                    Ok(_) => return,
-                }
-            }
-        }
-
-        fn try_wait(&self, timeout: Option<Duration>) -> bool {
-            #[cold]
-            fn wait(ptr: &AtomicUsize, timeout: Option<Duration>) -> bool {
-                unsafe { os::futex_wait(ptr, WAITING, EMPTY, timeout) }
-            }
-
-            let mut state = NOTIFIED;
-            loop {
-                match self.state.compare_exchange_weak(
-                    state,
-                    if state == NOTIFIED { EMPTY } else { WAITING },
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Err(e) => state = e,
-                    Ok(NOTIFIED) => return true,
-                    Ok(_) => return wait(&self.state, timeout), 
-                }
-            }
+        fn try_wait_until(&self, timeout: Self::Instant) -> bool {
+            let timeout = OsInstant::now().saturating_duration_since(timeout);
+            timeout.as_nanos() != 0 && self.try_wait_for(Some(timeout))
         }
     }
 
