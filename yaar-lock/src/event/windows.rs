@@ -1,23 +1,22 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 
-use crate::event::YieldContext;
+use crate::{YieldContext, OsInstant};
 use core::{
+    fmt,
     convert::TryInto,
     mem::{size_of, transmute},
     num::NonZeroUsize,
     ptr::null,
-    hint::unreachable_unchecked,
-    sync::atomic::{fence, spin_loop_hint, AtomicUsize, Ordering},
+    sync::atomic::{spin_loop_hint, AtomicUsize, Ordering},
     time::Duration,
 };
 use yaar_sys::{
-    TlsAlloc, TlsFree, TlsGetValue, TlsSetValue,
     CloseHandle, GetLastError, GetModuleHandleW, GetProcAddress, NtCreateKeyedEventFn,
-    NtReleaseKeyedEventFn, NtWaitForKeyedEventFn, QueryPerformanceCounter,
-    QueryPerformanceFrequency, WaitOnAddressFn, WakeByAddressSingleFn, ERROR_TIMEOUT, FALSE,
+    NtReleaseKeyedEventFn, NtWaitForKeyedEventFn,
+    WaitOnAddressFn, WakeByAddressSingleFn, ERROR_TIMEOUT, FALSE,
     GENERIC_READ, GENERIC_WRITE, HANDLE, INFINITE, INVALID_HANDLE_VALUE, LARGE_INTEGER, PVOID,
-    STATUS_SUCCESS, STATUS_TIMEOUT, TRUE, DWORD, TLS_OUT_OF_INDEXES,
+    STATUS_SUCCESS, STATUS_TIMEOUT, TRUE,
 };
 
 const EMPTY: usize = 0;
@@ -26,6 +25,21 @@ const NOTIFIED: usize = 2;
 
 pub struct Signal {
     state: AtomicUsize,
+}
+
+impl fmt::Debug for Signal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = match self.state.load(Ordering::SeqCst) {
+            EMPTY => "empty",
+            WAITING => "has_waiter",
+            NOTIFIED => "notified",
+            _ => "unknown",
+        };
+
+        f.debug_struct("OsSignal")
+            .field("state", &state)
+            .finish()
+    }
 }
 
 impl Signal {
@@ -41,133 +55,34 @@ impl Signal {
     }
 
     pub fn notify(&self) {
-        match self.state.compare_exchange(
-            EMPTY,
-            NOTIFIED,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {},
-            Err(_) => unsafe {
-                self.state.store(EMPTY, Ordering::Relaxed);
-                Backend::futex_wake(&self.state);
-            },
-        }
-    }
-
-    pub fn wait(&self, timeout: Option<Duration>) -> bool {
-        match self.state.compare_exchange(
-            EMPTY,
-            WAITING,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => unsafe {
-                Backend::futex_wait(&self.state, WAITING, EMPTY, timeout)
-            },
-            Err(_) => {
-                self.state.store(EMPTY, Ordering::Relaxed);
-                true
-            },
-        }
-    }
-}
-
-pub unsafe fn timestamp() -> Duration {
-    let frequency = {
-        static mut FREQUENCY: LARGE_INTEGER = 0;
-        static STATE: AtomicUsize = AtomicUsize::new(0);
-
-        if STATE.load(Ordering::Acquire) == 2 {
-            FREQUENCY
-        } else {
-            let mut frequency = 0;
-            let status = QueryPerformanceFrequency(&mut frequency);
-            debug_assert_eq!(status, TRUE);
-
-            if STATE.compare_and_swap(0, 1, Ordering::Relaxed) == 0 {
-                FREQUENCY = frequency;
-                STATE.store(2, Ordering::Release);
-            }
-
-            frequency
-        }
-    };
-
-    const WORD_SIZE: usize = size_of::<usize>();
-    const LARGE_INTEGER_SIZE: usize = size_of::<LARGE_INTEGER>();
-    const NUM_TLS_INDICES: usize = LARGE_INTEGER_SIZE / WORD_SIZE;
-
-    let tls_indices = {
-        static mut TLS_INDICES: [DWORD; NUM_TLS_INDICES] = [0; NUM_TLS_INDICES];
-        static STATE: AtomicUsize = AtomicUsize::new(0);
-
-        let mut spin: usize = 0;
-        let mut state = STATE.load(Ordering::Acquire);
-        'state: loop {
-            match state {
-                0 => match STATE.compare_and_swap(0, 1, Ordering::Relaxed) {
-                    0 => {
-                        let mut allocated = 0;
-                        for i in NUM_TLS_INDICES {
-                            TLS_INDICES[i] = TlsAlloc();
-                            if TLS_INDICES[i] == TLS_OUT_OF_INDEXES {
-                                for t in 0..allocated {
-                                    let status = TlsFree(TLS_INDICES[t]);
-                                    debug_assert_eq!(status, TRUE);
-                                }
-                                state = 3;
-                                STATE.store(state, Ordering::Release);
-                                continue 'state;
-                            }
-                            allocated += 1;
-                        }
-                        state = 2;
-                        STATE.store(state, Ordering::Release);
-                    },
-                    s => state = s,
-                },
-                1 => {
-                    spin = spin.wrapping_add(1);
-                    (0..(spin % 64)).for_each(|_| spin_loop_hint());
-                    state = STATE.load(Ordering::Acquire);
-                },
-                2 => break TLS_INDICES,
-                _ => unreachable!("Out of TLS indexes for OS timestamp"),
+        let mut state = self.state.load(Ordering::Relaxed);
+        if state == EMPTY {
+            state = self.state.compare_and_swap(EMPTY, NOTIFIED, Ordering::Relaxed);
+            if state == EMPTY {
+                return;
             }
         }
-    };
 
-    let load_tls_large_integer = || {
-        let mut tls_value = [0usize; NUM_TLS_INDICES];
-        for i in NUM_TLS_INDICES {
-            tls_value[i] = TlsGetValue(tls_indices[i]) as usize;
-        }
-        transmute::<_, LARGE_INTEGER>(tls_value)
-    };
-
-    let store_tls_large_integer = |value| {
-        let tls_value = transmute::<_, [usize; NUM_TLS_INDICES]>(value);
-        for i in NUM_TLS_INDICES {
-            let status = TlsSetValue(tls_indices[i], tls_value[i] as PVOID);
-            debug_assert_eq!(status, TRUE);
-        }
-    };
-
-    let mut counter = 0;
-    let status = QueryPerformanceCounter(&mut counter);
-    debug_assert_eq!(status, TRUE);
-
-    let previous = load_tls_large_integer();
-    if counter < previous {
-        counter = previous;
-    } else {
-        store_tls_large_integer(counter);
+        debug_assert_eq!(state, WAITING);
+        self.state.store(EMPTY, Ordering::Relaxed);
+        unsafe { Backend::futex_wake(&self.state) };
     }
 
-    const NANOS_PER_SEC: i64 = 1_000_000_000;
-    let ns = counter / (frequency / (NANOS_PER_SEC / 100));
-    Duration::from_nanos(ns as u64)
+    pub fn wait(&self, timeout: Option<&mut Duration>) -> bool {
+        let mut state = self.state.load(Ordering::Relaxed);
+        if state == EMPTY {
+            state = self.state.compare_and_swap(EMPTY, WAITING, Ordering::Relaxed);
+            if state == EMPTY {
+                return unsafe { 
+                    Backend::futex_wait(&self.state, WAITING, EMPTY, timeout)
+                };
+            }
+        }
+
+        debug_assert_eq!(state, NOTIFIED);
+        self.state.store(EMPTY, Ordering::Relaxed);
+        true
+    }
 }
 
 const WAIT_ON_ADDRESS: usize = INVALID_HANDLE_VALUE;
@@ -188,10 +103,10 @@ impl Backend {
     unsafe fn get() -> Self {
         match HANDLE.load(Ordering::Acquire) {
             0 => {
-                if let Some(handle) = Self::load_keyed_event() {
-                    Self::KeyedEvent(handle.get())
-                } else if Self::load_wait_on_address() {
+                if Self::load_wait_on_address() {
                     Self::WaitOnAddress
+                } else if let Some(handle) = Self::load_keyed_event() {
+                    Self::KeyedEvent(handle.get())
                 } else {
                     unreachable!("OsAutoResetEvent requires either WaitOnAddress (Win8+) or NT Keyed Events (WinXP+)");
                 }
@@ -221,18 +136,19 @@ impl Backend {
         ptr: &AtomicUsize,
         expect: usize,
         reset: usize,
-        mut timeout: Option<Duration>,
+        mut timeout: Option<&mut Duration>,
     ) -> bool {
         match Self::get() {
             Self::KeyedEvent(handle) => {
                 let NtWaitForKeyedEvent = _NtWaitForKeyedEvent.load(Ordering::Relaxed);
                 let NtWaitForKeyedEvent: NtWaitForKeyedEventFn = transmute(NtWaitForKeyedEvent);
+                let timeout_end = timeout.as_ref().map(|t| OsInstant::now() + **t);
 
                 let mut timeout_int = 1;
                 let mut timeout_int_ptr = null();
-                if let Some(timeout) = timeout {
+                if let Some(timeout) = timeout.as_ref() {
                     timeout_int_ptr = &timeout_int;
-                    timeout_int = -(timeout.as_nanos() / 100)
+                    timeout_int = -((*timeout).as_nanos() / 100)
                         .try_into()
                         .unwrap_or(LARGE_INTEGER::max_value());
                 }
@@ -241,6 +157,9 @@ impl Backend {
                 if timeout_int != 0 {
                     let status = NtWaitForKeyedEvent(handle, key, FALSE, timeout_int_ptr);
                     debug_assert!(status == STATUS_SUCCESS || status == STATUS_TIMEOUT);
+                    if let (Some(timeout), Some(end)) = (timeout.as_mut(), timeout_end) {
+                        **timeout = OsInstant::now().saturating_duration_since(end);
+                    }
                     if status == STATUS_SUCCESS {
                         return true;
                     }
@@ -259,22 +178,19 @@ impl Backend {
             Self::WaitOnAddress => {
                 let WaitOnAddress = _WaitOnAddress.load(Ordering::Relaxed);
                 let WaitOnAddress: WaitOnAddressFn = transmute(WaitOnAddress);
-                let timeout_timestamp = timeout.map(|t| timestamp() + t);
+                let timeout_end = timeout.as_ref().map(|t| OsInstant::now() + **t);
 
                 while ptr.load(Ordering::Acquire) == expect {
                     let timeout_ms = timeout
-                        .map(|t| t.as_millis().try_into().unwrap_or(INFINITE - 1))
+                        .as_ref()
+                        .and_then(|t| (*t).as_millis().try_into().ok())
                         .unwrap_or(INFINITE);
 
                     if timeout_ms == 0 {
-                        if ptr.load(Ordering::Acquire) == expect {
-                            if ptr.compare_and_swap(expect, reset, Ordering::Relaxed) == expect {
-                                return false;
-                            }
-                        }
-                        return true;
+                        let timed_out = ptr.compare_and_swap(expect, reset, Ordering::Relaxed) == expect;
+                        return !timed_out;
                     }
-
+                
                     let status = WaitOnAddress(
                         ptr as *const _ as PVOID,
                         &expect as *const _ as PVOID,
@@ -282,14 +198,13 @@ impl Backend {
                         timeout_ms,
                     );
 
+                    if let (Some(timeout), Some(end)) = (timeout.as_mut(), timeout_end) {
+                        **timeout = OsInstant::now().saturating_duration_since(end);
+                    }
+
                     debug_assert!(status == TRUE || status == FALSE);
                     if status == FALSE {
                         debug_assert_eq!(GetLastError(), ERROR_TIMEOUT);
-                        if let Some(t) = timeout_timestamp {
-                            let t = t.checked_sub(timestamp());
-                            let t = t.unwrap_or(Duration::from_secs(0));
-                            timeout = Some(t);
-                        }
                     }
                 }
 
@@ -298,6 +213,7 @@ impl Backend {
         }
     }
 
+    #[cold]
     unsafe fn load_wait_on_address() -> bool {
         let dll = GetModuleHandleW(
             (&[
@@ -359,6 +275,7 @@ impl Backend {
         true
     }
 
+    #[cold]
     unsafe fn load_keyed_event() -> Option<NonZeroUsize> {
         let dll = GetModuleHandleW(
             (&[

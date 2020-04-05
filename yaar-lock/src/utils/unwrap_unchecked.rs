@@ -10,7 +10,7 @@ impl<T> UnwrapUnchecked<T> for Option<T> {
     }
 }
 
-impl<T, E> UnwrapUnchecked<T, E> for Result<T, E> {
+impl<T, E> UnwrapUnchecked<T> for Result<T, E> {
     unsafe fn unwrap_unchecked(self) -> T {
         self.unwrap_or_else(|_| unreachable())
     }

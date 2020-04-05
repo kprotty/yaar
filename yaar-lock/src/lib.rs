@@ -6,8 +6,6 @@ pub use event::*;
 
 pub mod utils;
 
-pub(crate) mod shared;
-
 #[cfg(feature = "sync")]
 pub mod sync;
 
