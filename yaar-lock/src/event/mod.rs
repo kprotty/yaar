@@ -81,7 +81,17 @@ mod if_os {
         }
 
         fn yield_now(request: YieldRequest) -> YieldResponse {
-            os::Signal::yield_now(request)
+            if let YieldRequest::QueryBestMethod = request {
+                // On AMD Ryzen, its better to yield to the OS than to spin.
+                // On Intel, the opposite appears to be true.
+                if Self::is_amd_ryzen() {
+                    YieldResponse::Block
+                } else {
+                    YieldResponse::Retry
+                }
+            } else {
+                os::Signal::yield_now(request)
+            }
         }
     }
 
@@ -97,5 +107,44 @@ mod if_os {
             let mut timeout = OsInstant::now().saturating_duration_since(timeout);
             timeout.as_nanos() != 0 && self.try_wait_for(&mut timeout)
         }
-    }    
+    }
+
+    impl OsAutoResetEvent {
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        pub fn is_amd_ryzen() -> bool {
+            false
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        pub fn is_amd_ryzen() -> bool {
+            #[cfg(target_arch = "x86")]
+            use core::arch::x86::{__cpuid, CpuidResult};
+            #[cfg(target_arch = "x86_64")]
+            use core::arch::x86_64::{__cpuid, CpuidResult};
+
+            use core::{
+                slice::from_raw_parts,
+                str::from_utf8_unchecked,
+                hint::unreachable_unchecked,
+                sync::atomic::{AtomicUsize, Ordering},
+            };
+
+            static IS_AMD: AtomicUsize = AtomicUsize::new(0);
+            unsafe {
+                match IS_AMD.load(Ordering::Relaxed) {
+                    0 => {
+                        let CpuidResult { ebx, ecx, edx, .. } = __cpuid(0);
+                        let vendor = &[ebx, edx, ecx] as *const _ as *const u8;
+                        let vendor = from_utf8_unchecked(from_raw_parts(vendor, 3 * 4));
+                        let is_amd = vendor == "AuthenticAMD";
+                        IS_AMD.store((is_amd as usize) + 1, Ordering::Relaxed);
+                        is_amd
+                    },
+                    1 => false,
+                    2 => true,
+                    _ => unreachable_unchecked(),
+                }
+            }
+        }
+    }
 }

@@ -51,9 +51,7 @@ impl Signal {
 
     pub fn yield_now(request: YieldRequest) -> YieldResponse {
         match request {
-            YieldRequest::QueryBestMethod => {
-                YieldResponse::Block
-            },
+            YieldRequest::QueryBestMethod => unreachable!(),
             YieldRequest::Spin { contended, iteration } => {
                 spin_loop_hint();
                 if !contended && iteration < 40 {
