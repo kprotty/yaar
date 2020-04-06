@@ -31,8 +31,8 @@ mod if_os {
 
 const UNLOCKED: usize = 0b00;
 const LOCKED: usize = 0b01;
-const DEQUEING: usize = 0b10;
-const MASK: usize = !(UNLOCKED | LOCKED | DEQUEING);
+const WAKING: usize = 0b10;
+const MASK: usize = !(UNLOCKED | LOCKED | WAKING);
 
 #[repr(align(4))]
 struct Waiter<E> {
@@ -170,9 +170,10 @@ impl<E: AutoResetEvent> BlockingMutex<E> {
             event_ref.wait();
 
             // Reset everything and try to acquire the lock again.
+            // Mark that we're awake so that another thread can be woken up in unlock().
             spin = 0;
             waiter.prev.set(MaybeUninit::new(None));
-            state = self.state.load(Ordering::Relaxed);
+            state = self.state.fetch_sub(WAKING, Ordering::Relaxed) - WAKING;
         }
     }
 
@@ -181,31 +182,32 @@ impl<E: AutoResetEvent> BlockingMutex<E> {
             unimplemented!("TODO: fair mutex unlock");
         }
 
-        // Unlock the mutex and try to deque->wake a waiting thread
-        // if there are any and if another unlock() thread isn't already dequeing.
+        // Unlock the mutex & try to deque->wake a waiting thread
+        // if theres threads in the waiter queue & if one isnt already waking up. 
         let state = self.state.fetch_sub(LOCKED, Ordering::Release);
-        if (state & MASK != 0) && (state & DEQUEING == 0) {
+        if (state & MASK != 0) && (state & WAKING == 0) {
             self.unlock_slow(state - LOCKED);
         }
     }
 
     #[cold]
     unsafe fn unlock_slow(&self, mut state: usize) {
-        // The lock was released, try to deque a waiter and unpark then to reacquire the lock.
-        // Stop trying if there are no waiters or if another thread is already dequeing.
+        // Try to acquire the WAKING flag on the mutex in order to deque->wake a waiting thread.
+        // Bail if theres no threads to deque, theres already a thread waiting, or the lock is
+        // being held since the lock holder can do the wake on unlock().
         loop {
-            if (state & MASK == 0) || (state & DEQUEING != 0) {
+            if (state & MASK == 0) || (state & WAKING != 0) || (state & LOCKED != 0) {
                 return;
             }
             match self.state.compare_exchange_weak(
                 state,
-                state | DEQUEING,
+                state | WAKING,
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
                 Err(e) => state = e,
                 Ok(_) => {
-                    state |= DEQUEING;
+                    state |= WAKING;
                     break;
                 },
             }
@@ -215,7 +217,7 @@ impl<E: AutoResetEvent> BlockingMutex<E> {
         // On enter, and on re-loop, need an Acquire barrier in order to observe the head
         // waiter field writes from both the previous deque thread and the enqueue thread.
         'deque: loop {
-            // Safety: guaranteed non-null from the DEQUEING acquire loop above.
+            // Safety: guaranteed non-null from the WAKING acquire loop above.
             let head = &*((state & MASK) as *const Waiter<E>);
 
             // Find the tail of the queue by following the next links from the head.
@@ -245,7 +247,7 @@ impl<E: AutoResetEvent> BlockingMutex<E> {
             if state & LOCKED != 0 {
                 match self.state.compare_exchange_weak(
                     state,
-                    state & !DEQUEING,
+                    state & !WAKING,
                     Ordering::Release,
                     Ordering::Relaxed,
                 ) {
@@ -260,12 +262,11 @@ impl<E: AutoResetEvent> BlockingMutex<E> {
             // from the tail to the head following the prev links set above.
             let new_tail = tail.prev.get().assume_init();
             
-            // The tail isnt the last waiter.
-            // Update the tail of the queue and release DEQUEING privileges.
+            // The tail isnt the last waiter, update the tail of the queue.
             // Release barrier to make the queue link writes visible to next unlock thread.
             if let Some(new_tail) = new_tail {
                 head.tail.set(MaybeUninit::new(Some(new_tail)));
-                self.state.fetch_sub(DEQUEING, Ordering::Release);
+                fence(Ordering::Release);
 
             // The tail was the last waiter in the queue.
             // Try to zero out the queue while also releasing the DEQUEUING lock.
@@ -278,7 +279,7 @@ impl<E: AutoResetEvent> BlockingMutex<E> {
                 loop {
                     match self.state.compare_exchange_weak(
                         state,
-                        state & LOCKED,
+                        state & (LOCKED | WAKING),
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                     ) {
