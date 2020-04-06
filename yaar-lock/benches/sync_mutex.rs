@@ -22,6 +22,7 @@ fn bench_all(c: &mut Criterion, ctx: BenchContext) {
     
     bench_mutex::<std_lock::Mutex<BenchValue>>(c, ctx);
     bench_mutex::<spin_lock::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<sys_lock::Mutex<BenchValue>>(c, ctx);
     #[cfg(windows)] bench_mutex::<nt_lock::Mutex<BenchValue>>(c, ctx);
 }
 

@@ -69,6 +69,19 @@ impl<T> Mutex<T> for spin_lock::Mutex<T> {
     } 
 }
 
+pub mod sys_lock;
+impl<T> Mutex<T> for sys_lock::Mutex<T> {
+    const NAME: &'static str = sys_lock::NAME;
+
+    fn new(value: T) -> Self {
+        Self::new(value)
+    }
+
+    fn locked<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        self.lock(f)
+    } 
+}
+
 #[cfg(windows)]
 pub mod nt_lock;
 #[cfg(windows)]
