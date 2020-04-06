@@ -20,6 +20,8 @@ impl<T> Mutex<T> {
     }
 
     pub fn lock<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut spin: usize = 0;
+        let max_spin = if cfg!(windows) { 500 } else { 32 };
         loop {
             if !self.is_locked.load(Ordering::Relaxed) {
                 if let Ok(_) = self.is_locked.compare_exchange_weak(
@@ -31,7 +33,8 @@ impl<T> Mutex<T> {
                     break;
                 }
             }
-            spin_loop_hint();
+            spin = spin.wrapping_add(1);
+            (0..(1 << spin).min(max_spin)).for_each(|_| spin_loop_hint());
         }
         let result = f(unsafe { &mut *self.value.get() });
         self.is_locked.store(false, Ordering::Release);

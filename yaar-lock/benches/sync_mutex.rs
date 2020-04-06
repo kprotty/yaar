@@ -13,14 +13,16 @@ use std::{
 mod sync_mutexes;
 use sync_mutexes::*;
 
+type BenchValue = CachePadded<f64>;
+
 fn bench_all(c: &mut Criterion, ctx: BenchContext) {
-    bench_mutex::<std::sync::Mutex<f64>>(c, ctx);
-    bench_mutex::<parking_lot::Mutex<f64>>(c, ctx);
-    bench_mutex::<yaar_lock::sync::Mutex<f64>>(c, ctx);
+    bench_mutex::<std::sync::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<parking_lot::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<yaar_lock::sync::Mutex<BenchValue>>(c, ctx);
     
-    bench_mutex::<std_lock::Mutex<f64>>(c, ctx);
-    bench_mutex::<spin_lock::Mutex<f64>>(c, ctx);
-    #[cfg(windows)] bench_mutex::<nt_lock::Mutex<f64>>(c, ctx);
+    bench_mutex::<std_lock::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<spin_lock::Mutex<BenchValue>>(c, ctx);
+    #[cfg(windows)] bench_mutex::<nt_lock::Mutex<BenchValue>>(c, ctx);
 }
 
 #[derive(Copy, Clone)]
@@ -29,18 +31,19 @@ struct BenchContext {
     work_per_critical_section: usize,
 }
 
-fn bench_mutex<M: Mutex<f64> + Send + Sync + 'static>(
+fn bench_mutex<M: Mutex<BenchValue> + Send + Sync + 'static>(
     c: &mut Criterion,
     ctx: BenchContext,
 ) {
     c.bench_function(
         &format!(
-            "[sync_mutex] {} threads={}", 
+            "[sync_mutex] {} threads={} work={}", 
             M::NAME,
             ctx.num_threads,
+            ctx.work_per_critical_section,
         ),
         |b| b.iter_custom(|iters| {
-            let mutex = Arc::new(CachePadded::new(M::new(0.0)));
+            let mutex = Arc::new(M::new(BenchValue::new(0.0)));
             let barrier = Arc::new(Barrier::new(ctx.num_threads + 1));
             
             let threads = (0..ctx.num_threads)
@@ -53,9 +56,9 @@ fn bench_mutex<M: Mutex<f64> + Send + Sync + 'static>(
                         for _ in 0..iters {
                             mutex.locked(|shared_value| {
                                 for _ in 0..ctx.work_per_critical_section {
-                                    *shared_value += local_value;
-                                    *shared_value *= 1.01;
-                                    local_value = *shared_value;
+                                    **shared_value += local_value;
+                                    **shared_value *= 1.01;
+                                    local_value = **shared_value;
                                 }
                             });
                         }
@@ -110,27 +113,48 @@ fn bench_throughput(c: &mut Criterion, work_per_critical_section: usize) {
 fn no_critical_section(c: &mut Criterion) {
     bench_throughput(c, 1);
 }
-
-#[allow(unused)]    
+ 
 fn small_critical_section(c: &mut Criterion) {
-    bench_throughput(c, 2);
+    bench_throughput(c, 10);
 }
 
-#[allow(unused)]
 fn large_critical_section(c: &mut Criterion) {
-    bench_throughput(c, 5);
+    bench_throughput(c, 20);
+}
+
+const NOISE_PERCENT: f64 = 0.10;
+const WARM_UP: Duration = Duration::from_millis(500);
+const MEASURE: Duration = Duration::from_millis(500);
+
+criterion_group! {
+    name = lock_throughput;
+    config = Criterion::default()
+        .noise_threshold(NOISE_PERCENT)
+        .warm_up_time(WARM_UP)
+        .measurement_time(MEASURE);
+    targets = no_critical_section
 }
 
 criterion_group! {
-    name = sync_mutex;
+    name = lock_nonblocking;
     config = Criterion::default()
-        .noise_threshold(0.10)
-        .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(1));
-    targets = 
-        no_critical_section,
-        // small_critical_section,
-        // large_critical_section,
+        .noise_threshold(NOISE_PERCENT)
+        .warm_up_time(WARM_UP)
+        .measurement_time(MEASURE);
+    targets = small_critical_section
 }
 
-criterion_main!(sync_mutex);
+criterion_group! {
+    name = lock_blocking;
+    config = Criterion::default()
+        .noise_threshold(NOISE_PERCENT)
+        .warm_up_time(WARM_UP)
+        .measurement_time(MEASURE);
+    targets = large_critical_section
+}
+
+criterion_main!(
+    lock_throughput,
+    lock_nonblocking,
+    lock_blocking,
+);
