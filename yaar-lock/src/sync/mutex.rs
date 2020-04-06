@@ -187,7 +187,7 @@ impl<E: AutoResetEvent> RawMutex<E> {
             if prefer_to_race {
                 state = self.state.load(Ordering::Relaxed);
             } else {
-                state = self.state.fetch_sub(WAKING, Ordering::Relaxed) - WAKING;
+                state = self.state.fetch_and(!WAKING, Ordering::Relaxed) & !WAKING;
             }
         }
     }
@@ -287,7 +287,7 @@ impl<E: AutoResetEvent> RawMutex<E> {
             if let Some(new_tail) = new_tail {
                 head.tail.set(MaybeUninit::new(Some(new_tail)));
                 if prefer_to_race {
-                    self.state.fetch_sub(WAKING, Ordering::Release);
+                    self.state.fetch_and(!WAKING, Ordering::Release);
                 } else {
                     fence(Ordering::Release);
                 }

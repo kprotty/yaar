@@ -56,7 +56,7 @@ impl Signal {
             },
             YieldRequest::Spin { contended, iteration } => {
                 spin_loop_hint();
-                if !contended && iteration < 2 {
+                if !contended && iteration < 16 {
                     YieldResponse::Retry
                 } else {
                     YieldResponse::Block
