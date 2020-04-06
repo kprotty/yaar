@@ -196,7 +196,9 @@ impl<E: AutoResetEvent> RawMutex<E> {
         }
 
         self.byte_state().store(UNLOCKED, Ordering::Release);
-        self.release_slow();
+        if self.state.load(Ordering::Relaxed) & MASK != 0 {
+            self.release_slow();
+        }
     }
 
     #[cold]
@@ -206,7 +208,7 @@ impl<E: AutoResetEvent> RawMutex<E> {
         // being held since the lock holder can do the wake on unlock().
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
-            if (state & MASK == 0) || (state & WAKING != 0) || (state & (LOCKED as usize) != 0) {
+            if (state & MASK == 0) || (state & (WAKING | (LOCKED as usize)) != 0) {
                 return;
             }
             match self.state.compare_exchange_weak(
