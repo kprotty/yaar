@@ -81,17 +81,7 @@ mod if_os {
         }
 
         fn yield_now(request: YieldRequest) -> YieldResponse {
-            if let YieldRequest::QueryBestMethod = request {
-                // On AMD Ryzen, its better to yield to the OS than to spin.
-                // On Intel, the opposite appears to be true.
-                if Self::is_amd_ryzen() {
-                    YieldResponse::Block
-                } else {
-                    YieldResponse::Retry
-                }
-            } else {
-                os::Signal::yield_now(request)
-            }
+            os::Signal::yield_now(request)
         }
     }
 
@@ -110,13 +100,17 @@ mod if_os {
     }
 
     impl OsAutoResetEvent {
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         pub fn is_amd_ryzen() -> bool {
+            Self::is_amd()
+        }
+
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        fn is_amd() -> bool {
             false
         }
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        pub fn is_amd_ryzen() -> bool {
+        fn is_amd() -> bool {
             #[cfg(target_arch = "x86")]
             use core::arch::x86::{__cpuid, CpuidResult};
             #[cfg(target_arch = "x86_64")]

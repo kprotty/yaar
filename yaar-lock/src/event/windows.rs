@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 
-use crate::event::{YieldRequest, YieldResponse, OsInstant};
+use crate::event::{YieldRequest, YieldResponse, OsInstant, OsAutoResetEvent};
 use core::{
     fmt,
     convert::TryInto,
@@ -51,14 +51,17 @@ impl Signal {
 
     pub fn yield_now(request: YieldRequest) -> YieldResponse {
         match request {
-            YieldRequest::QueryBestMethod => unreachable!(),
+            YieldRequest::QueryBestMethod => {
+                YieldResponse::Block
+            },
             YieldRequest::Spin { contended, iteration } => {
-                spin_loop_hint();
-                if !contended && iteration < 40 {
-                    YieldResponse::Retry
-                } else {
-                    YieldResponse::Block
+                if OsAutoResetEvent::is_amd_ryzen() {
+                    spin_loop_hint();
+                } else if !contended && iteration < 6 {
+                    (0..(1<<iteration)).for_each(|_| spin_loop_hint());
+                    return YieldResponse::Retry;
                 }
+                YieldResponse::Block
             },
         }
     }

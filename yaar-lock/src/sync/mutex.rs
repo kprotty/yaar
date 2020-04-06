@@ -45,12 +45,12 @@ struct Waiter<E> {
     tail: Cell<MaybeUninit<Option<NonNull<Self>>>>,
 }
 
-struct BlockingMutex<E> {
+pub struct RawMutex<E> {
     state: AtomicUsize,
     _phantom: PhantomData<E>,
 }
 
-impl<E> BlockingMutex<E> {
+impl<E> RawMutex<E> {
     pub const fn new() -> Self {
         Self {
             state: AtomicUsize::new(UNLOCKED),
@@ -58,7 +58,7 @@ impl<E> BlockingMutex<E> {
         }
     }
 
-    pub fn try_lock(&self) -> bool {
+    pub fn try_acquire(&self) -> bool {
         let mut state = self.state.load(Ordering::Relaxed);
         while state & LOCKED == 0 {
             match self.state.compare_exchange_weak(
@@ -75,8 +75,8 @@ impl<E> BlockingMutex<E> {
     }
 }
 
-impl<E: AutoResetEvent> BlockingMutex<E> {
-    pub unsafe fn lock(&self) {
+impl<E: AutoResetEvent> RawMutex<E> {
+    pub unsafe fn acquire(&self) {
         // Fast-path speculative lock acquire if uncontended
         if let Err(state) = self.state.compare_exchange_weak(
             UNLOCKED,
@@ -84,12 +84,12 @@ impl<E: AutoResetEvent> BlockingMutex<E> {
             Ordering::Acquire,
             Ordering::Relaxed,
         ) {
-            self.lock_slow(state);
+            self.acquire_slow(state);
         }
     }
 
     #[cold]
-    unsafe fn lock_slow(&self, mut state: usize) {
+    unsafe fn acquire_slow(&self, mut state: usize) {
         let mut spin: usize = 0;
         let prefer_to_race = {
             let response = E::yield_now(YieldRequest::QueryBestMethod);
@@ -189,7 +189,7 @@ impl<E: AutoResetEvent> BlockingMutex<E> {
         }
     }
 
-    pub unsafe fn unlock(&self, be_fair: bool) {
+    pub unsafe fn release(&self, be_fair: bool) {
         if be_fair {
             unimplemented!("TODO: fair mutex unlock");
         }
@@ -198,12 +198,12 @@ impl<E: AutoResetEvent> BlockingMutex<E> {
         // if theres threads in the waiter queue & if one isnt already waking up. 
         let state = self.state.fetch_sub(LOCKED, Ordering::Release);
         if (state & MASK != 0) && (state & WAKING == 0) {
-            self.unlock_slow(state - LOCKED);
+            self.release_slow(state - LOCKED);
         }
     }
 
     #[cold]
-    unsafe fn unlock_slow(&self, mut state: usize) {
+    unsafe fn release_slow(&self, mut state: usize) {
         let prefer_to_race = {
             let response = E::yield_now(YieldRequest::QueryBestMethod);
             response == YieldResponse::Retry
@@ -330,20 +330,66 @@ impl<E: AutoResetEvent> BlockingMutex<E> {
     }
 }
 
-impl<E: AutoResetEventTimed> BlockingMutex<E> {
+impl<E: AutoResetEventTimed> RawMutex<E> {
     #[inline]
-    pub unsafe fn try_lock_for(&self, _timeout: E::Duration) -> bool {
+    pub unsafe fn try_acquire_for(&self, _timeout: E::Duration) -> bool {
         unimplemented!("TODO: timed mutex acquire")
     }
 
     #[inline]
-    pub unsafe fn try_lock_until(&self, _timeout: E::Instant) -> bool {
+    pub unsafe fn try_acquire_until(&self, _timeout: E::Instant) -> bool {
         unimplemented!("TODO: tmied mutex acquire")
     }
 }
 
+#[cfg(feature = "lock_api")]
+unsafe impl<E: AutoResetEvent> lock_api::RawMutex for RawMutex<E> {
+    const INIT: Self = Self::new();
+
+    type GuardMarker = lock_api::GuardSend;
+
+    #[inline]
+    fn try_lock(&self) -> bool {
+        self.try_acquire()
+    }
+
+    #[inline]
+    fn lock(&self) {
+        unsafe { self.acquire() };
+    }
+
+    #[inline]
+    fn unlock(&self) {
+        unsafe { self.release(false) };
+    }
+}
+
+#[cfg(feature = "lock_api")]
+unsafe impl<E: AutoResetEvent> lock_api::RawMutexFair for RawMutex<E> {
+    #[inline]
+    fn unlock_fair(&self) {
+        unsafe { self.release(true) };
+    }
+}
+
+#[cfg(feature = "lock_api")]
+unsafe impl<E: AutoResetEventTimed> lock_api::RawMutexTimed for RawMutex<E> {
+    type Duration = E::Duration;
+    type Instant = E::Instant;
+
+    #[inline]
+    fn try_lock_for(&self, timeout: Self::Duration) -> bool {
+        unsafe { self.try_acquire_for(timeout) }
+    }
+
+    #[inline]
+    fn try_lock_until(&self, timeout: Self::Instant) -> bool {
+        unsafe { self.try_acquire_until(timeout) }
+    }
+}
+
 pub struct GenericMutex<E, T> {
-    blocking: BlockingMutex<E>,
+    raw_mutex: RawMutex<E>,
     value: UnsafeCell<T>,
 }
 
@@ -365,7 +411,7 @@ impl<E, T> From<T> for GenericMutex<E, T> {
 impl<E, T> GenericMutex<E, T> {
     pub const fn new(value: T) -> Self {
         Self {
-            blocking: BlockingMutex::new(),
+            raw_mutex: RawMutex::new(),
             value: UnsafeCell::new(value),
         }
     }
@@ -382,7 +428,7 @@ impl<E, T> GenericMutex<E, T> {
 impl<E: AutoResetEvent, T> GenericMutex<E, T> {
     #[inline]
     pub fn try_lock(&self) -> Option<GenericMutexGuard<'_, E, T>> {
-        if self.blocking.try_lock() {
+        if self.raw_mutex.try_acquire() {
             Some(GenericMutexGuard { mutex: self })
         } else {
             None
@@ -391,18 +437,18 @@ impl<E: AutoResetEvent, T> GenericMutex<E, T> {
 
     #[inline]
     pub fn lock(&self) -> GenericMutexGuard<'_, E, T> {
-        unsafe { self.blocking.lock() };
+        unsafe { self.raw_mutex.acquire() };
         GenericMutexGuard { mutex: self }
     }
 
     #[inline]
     pub unsafe fn force_unlock(&self) {
-        self.blocking.unlock(false)
+        self.raw_mutex.release(false)
     }
 
     #[inline]
     pub unsafe fn force_unlock_fair(&self) {
-        self.blocking.unlock(true)
+        self.raw_mutex.release(true)
     }
 }
 
@@ -413,7 +459,7 @@ impl<E: AutoResetEventTimed, T> GenericMutex<E, T> {
         timeout: E::Duration,
     ) -> Option<GenericMutexGuard<'_, E, T>> {
         unsafe {
-            if self.blocking.try_lock_for(timeout) {
+            if self.raw_mutex.try_acquire_for(timeout) {
                 Some(GenericMutexGuard { mutex: self })
             } else {
                 None
@@ -427,7 +473,7 @@ impl<E: AutoResetEventTimed, T> GenericMutex<E, T> {
         timeout: E::Instant,
     ) -> Option<GenericMutexGuard<'_, E, T>> {
         unsafe {
-            if self.blocking.try_lock_until(timeout) {
+            if self.raw_mutex.try_acquire_until(timeout) {
                 Some(GenericMutexGuard { mutex: self })
             } else {
                 None
@@ -475,23 +521,24 @@ impl<'a, E: AutoResetEvent, T> DerefMut for GenericMutexGuard<'a, E, T> {
 
 impl<'a, E: AutoResetEvent, T> Drop for GenericMutexGuard<'a, E, T> {
     fn drop(&mut self) {
-        unsafe { self.mutex.blocking.unlock(false) }
+        unsafe { self.mutex.force_unlock() }
     }
 }
 
 impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
     #[inline]
     pub fn unlock_fair(this: Self) {
-        unsafe { this.mutex.blocking.unlock(true) };
+        unsafe { this.mutex.force_unlock_fair() };
         forget(this)
     }
 
     #[inline]
     pub fn unlocked<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
         unsafe {
-            this.mutex.blocking.unlock(false);
+            this.mutex.force_unlock();
             let value = f();
-            this.mutex.blocking.lock();
+            let guard = this.mutex.lock();
+            forget(guard);
             value
         }
     }
@@ -499,9 +546,10 @@ impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
     #[inline]
     pub fn unlocked_fair<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
         unsafe {
-            this.mutex.blocking.unlock(true);
+            this.mutex.force_unlock_fair();
             let value = f();
-            this.mutex.blocking.lock();
+            let guard = this.mutex.lock();
+            forget(guard);
             value
         }
     }
@@ -514,11 +562,11 @@ impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
         f: impl FnOnce(&mut T) -> &mut U,
     ) -> GenericMappedMutexGuard<'a, E, U> {
         unsafe {
-            let blocking = &this.mutex.blocking;
+            let raw_mutex = &this.mutex.raw_mutex;
             let value = f(&mut *this.mutex.value.get());
             let value = NonNull::new_unchecked(value);
             forget(this);
-            GenericMappedMutexGuard { blocking, value }
+            GenericMappedMutexGuard { raw_mutex, value }
         }
     }
 
@@ -528,11 +576,11 @@ impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
         f: impl FnOnce(&mut T) -> Option<&mut U>,
     ) -> Result<GenericMappedMutexGuard<'a, E, U>, Self> {
         unsafe {
-            let blocking = &this.mutex.blocking;
+            let raw_mutex = &this.mutex.raw_mutex;
             if let Some(value) = f(&mut *this.mutex.value.get()) {
                 let value = NonNull::new_unchecked(value);
                 forget(this);
-                Ok(GenericMappedMutexGuard { blocking, value })
+                Ok(GenericMappedMutexGuard { raw_mutex, value })
             } else {
                 Err(this)
             }
@@ -543,7 +591,7 @@ impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct GenericMappedMutexGuard<'a, E: AutoResetEvent, T> {
     value: NonNull<T>,
-    blocking: &'a BlockingMutex<E>,
+    raw_mutex: &'a RawMutex<E>,
 }
 
 unsafe impl<'a, E: AutoResetEvent, T: Send> Send for GenericMappedMutexGuard<'a, E, T> {}
@@ -565,23 +613,23 @@ impl<'a, E: AutoResetEvent, T> DerefMut for GenericMappedMutexGuard<'a, E, T> {
 
 impl<'a, E: AutoResetEvent, T> Drop for GenericMappedMutexGuard<'a, E, T> {
     fn drop(&mut self) {
-        unsafe { self.blocking.unlock(false) }
+        unsafe { self.raw_mutex.release(false) }
     }
 }
 
 impl<'a, E: AutoResetEvent, T> GenericMappedMutexGuard<'a, E, T> {
     #[inline]
     pub fn unlock_fair(this: Self) {
-        unsafe { this.blocking.unlock(true) };
+        unsafe { this.raw_mutex.release(true) };
         forget(this)
     }
 
     #[inline]
     pub fn unlocked<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
         unsafe {
-            this.blocking.unlock(false);
+            this.raw_mutex.release(false);
             let value = f();
-            this.blocking.lock();
+            this.raw_mutex.acquire();
             value
         }
     }
@@ -589,9 +637,9 @@ impl<'a, E: AutoResetEvent, T> GenericMappedMutexGuard<'a, E, T> {
     #[inline]
     pub fn unlocked_fair<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
         unsafe {
-            this.blocking.unlock(true);
+            this.raw_mutex.release(true);
             let value = f();
-            this.blocking.lock();
+            this.raw_mutex.acquire();
             value
         }
     }
@@ -604,11 +652,11 @@ impl<'a, E: AutoResetEvent, T> GenericMappedMutexGuard<'a, E, T> {
         f: impl FnOnce(&mut T) -> &mut U,
     ) -> GenericMappedMutexGuard<'a, E, U> {
         unsafe {
-            let blocking = this.blocking;
+            let raw_mutex = this.raw_mutex;
             let value = f(&mut *this.value.as_ptr());
             let value = NonNull::new_unchecked(value);
             forget(this);
-            GenericMappedMutexGuard { blocking, value }
+            GenericMappedMutexGuard { raw_mutex, value }
         }
     }
 
@@ -618,11 +666,11 @@ impl<'a, E: AutoResetEvent, T> GenericMappedMutexGuard<'a, E, T> {
         f: impl FnOnce(&mut T) -> Option<&mut U>,
     ) -> Result<GenericMappedMutexGuard<'a, E, U>, Self> {
         unsafe {
-            let blocking = this.blocking;
+            let raw_mutex = this.raw_mutex;
             if let Some(value) = f(&mut *this.value.as_ptr()) {
                 let value = NonNull::new_unchecked(value);
                 forget(this);
-                Ok(GenericMappedMutexGuard { blocking, value })
+                Ok(GenericMappedMutexGuard { raw_mutex, value })
             } else {
                 Err(this)
             }

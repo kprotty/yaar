@@ -15,7 +15,7 @@ Fast, no_std synchronization primitives.
 [features]
 default = []
 nightly = []
-full = ["os", "sync", "future"]
+full = ["os", "sync", "future", "lock_api"]
 
 # Main features for yaar-lock
 os = ["yaar-sys"]
@@ -23,6 +23,7 @@ sync = []
 future = []
 
 [dependencies]
+lock_api = { version = "0.3", optional = true }
 yaar-sys = { path = "../yaar-sys", optional = true }
 
 [package.metadata.docs.rs]
