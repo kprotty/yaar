@@ -1,19 +1,8 @@
 
-#[non_exhaustive]
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum YieldRequest {
-    QueryBestMethod,
-    Spin {
-        contended: bool,
-        iteration: usize,
-    },
-}
-
-#[non_exhaustive]
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum YieldResponse {
-    Retry,
-    Block,
+pub struct YieldContext {
+    pub contended: bool,
+    pub iteration: usize,
+    pub(crate) _sealed: (),
 }
 
 pub unsafe trait AutoResetEvent: Sync + Sized + Default {
@@ -21,7 +10,7 @@ pub unsafe trait AutoResetEvent: Sync + Sized + Default {
 
     fn wait(&self);
 
-    fn yield_now(request: YieldRequest) -> YieldResponse;
+    fn yield_now(context: YieldContext) -> bool;
 }
 
 pub unsafe trait AutoResetEventTimed: AutoResetEvent {
@@ -47,6 +36,7 @@ pub use if_os::*;
 #[cfg(feature = "os")]
 mod if_os {
     use super::*;
+    use core::sync::atomic::spin_loop_hint;
 
     #[derive(Debug)]
     pub struct OsAutoResetEvent {
@@ -80,8 +70,15 @@ mod if_os {
             debug_assert!(notified);
         }
 
-        fn yield_now(request: YieldRequest) -> YieldResponse {
-            os::Signal::yield_now(request)
+        fn yield_now(context: YieldContext) -> bool {
+            if Self::is_amd() || context.contended || context.iteration >= 1024 {
+                spin_loop_hint();
+                return false;
+            }
+            for _ in 0..(1 << context.iteration).min(100) {
+                spin_loop_hint();
+            }
+            true
         }
     }
 

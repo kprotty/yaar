@@ -1,14 +1,14 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 
-use crate::event::{YieldRequest, YieldResponse, OsInstant};
+use crate::event::OsInstant;
 use core::{
     fmt,
     convert::TryInto,
     mem::{size_of, transmute},
     num::NonZeroUsize,
     ptr::null,
-    sync::atomic::{spin_loop_hint, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 use yaar_sys::{
@@ -46,22 +46,6 @@ impl Signal {
     pub const fn new() -> Self {
         Self {
             state: AtomicUsize::new(EMPTY),
-        }
-    }
-
-    pub fn yield_now(request: YieldRequest) -> YieldResponse {
-        match request {
-            YieldRequest::QueryBestMethod => {
-                YieldResponse::Block
-            },
-            YieldRequest::Spin { contended, iteration } => {
-                spin_loop_hint();
-                if !contended && iteration < 16 {
-                    YieldResponse::Retry
-                } else {
-                    YieldResponse::Block
-                }
-            },
         }
     }
 

@@ -108,7 +108,7 @@ fn bench_throughput(c: &mut Criterion, work_per_critical_section: usize) {
 }
 
 fn no_critical_section(c: &mut Criterion) {
-    bench_throughput(c, 0);
+    bench_throughput(c, 1);
 }
 
 #[allow(unused)]    

@@ -1,8 +1,7 @@
 use crate::{
     utils::UnwrapUnchecked,
     event::{
-        YieldRequest,
-        YieldResponse,
+        YieldContext,
         AutoResetEvent,
         AutoResetEventTimed,
     },
@@ -39,6 +38,7 @@ const MASK: usize = (!(WAKING - 1)) & !WAKING;
 
 #[repr(align(512))]
 struct Waiter<E> {
+    acquire_waking: Cell<bool>,
     event: Cell<MaybeUninit<E>>,
     prev: Cell<MaybeUninit<Option<NonNull<Self>>>>,
     next: Cell<MaybeUninit<Option<NonNull<Self>>>>,
@@ -94,13 +94,9 @@ impl<E: AutoResetEvent> RawMutex<E> {
     #[cold]
     unsafe fn acquire_slow(&self) {
         let mut spin: usize = 0;
-        let prefer_to_race = {
-            let response = E::yield_now(YieldRequest::QueryBestMethod);
-            response == YieldResponse::Retry
-        };
-
         let mut event_initialized = false;
         let waiter = Waiter {
+            acquire_waking: Cell::new(false),
             event: Cell::new(MaybeUninit::uninit()),
             prev: Cell::new(MaybeUninit::uninit()),
             next: Cell::new(MaybeUninit::uninit()),
@@ -136,10 +132,11 @@ impl<E: AutoResetEvent> RawMutex<E> {
             // Get the head of the waiter queue if any
             // and spin on the lock if the Event deems appropriate.
             let head = NonNull::new((state & MASK) as *mut Waiter<E>);
-            if prefer_to_race && E::yield_now(YieldRequest::Spin {
+            if E::yield_now(YieldContext {
                 contended: head.is_some(),
                 iteration: spin,
-            }) == YieldResponse::Retry {
+                _sealed: (),
+            }) {
                 spin = spin.wrapping_add(1);
                 state = self.state.load(Ordering::Relaxed);
                 continue;
@@ -184,10 +181,11 @@ impl<E: AutoResetEvent> RawMutex<E> {
             // Mark that we're awake so that another thread can be woken up in unlock().
             spin = 0;
             waiter.prev.set(MaybeUninit::new(None));
-            if prefer_to_race {
-                state = self.state.load(Ordering::Relaxed);
-            } else {
+            if waiter.acquire_waking.get() {
+                waiter.acquire_waking.set(false);
                 state = self.state.fetch_and(!WAKING, Ordering::Relaxed) & !WAKING;
+            } else {
+                state = self.state.load(Ordering::Relaxed);
             }
         }
     }
@@ -203,20 +201,12 @@ impl<E: AutoResetEvent> RawMutex<E> {
 
     #[cold]
     unsafe fn release_slow(&self) {
-        let prefer_to_race = {
-            let response = E::yield_now(YieldRequest::QueryBestMethod);
-            response == YieldResponse::Retry
-        };
-
         // Try to acquire the WAKING flag on the mutex in order to deque->wake a waiting thread.
         // Bail if theres no threads to deque, theres already a thread waiting, or the lock is
         // being held since the lock holder can do the wake on unlock().
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
-            if (state & MASK == 0) || (state & WAKING != 0) {
-                return;
-            }
-            if !prefer_to_race && (state & (LOCKED as usize) != 0) {
+            if (state & MASK == 0) || (state & WAKING != 0) || (state & (LOCKED as usize) != 0) {
                 return;
             }
             match self.state.compare_exchange_weak(
@@ -286,11 +276,8 @@ impl<E: AutoResetEvent> RawMutex<E> {
             // Release barrier to make the queue link writes visible to next unlock thread.
             if let Some(new_tail) = new_tail {
                 head.tail.set(MaybeUninit::new(Some(new_tail)));
-                if prefer_to_race {
-                    self.state.fetch_and(!WAKING, Ordering::Release);
-                } else {
-                    fence(Ordering::Release);
-                }
+                tail.acquire_waking.set(true);
+                fence(Ordering::Release);
 
             // The tail was the last waiter in the queue.
             // Try to zero out the queue while also releasing the DEQUEUING lock.
@@ -301,13 +288,9 @@ impl<E: AutoResetEvent> RawMutex<E> {
             // no other thread can observe the waiters.
             } else {
                 loop {
-                    let mut new_state = state & (LOCKED as usize);
-                    if !prefer_to_race {
-                        new_state |= WAKING;
-                    }
                     match self.state.compare_exchange_weak(
                         state,
-                        new_state,
+                        state & (LOCKED as usize),
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                     ) {
