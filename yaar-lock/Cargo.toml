@@ -26,6 +26,15 @@ future = []
 lock_api = { version = "0.3", optional = true }
 yaar-sys = { path = "../yaar-sys", optional = true }
 
+[dev-dependencies]
+criterion = "0.3"
+num_cpus = "1.11"
+parking_lot = "0.10"
+
+[[bench]]
+name = "sync_mutex"
+harness = false
+
 [package.metadata.docs.rs]
 features = ["full", "nightly"]
 

@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 
-use crate::event::{YieldRequest, YieldResponse, OsInstant, OsAutoResetEvent};
+use crate::event::{YieldRequest, YieldResponse, OsInstant};
 use core::{
     fmt,
     convert::TryInto,
@@ -55,13 +55,12 @@ impl Signal {
                 YieldResponse::Block
             },
             YieldRequest::Spin { contended, iteration } => {
-                if OsAutoResetEvent::is_amd_ryzen() {
-                    spin_loop_hint();
-                } else if !contended && iteration < 6 {
-                    (0..(1<<iteration)).for_each(|_| spin_loop_hint());
-                    return YieldResponse::Retry;
+                spin_loop_hint();
+                if !contended && iteration < 2 {
+                    YieldResponse::Retry
+                } else {
+                    YieldResponse::Block
                 }
-                YieldResponse::Block
             },
         }
     }

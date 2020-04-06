@@ -4,5 +4,4 @@ members = [
     "yaar-sys",
     "yaar-lock",
     "yaar-reactor",
-    "yaar-lock/benches",
 ]

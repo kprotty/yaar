@@ -1,6 +1,2 @@
 [alias]
-bench_sync_mutex = [
-    "run", "--release", "--bin",
-    "sync_mutex", "--features=sync_mutex",
-    "--manifest-path", "./benches/Cargo.toml",
-]
+bench_sync_mutex = ["bench", "sync_mutex", "--features=full"]

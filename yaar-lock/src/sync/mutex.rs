@@ -77,7 +77,6 @@ impl<E> RawMutex<E> {
 
 impl<E: AutoResetEvent> RawMutex<E> {
     pub unsafe fn acquire(&self) {
-        // Fast-path speculative lock acquire if uncontended
         if let Err(state) = self.state.compare_exchange_weak(
             UNLOCKED,
             LOCKED,
@@ -133,7 +132,7 @@ impl<E: AutoResetEvent> RawMutex<E> {
             // Get the head of the waiter queue if any
             // and spin on the lock if the Event deems appropriate.
             let head = NonNull::new((state & MASK) as *mut Waiter<E>);
-            if E::yield_now(YieldRequest::Spin {
+            if prefer_to_race && E::yield_now(YieldRequest::Spin {
                 contended: head.is_some(),
                 iteration: spin,
             }) == YieldResponse::Retry {
