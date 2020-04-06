@@ -1,8 +1,19 @@
 
+#[non_exhaustive]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum YieldRequest {
+    QueryBestMethod,
+    Spin {
+        contended: bool,
+        iteration: usize,
+    },
+}
 
-pub struct YieldContext {
-    pub contended: bool,
-    pub iteration: usize,
+#[non_exhaustive]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum YieldResponse {
+    Retry,
+    Block,
 }
 
 pub unsafe trait AutoResetEvent: Sync + Sized + Default {
@@ -10,7 +21,7 @@ pub unsafe trait AutoResetEvent: Sync + Sized + Default {
 
     fn wait(&self);
 
-    fn yield_now(context: YieldContext) -> bool;
+    fn yield_now(request: YieldRequest) -> YieldResponse;
 }
 
 pub unsafe trait AutoResetEventTimed: AutoResetEvent {
@@ -69,8 +80,8 @@ mod if_os {
             debug_assert!(notified);
         }
 
-        fn yield_now(context: YieldContext) -> bool {
-            os::Signal::yield_now(context)
+        fn yield_now(request: YieldRequest) -> YieldResponse {
+            os::Signal::yield_now(request)
         }
     }
 

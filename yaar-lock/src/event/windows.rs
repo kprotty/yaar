@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 
-use crate::{YieldContext, OsInstant};
+use crate::event::{YieldRequest, YieldResponse, OsInstant};
 use core::{
     fmt,
     convert::TryInto,
@@ -49,9 +49,20 @@ impl Signal {
         }
     }
 
-    pub fn yield_now(context: YieldContext) -> bool {
-        spin_loop_hint();
-        !context.contended && context.iteration < 40
+    pub fn yield_now(request: YieldRequest) -> YieldResponse {
+        match request {
+            YieldRequest::QueryBestMethod => {
+                YieldResponse::Block
+            },
+            YieldRequest::Spin { contended, iteration } => {
+                spin_loop_hint();
+                if !contended && iteration < 40 {
+                    YieldResponse::Retry
+                } else {
+                    YieldResponse::Block
+                }
+            },
+        }
     }
 
     pub fn notify(&self) {
