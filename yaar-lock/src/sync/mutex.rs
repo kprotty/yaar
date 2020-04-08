@@ -1,10 +1,6 @@
 use crate::{
+    event::{AutoResetEvent, AutoResetEventTimed, YieldContext},
     utils::UnwrapUnchecked,
-    event::{
-        YieldContext,
-        AutoResetEvent,
-        AutoResetEventTimed,
-    },
 };
 use core::{
     cell::{Cell, UnsafeCell},
@@ -13,7 +9,7 @@ use core::{
     mem::{forget, MaybeUninit},
     ops::{Deref, DerefMut},
     ptr::{drop_in_place, NonNull},
-    sync::atomic::{fence, Ordering, AtomicU8, AtomicUsize},
+    sync::atomic::{fence, AtomicU8, AtomicUsize, Ordering},
 };
 
 #[cfg(feature = "os")]
@@ -118,7 +114,7 @@ impl<E: AutoResetEvent> RawMutex<E> {
                     // Safety:
                     // Holding the lock guarantees our waiter isnt enqueued
                     // and hence accesible by another possible unlock() thread
-                    // so it is ok to create a mutable reference to its fields. 
+                    // so it is ok to create a mutable reference to its fields.
                     if event_initialized {
                         let maybe_event = &mut *waiter.event.as_ptr();
                         drop_in_place(maybe_event.as_mut_ptr());
@@ -170,7 +166,7 @@ impl<E: AutoResetEvent> RawMutex<E> {
                 state = e;
                 continue;
             }
-            
+
             // Park on our event until unparked by a dequeing thread.
             // Safety: guaranteed to be initialized from init_event.
             let maybe_event = &*waiter.event.as_ptr();
@@ -203,9 +199,10 @@ impl<E: AutoResetEvent> RawMutex<E> {
 
     #[cold]
     unsafe fn release_slow(&self) {
-        // Try to acquire the WAKING flag on the mutex in order to deque->wake a waiting thread.
-        // Bail if theres no threads to deque, theres already a thread waiting, or the lock is
-        // being held since the lock holder can do the wake on unlock().
+        // Try to acquire the WAKING flag on the mutex in order to deque->wake a waiting
+        // thread. Bail if theres no threads to deque, theres already a thread
+        // waiting, or the lock is being held since the lock holder can do the
+        // wake on unlock().
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
             if (state & MASK == 0) || (state & (WAKING | (LOCKED as usize)) != 0) {
@@ -221,13 +218,14 @@ impl<E: AutoResetEvent> RawMutex<E> {
                 Ok(_) => {
                     state |= WAKING;
                     break;
-                },
+                }
             }
         }
 
         // Our thread is now the only one dequeing a node from the wait quuee.
-        // On enter, and on re-loop, need an Acquire barrier in order to observe the head
-        // waiter field writes from both the previous deque thread and the enqueue thread.
+        // On enter, and on re-loop, need an Acquire barrier in order to observe the
+        // head waiter field writes from both the previous deque thread and the
+        // enqueue thread.
         'deque: loop {
             // Safety: guaranteed non-null from the WAKING acquire loop above.
             let head = &*((state & MASK) as *const Waiter<E>);
@@ -273,7 +271,7 @@ impl<E: AutoResetEvent> RawMutex<E> {
             // Get the new tail of the queue by traversing backwards
             // from the tail to the head following the prev links set above.
             let new_tail = tail.prev.get().assume_init();
-            
+
             // The tail isnt the last waiter, update the tail of the queue.
             // Release barrier to make the queue link writes visible to next unlock thread.
             if let Some(new_tail) = new_tail {
@@ -282,10 +280,11 @@ impl<E: AutoResetEvent> RawMutex<E> {
                 fence(Ordering::Release);
 
             // The tail was the last waiter in the queue.
-            // Try to zero out the queue while also releasing the DEQUEUING lock.
-            // If a new waiter comes in, we need to retry the deque
-            // since it's next link would point to our dequed tail.
-            // 
+            // Try to zero out the queue while also releasing the DEQUEUING
+            // lock. If a new waiter comes in, we need to retry the
+            // deque since it's next link would point to our dequed
+            // tail.
+            //
             // No release barrier since after zeroing the queue,
             // no other thread can observe the waiters.
             } else {
@@ -327,7 +326,6 @@ impl<E: AutoResetEventTimed> RawMutex<E> {
     }
 }
 
-#[cfg(feature = "lock_api")]
 unsafe impl<E: AutoResetEvent> lock_api::RawMutex for RawMutex<E> {
     const INIT: Self = Self::new();
 
@@ -349,7 +347,6 @@ unsafe impl<E: AutoResetEvent> lock_api::RawMutex for RawMutex<E> {
     }
 }
 
-#[cfg(feature = "lock_api")]
 unsafe impl<E: AutoResetEvent> lock_api::RawMutexFair for RawMutex<E> {
     #[inline]
     fn unlock_fair(&self) {
@@ -357,7 +354,6 @@ unsafe impl<E: AutoResetEvent> lock_api::RawMutexFair for RawMutex<E> {
     }
 }
 
-#[cfg(feature = "lock_api")]
 unsafe impl<E: AutoResetEventTimed> lock_api::RawMutexTimed for RawMutex<E> {
     type Duration = E::Duration;
     type Instant = E::Instant;
@@ -439,10 +435,7 @@ impl<E: AutoResetEvent, T> GenericMutex<E, T> {
 
 impl<E: AutoResetEventTimed, T> GenericMutex<E, T> {
     #[inline]
-    pub fn try_lock_for(
-        &self,
-        timeout: E::Duration,
-    ) -> Option<GenericMutexGuard<'_, E, T>> {
+    pub fn try_lock_for(&self, timeout: E::Duration) -> Option<GenericMutexGuard<'_, E, T>> {
         unsafe {
             if self.raw_mutex.try_acquire_for(timeout) {
                 Some(GenericMutexGuard { mutex: self })
@@ -453,10 +446,7 @@ impl<E: AutoResetEventTimed, T> GenericMutex<E, T> {
     }
 
     #[inline]
-    pub fn try_lock_until(
-        &self,
-        timeout: E::Instant,
-    ) -> Option<GenericMutexGuard<'_, E, T>> {
+    pub fn try_lock_until(&self, timeout: E::Instant) -> Option<GenericMutexGuard<'_, E, T>> {
         unsafe {
             if self.raw_mutex.try_acquire_until(timeout) {
                 Some(GenericMutexGuard { mutex: self })
@@ -470,14 +460,8 @@ impl<E: AutoResetEventTimed, T> GenericMutex<E, T> {
 impl<E: AutoResetEvent, T: fmt::Debug> fmt::Debug for GenericMutex<E, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.try_lock() {
-            Some(guard) => f
-                .debug_struct("Mutex")
-                .field("data", &&*guard)
-                .finish(),
-            None => f
-                .debug_struct("Mutex")
-                .field("data", &"<locked>")
-                .finish(),
+            Some(guard) => f.debug_struct("Mutex").field("data", &&*guard).finish(),
+            None => f.debug_struct("Mutex").field("data", &"<locked>").finish(),
         }
     }
 }

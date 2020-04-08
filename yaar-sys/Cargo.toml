@@ -6,3 +6,7 @@ edition = "2018"
 description = """
 System definitions for platforms supported by the yaar crate ecosystem
 """
+
+[target.'cfg(unix)'.dependencies.libc]
+verison = "0.2"
+default-features = false

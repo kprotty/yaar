@@ -1,6 +1,6 @@
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{spin_loop_hint, Ordering, AtomicBool},
+    sync::atomic::{spin_loop_hint, AtomicBool, Ordering},
 };
 
 pub struct Mutex<T> {

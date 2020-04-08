@@ -1,22 +1,20 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 
-use crate::event::OsInstant;
+use crate::event::{OsInstant, OsDuration};
 use core::{
-    fmt,
     convert::TryInto,
+    fmt,
     mem::{size_of, transmute},
     num::NonZeroUsize,
     ptr::null,
     sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
 };
 use yaar_sys::{
     CloseHandle, GetLastError, GetModuleHandleW, GetProcAddress, NtCreateKeyedEventFn,
-    NtReleaseKeyedEventFn, NtWaitForKeyedEventFn,
-    WaitOnAddressFn, WakeByAddressSingleFn, ERROR_TIMEOUT, FALSE,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, INFINITE, INVALID_HANDLE_VALUE, LARGE_INTEGER, PVOID,
-    STATUS_SUCCESS, STATUS_TIMEOUT, TRUE,
+    NtReleaseKeyedEventFn, NtWaitForKeyedEventFn, WaitOnAddressFn, WakeByAddressSingleFn,
+    ERROR_TIMEOUT, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, INFINITE, INVALID_HANDLE_VALUE,
+    LARGE_INTEGER, PVOID, STATUS_SUCCESS, STATUS_TIMEOUT, TRUE,
 };
 
 const EMPTY: usize = 0;
@@ -36,9 +34,7 @@ impl fmt::Debug for Signal {
             _ => "unknown",
         };
 
-        f.debug_struct("OsSignal")
-            .field("state", &state)
-            .finish()
+        f.debug_struct("OsSignal").field("state", &state).finish()
     }
 }
 
@@ -52,7 +48,9 @@ impl Signal {
     pub fn notify(&self) {
         let mut state = self.state.load(Ordering::Relaxed);
         if state == EMPTY {
-            state = self.state.compare_and_swap(EMPTY, NOTIFIED, Ordering::Relaxed);
+            state = self
+                .state
+                .compare_and_swap(EMPTY, NOTIFIED, Ordering::Relaxed);
             if state == EMPTY {
                 return;
             }
@@ -63,14 +61,14 @@ impl Signal {
         unsafe { Backend::futex_wake(&self.state) };
     }
 
-    pub fn wait(&self, timeout: Option<&mut Duration>) -> bool {
+    pub fn wait(&self, timeout: Option<&mut OsDuration>) -> bool {
         let mut state = self.state.load(Ordering::Relaxed);
         if state == EMPTY {
-            state = self.state.compare_and_swap(EMPTY, WAITING, Ordering::Relaxed);
+            state = self
+                .state
+                .compare_and_swap(EMPTY, WAITING, Ordering::Relaxed);
             if state == EMPTY {
-                return unsafe { 
-                    Backend::futex_wait(&self.state, WAITING, EMPTY, timeout)
-                };
+                return unsafe { Backend::futex_wait(&self.state, WAITING, EMPTY, timeout) };
             }
         }
 
@@ -131,7 +129,7 @@ impl Backend {
         ptr: &AtomicUsize,
         expect: usize,
         reset: usize,
-        mut timeout: Option<&mut Duration>,
+        mut timeout: Option<&mut OsDuration>,
     ) -> bool {
         match Self::get() {
             Self::KeyedEvent(handle) => {
@@ -182,10 +180,11 @@ impl Backend {
                         .unwrap_or(INFINITE);
 
                     if timeout_ms == 0 {
-                        let timed_out = ptr.compare_and_swap(expect, reset, Ordering::Relaxed) == expect;
+                        let timed_out =
+                            ptr.compare_and_swap(expect, reset, Ordering::Relaxed) == expect;
                         return !timed_out;
                     }
-                
+
                     let status = WaitOnAddress(
                         ptr as *const _ as PVOID,
                         &expect as *const _ as PVOID,

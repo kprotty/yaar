@@ -1,4 +1,3 @@
-
 pub trait Mutex<T> {
     const NAME: &'static str;
 
@@ -16,7 +15,7 @@ impl<T> Mutex<T> for std::sync::Mutex<T> {
 
     fn locked<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         f(&mut *self.lock().unwrap())
-    } 
+    }
 }
 
 impl<T> Mutex<T> for parking_lot::Mutex<T> {
@@ -28,7 +27,7 @@ impl<T> Mutex<T> for parking_lot::Mutex<T> {
 
     fn locked<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         f(&mut *self.lock())
-    } 
+    }
 }
 
 impl<T> Mutex<T> for yaar_lock::sync::Mutex<T> {
@@ -40,7 +39,7 @@ impl<T> Mutex<T> for yaar_lock::sync::Mutex<T> {
 
     fn locked<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         f(&mut *self.lock())
-    } 
+    }
 }
 
 pub mod std_lock;
@@ -53,7 +52,7 @@ impl<T> Mutex<T> for std_lock::Mutex<T> {
 
     fn locked<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         f(&mut *self.lock())
-    } 
+    }
 }
 
 pub mod spin_lock;
@@ -66,7 +65,7 @@ impl<T> Mutex<T> for spin_lock::Mutex<T> {
 
     fn locked<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         self.lock(f)
-    } 
+    }
 }
 
 pub mod sys_lock;
@@ -79,7 +78,7 @@ impl<T> Mutex<T> for sys_lock::Mutex<T> {
 
     fn locked<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         self.lock(f)
-    } 
+    }
 }
 
 #[cfg(windows)]
@@ -94,5 +93,5 @@ impl<T> Mutex<T> for nt_lock::Mutex<T> {
 
     fn locked<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         self.lock(f)
-    } 
+    }
 }

@@ -57,4 +57,3 @@ mod sys {
         fn ReleaseSRWLockExclusive(srwlock: *mut SRWLOCK);
     }
 }
-

@@ -1,5 +1,3 @@
-
-
 pub trait UnwrapUnchecked<T> {
     unsafe fn unwrap_unchecked(self) -> T;
 }

@@ -1,13 +1,12 @@
 use std::{
-    fmt,
     cell::{Cell, UnsafeCell},
-    ptr::NonNull,
+    fmt,
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
+    ptr::NonNull,
     sync::{
-        Condvar,
-        Mutex as StdMutex,
-        atomic::{fence, Ordering, AtomicUsize},
+        atomic::{fence, AtomicUsize, Ordering},
+        Condvar, Mutex as StdMutex,
     },
 };
 
@@ -45,7 +44,8 @@ impl Node {
     #[cold]
     pub fn lazy_init(&self) {
         self.condvar.set(MaybeUninit::new(Condvar::new()));
-        self.mutex.set(MaybeUninit::new(StdMutex::new(NodeState::Empty)));
+        self.mutex
+            .set(MaybeUninit::new(StdMutex::new(NodeState::Empty)));
     }
 
     pub fn with_local<T>(f: impl FnOnce(&Self) -> T) -> T {
@@ -134,7 +134,7 @@ impl<T> Mutex<T> {
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(MutexGuard{ mutex: self }),
+                Ok(_) => return Some(MutexGuard { mutex: self }),
                 Err(e) => state = e,
             }
         }
@@ -149,7 +149,7 @@ impl<T> Mutex<T> {
         {
             self.lock_slow();
         }
-        MutexGuard{ mutex: self }
+        MutexGuard { mutex: self }
     }
 
     #[cold]
@@ -178,7 +178,7 @@ impl<T> Mutex<T> {
                     state = self.state.load(Ordering::Relaxed);
                     continue;
                 }
-                
+
                 if !node.initialized.get() {
                     node.initialized.set(true);
                     node.lazy_init();
@@ -246,12 +246,12 @@ impl<T> Mutex<T> {
                         Some(tail) => {
                             head.tail.set(Some(tail));
                             break &*tail.as_ptr();
-                        },
+                        }
                         None => {
                             let next = &*current.next.get().unwrap().as_ptr();
                             next.prev.set(NonNull::new(current as *const _ as *mut _));
                             current = next;
-                        },
+                        }
                     }
                 }
             };
@@ -274,7 +274,7 @@ impl<T> Mutex<T> {
                 Some(new_tail) => {
                     head.tail.set(Some(new_tail));
                     self.state.fetch_and(!QUEUE_LOCK, Ordering::Release);
-                },
+                }
                 None => loop {
                     match self.state.compare_exchange_weak(
                         state,
@@ -289,7 +289,7 @@ impl<T> Mutex<T> {
                         fence(Ordering::Acquire);
                         continue 'outer;
                     }
-                }
+                },
             }
 
             tail.notify();
@@ -320,14 +320,12 @@ impl<T> Mutex<T> {
     #[cfg(all(windows, any(target_arch = "x86_64", target_arch = "x86")))]
     fn yield_now(spin: usize) -> bool {
         #[cfg(target_arch = "x86")]
-        use std::arch::x86::{__cpuid, CpuidResult};
+        use std::arch::x86::{CpuidResult, __cpuid};
         #[cfg(target_arch = "x86_64")]
-        use std::arch::x86_64::{__cpuid, CpuidResult};
+        use std::arch::x86_64::{CpuidResult, __cpuid};
 
         use std::{
-            slice::from_raw_parts,
-            str::from_utf8_unchecked,
-            hint::unreachable_unchecked,
+            hint::unreachable_unchecked, slice::from_raw_parts, str::from_utf8_unchecked,
             sync::atomic::spin_loop_hint,
         };
 
@@ -341,7 +339,7 @@ impl<T> Mutex<T> {
                     let is_amd = vendor == "AuthenticAMD";
                     IS_AMD.store((is_amd as usize) + 1, Ordering::Relaxed);
                     is_amd
-                },
+                }
                 1 => false,
                 2 => true,
                 _ => unreachable_unchecked(),

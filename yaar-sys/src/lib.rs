@@ -3,7 +3,12 @@
 #![allow(non_camel_case_types)]
 #![allow(non_upper_case_globals)]
 
-#[cfg_attr(windows, path = "./windows.rs")]
-mod definitions;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::*;
 
-pub use definitions::*;
+#[cfg(unix)]
+extern crate libc;
+#[cfg(unix)]
+pub use libc::*;

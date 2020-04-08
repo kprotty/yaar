@@ -1,7 +1,7 @@
 use std::{
-    mem::transmute,
     cell::UnsafeCell,
-    sync::atomic::{spin_loop_hint, Ordering, AtomicU8, AtomicUsize},
+    mem::transmute,
+    sync::atomic::{spin_loop_hint, AtomicU8, AtomicUsize, Ordering},
 };
 
 const UNLOCKED: u8 = 0;
@@ -81,7 +81,7 @@ impl<T> Mutex<T> {
                 spin += 1;
                 continue;
             }
-            
+
             if let Ok(_) = self.state.compare_exchange_weak(
                 waiters,
                 waiters + WAIT,
@@ -131,18 +131,21 @@ impl<T> Mutex<T> {
     #[cold]
     fn get_handle_slow() -> usize {
         unsafe {
-            let dll = GetModuleHandleW((&[
-                b'n' as u16,
-                b't' as u16,
-                b'd' as u16,
-                b'l' as u16,
-                b'l' as u16,
-                b'.' as u16,
-                b'd' as u16,
-                b'l' as u16,
-                b'l' as u16,
-                0 as u16,
-            ]).as_ptr());
+            let dll = GetModuleHandleW(
+                (&[
+                    b'n' as u16,
+                    b't' as u16,
+                    b'd' as u16,
+                    b'l' as u16,
+                    b'l' as u16,
+                    b'.' as u16,
+                    b'd' as u16,
+                    b'l' as u16,
+                    b'l' as u16,
+                    0 as u16,
+                ])
+                    .as_ptr(),
+            );
             assert_ne!(dll, 0, "Failed to load ntdll.dll");
 
             let notify = GetProcAddress(dll, b"NtReleaseKeyedEvent\0".as_ptr());
@@ -161,12 +164,7 @@ impl<T> Mutex<T> {
             let status = create(&mut handle, 0x80000000 | 0x40000000, 0, 0);
             assert_eq!(status, 0, "Failed to create NT Keyed Event Handle");
 
-            match NT_HANDLE.compare_exchange(
-                0,
-                handle,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
+            match NT_HANDLE.compare_exchange(0, handle, Ordering::Release, Ordering::Relaxed) {
                 Ok(_) => handle,
                 Err(new_handle) => {
                     let status = CloseHandle(handle);
@@ -182,18 +180,9 @@ static NT_WAIT: AtomicUsize = AtomicUsize::new(0);
 static NT_NOTIFY: AtomicUsize = AtomicUsize::new(0);
 static NT_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
-type NtCreate = extern "stdcall" fn(
-    handle: &mut usize,
-    mask: u32,
-    unused: usize,
-    unused: usize,
-) -> u32;
-type NtInvoke = extern "stdcall" fn(
-    handle: usize,
-    key: usize,
-    block: usize,
-    timeout: usize,
-) -> u32;
+type NtCreate =
+    extern "stdcall" fn(handle: &mut usize, mask: u32, unused: usize, unused: usize) -> u32;
+type NtInvoke = extern "stdcall" fn(handle: usize, key: usize, block: usize, timeout: usize) -> u32;
 
 #[link(name = "kernel32")]
 extern "stdcall" {

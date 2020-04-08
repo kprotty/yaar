@@ -1,12 +1,17 @@
 use core::{
+    ops::{Add, AddAssign, Sub, SubAssign},
     time::Duration,
-    ops::{Add, Sub, AddAssign, SubAssign},
 };
 
-#[cfg_attr(windows, path = "./windows.rs")]
-mod os;
+#[cfg(all(feature = "os", windows))]
+mod windows;
+#[cfg(all(feature = "os", windows))]
+use windows::*;
 
-mod monotonic;
+#[cfg(all(feature = "os", unix))]
+mod posix;
+#[cfg(all(feature = "os", unix))]
+use posix::*;
 
 pub type OsDuration = Duration;
 
@@ -55,7 +60,7 @@ impl Sub<Self> for OsInstant {
 
 impl OsInstant {
     pub fn now() -> Self {
-        let timestamp = unsafe { monotonic::timestamp::<os::Timer>() };
+        let timestamp = unsafe { os_timestamp() };
         Self { timestamp }
     }
 
@@ -65,8 +70,7 @@ impl OsInstant {
     }
 
     pub fn checked_duration_since(&self, earlier: Self) -> Option<Duration> {
-        self.timestamp
-            .checked_sub(earlier.timestamp)
+        self.timestamp.checked_sub(earlier.timestamp)
     }
 
     pub fn saturating_duration_since(&self, earlier: Self) -> Duration {

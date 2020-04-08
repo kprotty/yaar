@@ -1,4 +1,3 @@
-
 pub struct YieldContext {
     pub contended: bool,
     pub iteration: usize,
@@ -22,9 +21,15 @@ pub unsafe trait AutoResetEventTimed: AutoResetEvent {
     fn try_wait_for(&self, timeout: &mut Self::Duration) -> bool;
 }
 
-#[cfg(feature = "os")]
-#[cfg_attr(windows, path = "./windows.rs")]
-mod os;
+#[cfg(all(feature = "os", windows))]
+mod windows;
+#[cfg(all(feature = "os", windows))]
+use windows::Signal;
+
+#[cfg(all(feature = "os", unix))]
+mod posix;
+#[cfg(all(feature = "os", unix))]
+use posix::Signal;
 
 #[cfg(feature = "os")]
 mod time;
@@ -40,7 +45,7 @@ mod if_os {
 
     #[derive(Debug)]
     pub struct OsAutoResetEvent {
-        signal: os::Signal,
+        signal: Signal,
     }
 
     unsafe impl Sync for OsAutoResetEvent {}
@@ -55,7 +60,7 @@ mod if_os {
     impl OsAutoResetEvent {
         pub const fn new() -> Self {
             Self {
-                signal: os::Signal::new(),
+                signal: Signal::new(),
             }
         }
     }
@@ -109,14 +114,14 @@ mod if_os {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         fn is_amd() -> bool {
             #[cfg(target_arch = "x86")]
-            use core::arch::x86::{__cpuid, CpuidResult};
+            use core::arch::x86::{CpuidResult, __cpuid};
             #[cfg(target_arch = "x86_64")]
-            use core::arch::x86_64::{__cpuid, CpuidResult};
+            use core::arch::x86_64::{CpuidResult, __cpuid};
 
             use core::{
+                hint::unreachable_unchecked,
                 slice::from_raw_parts,
                 str::from_utf8_unchecked,
-                hint::unreachable_unchecked,
                 sync::atomic::{AtomicUsize, Ordering},
             };
 
@@ -130,7 +135,7 @@ mod if_os {
                         let is_amd = vendor == "AuthenticAMD";
                         IS_AMD.store((is_amd as usize) + 1, Ordering::Relaxed);
                         is_amd
-                    },
+                    }
                     1 => false,
                     2 => true,
                     _ => unreachable_unchecked(),
