@@ -21,13 +21,13 @@ pub unsafe fn os_timestamp() -> OsDuration {
         now = current;
     }
 
-    OsDuration::from_nanos(now)
+    OsDuration::from_nanos(now.try_into().unwrap_unchecked())
 }
 
 const NANOS_PER_SEC: LARGE_INTEGER = 1_000_000_000;
 const NANOS_RESOLUTION: LARGE_INTEGER = 100;
 
-unsafe fn nanotime() -> u64 {
+unsafe fn nanotime() -> LARGE_INTEGER {
     let ticks_per_sec = {
         const UNINIT: usize = 0;
         const CREATING: usize = 1;
@@ -57,15 +57,15 @@ unsafe fn nanotime() -> u64 {
     debug_assert_eq!(status, TRUE);
 
     let resolution = NANOS_PER_SEC / NANOS_RESOLUTION;
-    (ticks / (ticks_per_sec / resolution)) as u64
+    ticks / (ticks_per_sec / resolution)
 }
 
-const NUM_KEYS: usize = size_of::<u64>() / size_of::<usize>();
+const NUM_KEYS: usize = size_of::<LARGE_INTEGER>() / size_of::<usize>();
 
 unsafe fn load_tls(tls_keys: [usize; NUM_KEYS]) -> LARGE_INTEGER {
     let mut words = [0usize; NUM_KEYS];
     for k in 0..NUM_KEYS {
-        words[k] = unsafe {
+        words[k] = {
             let key = tls_keys[k].try_into().unwrap_unchecked();
             let value = TlsGetValue(key);
             debug_assert_eq!(ERROR_SUCCESS, GetLastError());
@@ -78,11 +78,9 @@ unsafe fn load_tls(tls_keys: [usize; NUM_KEYS]) -> LARGE_INTEGER {
 unsafe fn store_tls(tls_keys: [usize; NUM_KEYS], value: LARGE_INTEGER) {
     let words = transmute::<_, [usize; NUM_KEYS]>(value);
     for k in 0..NUM_KEYS {
-        unsafe {
-            let key = tls_keys[k].try_into().unwrap_unchecked();
-            let stored = TlsSetValue(key, words[k]);
-            debug_assert_eq!(stored, TRUE);
-        };
+        let key = tls_keys[k].try_into().unwrap_unchecked();
+        let stored = TlsSetValue(key, words[k]);
+        debug_assert_eq!(stored, TRUE);
     }
 }
 
@@ -118,7 +116,7 @@ unsafe fn get_tls_keys() -> [usize; NUM_KEYS] {
                             },
                             key => {
                                 created += 1;
-                                TLS_KEYS[k] = key;
+                                TLS_KEYS[k] = key as usize;
                             }
                         }
                     }
