@@ -76,14 +76,20 @@ mod if_os {
         }
 
         fn yield_now(context: YieldContext) -> bool {
-            if Self::is_amd() || context.contended || context.iteration >= 1024 {
-                spin_loop_hint();
-                return false;
+            const BITS: usize = (1024usize - 1).count_ones() as usize;
+
+            if !context.contended {
+                if context.iteration < BITS {
+                    (0..(1 << context.iteration)).for_each(|_| spin_loop_hint());
+                    return true;
+                } else if context.iteration < BITS + 10 {
+                    let spin = context.iteration - (BITS - 1);
+                    (0..(spin * 1024)).for_each(|_| spin_loop_hint());
+                    return true;
+                }
             }
-            for _ in 0..(1 << context.iteration).min(100) {
-                spin_loop_hint();
-            }
-            true
+
+            false
         }
     }
 
@@ -98,49 +104,6 @@ mod if_os {
         fn try_wait_until(&self, timeout: Self::Instant) -> bool {
             let mut timeout = OsInstant::now().saturating_duration_since(timeout);
             timeout.as_nanos() != 0 && self.try_wait_for(&mut timeout)
-        }
-    }
-
-    impl OsAutoResetEvent {
-        pub fn is_amd_ryzen() -> bool {
-            Self::is_amd()
-        }
-
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        fn is_amd() -> bool {
-            false
-        }
-
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        fn is_amd() -> bool {
-            #[cfg(target_arch = "x86")]
-            use core::arch::x86::{CpuidResult, __cpuid};
-            #[cfg(target_arch = "x86_64")]
-            use core::arch::x86_64::{CpuidResult, __cpuid};
-
-            use core::{
-                hint::unreachable_unchecked,
-                slice::from_raw_parts,
-                str::from_utf8_unchecked,
-                sync::atomic::{AtomicUsize, Ordering},
-            };
-
-            static IS_AMD: AtomicUsize = AtomicUsize::new(0);
-            unsafe {
-                match IS_AMD.load(Ordering::Relaxed) {
-                    0 => {
-                        let CpuidResult { ebx, ecx, edx, .. } = __cpuid(0);
-                        let vendor = &[ebx, edx, ecx] as *const _ as *const u8;
-                        let vendor = from_utf8_unchecked(from_raw_parts(vendor, 3 * 4));
-                        let is_amd = vendor == "AuthenticAMD";
-                        IS_AMD.store((is_amd as usize) + 1, Ordering::Relaxed);
-                        is_amd
-                    }
-                    1 => false,
-                    2 => true,
-                    _ => unreachable_unchecked(),
-                }
-            }
         }
     }
 }

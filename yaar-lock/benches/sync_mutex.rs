@@ -15,28 +15,19 @@ use sync_mutexes::*;
 
 type BenchValue = CachePadded<f64>;
 
-fn bench_all(c: &mut Criterion, ctx: BenchContext) {
-    bench_mutex::<std::sync::Mutex<BenchValue>>(c, ctx);
-    bench_mutex::<parking_lot::Mutex<BenchValue>>(c, ctx);
-    bench_mutex::<yaar_lock::sync::Mutex<BenchValue>>(c, ctx);
-
-    bench_mutex::<std_lock::Mutex<BenchValue>>(c, ctx);
-    bench_mutex::<spin_lock::Mutex<BenchValue>>(c, ctx);
-    bench_mutex::<sys_lock::Mutex<BenchValue>>(c, ctx);
-    #[cfg(windows)]
-    bench_mutex::<nt_lock::Mutex<BenchValue>>(c, ctx);
-}
-
 #[derive(Copy, Clone)]
 struct BenchContext {
     num_threads: usize,
     work_per_critical_section: usize,
 }
 
-fn bench_mutex<M: Mutex<BenchValue> + Send + Sync + 'static>(c: &mut Criterion, ctx: BenchContext) {
+fn bench_mutex<M>(c: &mut Criterion, ctx: BenchContext)
+where
+    M: Mutex<BenchValue> + Send + Sync + 'static
+{
     c.bench_function(
         &format!(
-            "[sync_mutex] {} threads={} work={}",
+            "[sync_mutex] [throughput] {} threads={} work_per_lock={}",
             M::NAME,
             ctx.num_threads,
             ctx.work_per_critical_section,
@@ -77,6 +68,19 @@ fn bench_mutex<M: Mutex<BenchValue> + Send + Sync + 'static>(c: &mut Criterion, 
             })
         },
     );
+}
+
+fn bench_all(c: &mut Criterion, ctx: BenchContext) {
+    bench_mutex::<std::sync::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<parking_lot::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<yaar_lock::sync::Mutex<BenchValue>>(c, ctx);
+
+    bench_mutex::<std_lock::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<spin_lock::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<sys_lock::Mutex<BenchValue>>(c, ctx);
+
+    #[cfg(windows)]
+    bench_mutex::<nt_lock::Mutex<BenchValue>>(c, ctx);
 }
 
 fn bench_throughput(c: &mut Criterion, work_per_critical_section: usize) {
@@ -169,4 +173,4 @@ criterion_group! {
     targets = large_critical_section
 }
 
-criterion_main!(lock_throughput, lock_nonblocking, lock_blocking,);
+criterion_main!(lock_nonblocking, lock_blocking,);
