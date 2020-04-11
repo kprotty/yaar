@@ -1,6 +1,8 @@
 use core::{
+    mem::size_of,
     ops::{Add, AddAssign, Sub, SubAssign},
     time::Duration,
+    sync::atomic::{spin_loop_hint, Ordering, AtomicBool},
 };
 
 #[cfg(all(feature = "os", windows))]
@@ -59,9 +61,45 @@ impl Sub<Self> for OsInstant {
 }
 
 impl OsInstant {
+    unsafe fn timestamp() -> OsDuration {
+        let mut now = Timer::timestamp();
+        if Timer::IS_ACTUALLY_MONOTONIC {
+            return now;
+        }
+
+        static LOCKED: AtomicBool = AtomicBool::new(false);
+        static mut CURRENT: OsDuration = OsDuration::from_secs(0);
+
+        let mut spin: usize = 0;
+        loop {
+            if !LOCKED.load(Ordering::Relaxed) {
+                if let Ok(_) = LOCKED.compare_exchange_weak(
+                    false,
+                    true,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    break;
+                }
+            }
+            spin = spin.wrapping_add(size_of::<usize>());
+            (0..spin.min(1024)).for_each(|_| spin_loop_hint());
+        }
+        
+        if CURRENT >= now {
+            now = CURRENT;
+        } else {
+            CURRENT = now;
+        }
+
+        LOCKED.store(false, Ordering::Release);
+        now
+    }
+
     pub fn now() -> Self {
-        let timestamp = unsafe { os_timestamp() };
-        Self { timestamp }
+        Self {
+            timestamp: unsafe { Self::timestamp() },
+        }
     }
 
     pub fn duration_since(&self, earlier: Self) -> Duration {

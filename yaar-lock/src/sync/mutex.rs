@@ -1,15 +1,18 @@
-use crate::{
-    event::{AutoResetEvent, AutoResetEventTimed, YieldContext},
-    utils::UnwrapUnchecked,
-};
+use crate::event::{AutoResetEvent, AutoResetEventTimed, YieldContext};
+use super::parker::{Parker, ParkResult, UnparkResult};
 use core::{
-    cell::{Cell, UnsafeCell},
+    cell::UnsafeCell,
     fmt,
-    marker::PhantomData,
-    mem::{forget, MaybeUninit},
+    mem::forget,
+    ptr::NonNull,
     ops::{Deref, DerefMut},
-    ptr::{drop_in_place, NonNull},
-    sync::atomic::{fence, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
+};
+use lock_api::{
+    GuardSend,
+    RawMutex,
+    RawMutexFair,
+    RawMutexTimed,
 };
 
 #[cfg(feature = "os")]
@@ -27,43 +30,163 @@ mod if_os {
     pub type MappedMutexGuard<'a, T> = GenericMappedMutexGuard<'a, OsAutoResetEvent, T>;
 }
 
-const UNLOCKED: u8 = 0;
-const LOCKED: u8 = 1;
-const WAKING: usize = 1 << 8;
-const MASK: usize = (!(WAKING - 1)) & !WAKING;
+const UNLOCKED: u8 = 0b00;
+const LOCKED: u8 = 0b01;
+const PARKED: u8 = 0b10;
 
-#[repr(align(512))]
-struct Waiter<E> {
-    acquire_waking: Cell<bool>,
-    event: Cell<MaybeUninit<E>>,
-    prev: Cell<MaybeUninit<Option<NonNull<Self>>>>,
-    next: Cell<MaybeUninit<Option<NonNull<Self>>>>,
-    tail: Cell<MaybeUninit<Option<NonNull<Self>>>>,
+const DEFAULT_TOKEN: usize = 0;
+const RETRY_TOKEN: usize = 1;
+const HANDOFF_TOKEN: usize = 2;
+
+pub struct GenericRawMutex<E> {
+    state: AtomicU8,
+    parker: Parker<E>,
 }
 
-pub struct RawMutex<E> {
-    state: AtomicUsize,
-    _phantom: PhantomData<E>,
-}
-
-impl<E> RawMutex<E> {
+impl<E> GenericRawMutex<E> {
     pub const fn new() -> Self {
         Self {
-            state: AtomicUsize::new(UNLOCKED as usize),
-            _phantom: PhantomData,
+            state: AtomicU8::new(UNLOCKED),
+            parker: Parker::new(),
+        }
+    }
+}
+
+impl<E: AutoResetEvent> GenericRawMutex<E> {
+    #[inline]
+    fn acquire(&self, try_park: impl FnMut(&E) -> bool) -> bool {
+        match self.state.compare_exchange_weak(
+            UNLOCKED,
+            LOCKED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => true,
+            Err(_) => self.acquire_slow(try_park),
         }
     }
 
-    fn byte_state(&self) -> &AtomicU8 {
-        unsafe { &*(&self.state as *const _ as *const _) }
+    #[inline]
+    fn release(&self, be_fair: bool) {
+        if let Err(_) = self.state.compare_exchange_weak(
+            LOCKED,
+            UNLOCKED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            self.release_slow(be_fair);
+        }
     }
 
-    pub fn try_acquire(&self) -> bool {
-        let mut state = self.byte_state().load(Ordering::Relaxed);
-        while state == UNLOCKED {
-            match self.byte_state().compare_exchange_weak(
-                UNLOCKED,
-                LOCKED,
+    #[cold]
+    fn acquire_slow(&self, mut try_park: impl FnMut(&E) -> bool)  -> bool {
+        let mut spin: usize = 0;
+        let mut state = self.state.load(Ordering::Relaxed);
+
+        loop {
+            if state & LOCKED == 0 {
+                match self.state.compare_exchange_weak(
+                    state,
+                    state | LOCKED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(e) => state = e,
+                }
+                continue;
+            }
+
+            if E::yield_now(YieldContext {
+                contended: state & PARKED != 0,
+                iteration: spin,
+                _sealed: (),
+            }) {
+                spin = spin.wrapping_add(1);
+                state = self.state.load(Ordering::Relaxed);
+                continue;
+            }
+
+            if state & PARKED == 0 {
+                if let Err(e) = self.state.compare_exchange_weak(
+                    state,
+                    state | PARKED,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    state = e;
+                    continue;
+                }
+            }
+
+            let validate = || self.state.load(Ordering::Relaxed) == LOCKED | PARKED;
+            let cancelled = |was_last_thread| {
+                if was_last_thread {
+                    self.state.fetch_and(!PARKED, Ordering::Relaxed);
+                }
+            };
+
+            match unsafe {
+                self.parker.park(
+                    DEFAULT_TOKEN,
+                    validate,
+                    |event| try_park(event),
+                    cancelled,
+                )
+            } {
+                ParkResult::Invalid => {},
+                ParkResult::Cancelled => return false,
+                ParkResult::Unparked(HANDOFF_TOKEN) => return true,
+                ParkResult::Unparked(RETRY_TOKEN) => {},
+                _ => unreachable!(),
+            }
+
+            spin = 0;
+            state = self.state.load(Ordering::Relaxed);
+        }
+    }
+
+    #[cold]
+    fn release_slow(&self, be_fair: bool) {
+        let unpark = |_result, token| {
+            debug_assert_eq!(token, DEFAULT_TOKEN);
+            if be_fair { HANDOFF_TOKEN } else { RETRY_TOKEN }  
+        };
+        let callback = |result: UnparkResult| {
+            if result.unparked != 0 && be_fair {
+                if !result.has_more {
+                    self.state.store(LOCKED, Ordering::Relaxed);
+                }
+            } else if result.has_more {
+                self.state.store(PARKED, Ordering::Release);
+            } else {
+                self.state.store(UNLOCKED, Ordering::Release);
+            }
+        };
+        unsafe {
+            self.parker.unpark_one(unpark, callback);
+        }
+    }
+
+    #[cold]
+    fn bump_slow(&self) {
+        self.release_slow(true);
+        self.lock();
+    }
+}
+
+unsafe impl<E: AutoResetEvent> RawMutex for GenericRawMutex<E> {
+    const INIT: Self = Self::new();
+
+    type GuardMarker = GuardSend;
+
+    #[inline]
+    fn try_lock(&self) -> bool {
+        let mut state = self.state.load(Ordering::Relaxed);
+        while state & LOCKED == 0 {
+            match self.state.compare_exchange_weak(
+                state,
+                state | LOCKED,
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
@@ -73,304 +196,53 @@ impl<E> RawMutex<E> {
         }
         false
     }
-}
-
-impl<E: AutoResetEvent> RawMutex<E> {
-    pub unsafe fn acquire(&self) {
-        if let Err(_) = self.byte_state().compare_exchange_weak(
-            UNLOCKED,
-            LOCKED,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            self.acquire_slow();
-        }
-    }
-
-    #[cold]
-    unsafe fn acquire_slow(&self) {
-        let mut spin: usize = 0;
-        let mut event_initialized = false;
-        let waiter = Waiter {
-            acquire_waking: Cell::new(false),
-            event: Cell::new(MaybeUninit::uninit()),
-            prev: Cell::new(MaybeUninit::uninit()),
-            next: Cell::new(MaybeUninit::uninit()),
-            tail: Cell::new(MaybeUninit::uninit()),
-        };
-
-        let mut state = self.state.load(Ordering::Relaxed);
-        loop {
-            // Try to acquire the lock if its unlocked.
-            if state & (LOCKED as usize) == 0 {
-                if let Ok(_) = self.byte_state().compare_exchange_weak(
-                    UNLOCKED,
-                    LOCKED,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    // Make sure to drop the Event if it was created.
-                    //
-                    // Safety:
-                    // Holding the lock guarantees our waiter isnt enqueued
-                    // and hence accesible by another possible unlock() thread
-                    // so it is ok to create a mutable reference to its fields.
-                    if event_initialized {
-                        let maybe_event = &mut *waiter.event.as_ptr();
-                        drop_in_place(maybe_event.as_mut_ptr());
-                    }
-                    return;
-                }
-                state = self.state.load(Ordering::Relaxed);
-                continue;
-            }
-
-            // Get the head of the waiter queue if any
-            // and spin on the lock if the Event deems appropriate.
-            let head = NonNull::new((state & MASK) as *mut Waiter<E>);
-            if E::yield_now(YieldContext {
-                contended: head.is_some(),
-                iteration: spin,
-                _sealed: (),
-            }) {
-                spin = spin.wrapping_add(1);
-                state = self.state.load(Ordering::Relaxed);
-                continue;
-            }
-
-            // Lazily initialize the Event if its not already
-            if !event_initialized {
-                event_initialized = true;
-                waiter.prev.set(MaybeUninit::new(None));
-                waiter.event.set(MaybeUninit::new(E::default()));
-            }
-
-            // Prepare the waiter to be enqueued in the wait queue.
-            // If its the first waiter, set it's tail to itself.
-            // If not, then the tail will be resolved by a dequeing thread.
-            let waiter_ptr = &waiter as *const _ as usize;
-            waiter.next.set(MaybeUninit::new(head));
-            waiter.tail.set(MaybeUninit::new(match head {
-                Some(_) => None,
-                None => NonNull::new(waiter_ptr as *mut _),
-            }));
-
-            // Try to enqueue the waiter as the new head of the wait queue.
-            // Release barrier to make the waiter field writes visible to the deque thread.
-            if let Err(e) = self.state.compare_exchange_weak(
-                state,
-                (state & !MASK) | waiter_ptr,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                state = e;
-                continue;
-            }
-
-            // Park on our event until unparked by a dequeing thread.
-            // Safety: guaranteed to be initialized from init_event.
-            let maybe_event = &*waiter.event.as_ptr();
-            let event_ref = &*maybe_event.as_ptr();
-            event_ref.wait();
-
-            // Reset everything and try to acquire the lock again.
-            // Mark that we're awake so that another thread can be woken up in unlock().
-            spin = 0;
-            waiter.prev.set(MaybeUninit::new(None));
-            if waiter.acquire_waking.get() {
-                waiter.acquire_waking.set(false);
-                state = self.state.fetch_and(!WAKING, Ordering::Relaxed) & !WAKING;
-            } else {
-                state = self.state.load(Ordering::Relaxed);
-            }
-        }
-    }
-
-    pub unsafe fn release(&self, be_fair: bool) {
-        if be_fair {
-            unimplemented!("TODO: fair mutex unlock");
-        }
-
-        self.byte_state().store(UNLOCKED, Ordering::Release);
-        if self.state.load(Ordering::Relaxed) & MASK != 0 {
-            self.release_slow();
-        }
-    }
-
-    #[cold]
-    unsafe fn release_slow(&self) {
-        // Try to acquire the WAKING flag on the mutex in order to deque->wake a waiting
-        // thread. Bail if theres no threads to deque, theres already a thread
-        // waiting, or the lock is being held since the lock holder can do the
-        // wake on unlock().
-        let mut state = self.state.load(Ordering::Relaxed);
-        loop {
-            if (state & MASK == 0) || (state & (WAKING | (LOCKED as usize)) != 0) {
-                return;
-            }
-            match self.state.compare_exchange_weak(
-                state,
-                state | WAKING,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Err(e) => state = e,
-                Ok(_) => {
-                    state |= WAKING;
-                    break;
-                }
-            }
-        }
-
-        // Our thread is now the only one dequeing a node from the wait quuee.
-        // On enter, and on re-loop, need an Acquire barrier in order to observe the
-        // head waiter field writes from both the previous deque thread and the
-        // enqueue thread.
-        'deque: loop {
-            // Safety: guaranteed non-null from the WAKING acquire loop above.
-            let head = &*((state & MASK) as *const Waiter<E>);
-
-            // Find the tail of the queue by following the next links from the head.
-            // While traversing the links, store the prev link to complete the back-edge.
-            // Finally, store the found tail onto the head to amortize the search later.
-            let tail = {
-                let mut current = head;
-                loop {
-                    if let Some(tail) = current.tail.get().assume_init() {
-                        head.tail.set(MaybeUninit::new(Some(tail)));
-                        break &*tail.as_ptr();
-                    } else {
-                        let next = current.next.get().assume_init();
-                        let next = &*next.unwrap_unchecked().as_ptr();
-                        let current_ptr = NonNull::new(current as *const _ as *mut _);
-                        next.prev.set(MaybeUninit::new(current_ptr));
-                        current = next;
-                    }
-                }
-            };
-
-            // The mutex is currently locked. Let the thread with the lock do the
-            // dequeing at unlock by releasing our DEQUEUE privileges.
-            //
-            // Release barrier to make the queue link writes above visible to
-            // the next unlock thread.
-            if state & (LOCKED as usize) != 0 {
-                match self.state.compare_exchange_weak(
-                    state,
-                    state & !WAKING,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return,
-                    Err(e) => state = e,
-                }
-                fence(Ordering::Acquire);
-                continue 'deque;
-            }
-
-            // Get the new tail of the queue by traversing backwards
-            // from the tail to the head following the prev links set above.
-            let new_tail = tail.prev.get().assume_init();
-
-            // The tail isnt the last waiter, update the tail of the queue.
-            // Release barrier to make the queue link writes visible to next unlock thread.
-            if let Some(new_tail) = new_tail {
-                head.tail.set(MaybeUninit::new(Some(new_tail)));
-                tail.acquire_waking.set(true);
-                fence(Ordering::Release);
-
-            // The tail was the last waiter in the queue.
-            // Try to zero out the queue while also releasing the DEQUEUING
-            // lock. If a new waiter comes in, we need to retry the
-            // deque since it's next link would point to our dequed
-            // tail.
-            //
-            // No release barrier since after zeroing the queue,
-            // no other thread can observe the waiters.
-            } else {
-                loop {
-                    match self.state.compare_exchange_weak(
-                        state,
-                        state & (LOCKED as usize),
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(e) => state = e,
-                    }
-                    if state & MASK != 0 {
-                        fence(Ordering::Acquire);
-                        continue 'deque;
-                    }
-                }
-            }
-
-            // Wake up the dequeud tail.
-            let maybe_event = &*tail.event.as_ptr();
-            let event_ref = &*maybe_event.as_ptr();
-            event_ref.set();
-            return;
-        }
-    }
-}
-
-impl<E: AutoResetEventTimed> RawMutex<E> {
-    #[inline]
-    pub unsafe fn try_acquire_for(&self, _timeout: E::Duration) -> bool {
-        unimplemented!("TODO: timed mutex acquire")
-    }
-
-    #[inline]
-    pub unsafe fn try_acquire_until(&self, _timeout: E::Instant) -> bool {
-        unimplemented!("TODO: tmied mutex acquire")
-    }
-}
-
-unsafe impl<E: AutoResetEvent> lock_api::RawMutex for RawMutex<E> {
-    const INIT: Self = Self::new();
-
-    type GuardMarker = lock_api::GuardSend;
-
-    #[inline]
-    fn try_lock(&self) -> bool {
-        self.try_acquire()
-    }
 
     #[inline]
     fn lock(&self) {
-        unsafe { self.acquire() };
+        let acquired = self.acquire(|event| {
+            event.wait();
+            true
+        });
+        debug_assert!(acquired);
     }
 
     #[inline]
     fn unlock(&self) {
-        unsafe { self.release(false) };
+        self.release(false);
     }
 }
 
-unsafe impl<E: AutoResetEvent> lock_api::RawMutexFair for RawMutex<E> {
+unsafe impl<E: AutoResetEvent> RawMutexFair for GenericRawMutex<E> {
     #[inline]
     fn unlock_fair(&self) {
-        unsafe { self.release(true) };
+        self.release(true)
+    }
+
+    #[inline]
+    fn bump(&self) {
+        if self.state.load(Ordering::Relaxed) & PARKED != 0 {
+            self.bump_slow();
+        }
     }
 }
 
-unsafe impl<E: AutoResetEventTimed> lock_api::RawMutexTimed for RawMutex<E> {
+unsafe impl<E: AutoResetEventTimed> RawMutexTimed for GenericRawMutex<E> where E::Instant: Copy {
     type Duration = E::Duration;
     type Instant = E::Instant;
 
     #[inline]
-    fn try_lock_for(&self, timeout: Self::Duration) -> bool {
-        unsafe { self.try_acquire_for(timeout) }
+    fn try_lock_for(&self, mut timeout: Self::Duration) -> bool {
+        self.acquire(|event| event.try_wait_for(&mut timeout))
     }
 
     #[inline]
     fn try_lock_until(&self, timeout: Self::Instant) -> bool {
-        unsafe { self.try_acquire_until(timeout) }
+        self.acquire(|event| event.try_wait_until(timeout))
     }
 }
 
 pub struct GenericMutex<E, T> {
-    raw_mutex: RawMutex<E>,
+    raw_mutex: GenericRawMutex<E>,
     value: UnsafeCell<T>,
 }
 
@@ -392,7 +264,7 @@ impl<E, T> From<T> for GenericMutex<E, T> {
 impl<E, T> GenericMutex<E, T> {
     pub const fn new(value: T) -> Self {
         Self {
-            raw_mutex: RawMutex::new(),
+            raw_mutex: GenericRawMutex::new(),
             value: UnsafeCell::new(value),
         }
     }
@@ -409,7 +281,7 @@ impl<E, T> GenericMutex<E, T> {
 impl<E: AutoResetEvent, T> GenericMutex<E, T> {
     #[inline]
     pub fn try_lock(&self) -> Option<GenericMutexGuard<'_, E, T>> {
-        if self.raw_mutex.try_acquire() {
+        if self.raw_mutex.try_lock() {
             Some(GenericMutexGuard { mutex: self })
         } else {
             None
@@ -418,41 +290,37 @@ impl<E: AutoResetEvent, T> GenericMutex<E, T> {
 
     #[inline]
     pub fn lock(&self) -> GenericMutexGuard<'_, E, T> {
-        unsafe { self.raw_mutex.acquire() };
+        self.raw_mutex.lock();
         GenericMutexGuard { mutex: self }
     }
 
     #[inline]
     pub unsafe fn force_unlock(&self) {
-        self.raw_mutex.release(false)
+        self.raw_mutex.unlock();
     }
 
     #[inline]
     pub unsafe fn force_unlock_fair(&self) {
-        self.raw_mutex.release(true)
+        self.raw_mutex.unlock_fair();
     }
 }
 
-impl<E: AutoResetEventTimed, T> GenericMutex<E, T> {
+impl<E: AutoResetEventTimed, T> GenericMutex<E, T> where E::Instant: Copy {
     #[inline]
     pub fn try_lock_for(&self, timeout: E::Duration) -> Option<GenericMutexGuard<'_, E, T>> {
-        unsafe {
-            if self.raw_mutex.try_acquire_for(timeout) {
-                Some(GenericMutexGuard { mutex: self })
-            } else {
-                None
-            }
+        if self.raw_mutex.try_lock_for(timeout) {
+            Some(GenericMutexGuard { mutex: self })
+        } else {
+            None
         }
     }
 
     #[inline]
     pub fn try_lock_until(&self, timeout: E::Instant) -> Option<GenericMutexGuard<'_, E, T>> {
-        unsafe {
-            if self.raw_mutex.try_acquire_until(timeout) {
-                Some(GenericMutexGuard { mutex: self })
-            } else {
-                None
-            }
+        if self.raw_mutex.try_lock_until(timeout) {
+            Some(GenericMutexGuard { mutex: self })
+        } else {
+            None
         }
     }
 }
@@ -490,37 +358,31 @@ impl<'a, E: AutoResetEvent, T> DerefMut for GenericMutexGuard<'a, E, T> {
 
 impl<'a, E: AutoResetEvent, T> Drop for GenericMutexGuard<'a, E, T> {
     fn drop(&mut self) {
-        unsafe { self.mutex.force_unlock() }
+        self.mutex.raw_mutex.unlock();
     }
 }
 
 impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
     #[inline]
     pub fn unlock_fair(this: Self) {
-        unsafe { this.mutex.force_unlock_fair() };
+        this.mutex.raw_mutex.unlock_fair();
         forget(this)
     }
 
     #[inline]
     pub fn unlocked<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
-        unsafe {
-            this.mutex.force_unlock();
-            let value = f();
-            let guard = this.mutex.lock();
-            forget(guard);
-            value
-        }
+        this.mutex.raw_mutex.unlock();
+        let value = f();
+        this.mutex.raw_mutex.lock();
+        value
     }
 
     #[inline]
     pub fn unlocked_fair<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
-        unsafe {
-            this.mutex.force_unlock_fair();
-            let value = f();
-            let guard = this.mutex.lock();
-            forget(guard);
-            value
-        }
+        this.mutex.raw_mutex.unlock_fair();
+        let value = f();
+        this.mutex.raw_mutex.lock();
+        value
     }
 }
 
@@ -560,7 +422,7 @@ impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct GenericMappedMutexGuard<'a, E: AutoResetEvent, T> {
     value: NonNull<T>,
-    raw_mutex: &'a RawMutex<E>,
+    raw_mutex: &'a GenericRawMutex<E>,
 }
 
 unsafe impl<'a, E: AutoResetEvent, T: Send> Send for GenericMappedMutexGuard<'a, E, T> {}
@@ -582,35 +444,31 @@ impl<'a, E: AutoResetEvent, T> DerefMut for GenericMappedMutexGuard<'a, E, T> {
 
 impl<'a, E: AutoResetEvent, T> Drop for GenericMappedMutexGuard<'a, E, T> {
     fn drop(&mut self) {
-        unsafe { self.raw_mutex.release(false) }
+        self.raw_mutex.unlock();
     }
 }
 
 impl<'a, E: AutoResetEvent, T> GenericMappedMutexGuard<'a, E, T> {
     #[inline]
     pub fn unlock_fair(this: Self) {
-        unsafe { this.raw_mutex.release(true) };
+        this.raw_mutex.unlock_fair();
         forget(this)
     }
 
     #[inline]
     pub fn unlocked<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
-        unsafe {
-            this.raw_mutex.release(false);
-            let value = f();
-            this.raw_mutex.acquire();
-            value
-        }
+        this.raw_mutex.unlock();
+        let value = f();
+        this.raw_mutex.lock();
+        value
     }
 
     #[inline]
     pub fn unlocked_fair<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
-        unsafe {
-            this.raw_mutex.release(true);
-            let value = f();
-            this.raw_mutex.acquire();
-            value
-        }
+        this.raw_mutex.unlock_fair();
+        let value = f();
+        this.raw_mutex.lock();
+        value
     }
 }
 

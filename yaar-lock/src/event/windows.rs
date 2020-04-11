@@ -1,14 +1,14 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 
-use crate::event::{OsInstant, OsDuration};
+use crate::event::OsInstant;
 use core::{
     convert::TryInto,
     fmt,
     mem::{size_of, transmute},
     num::NonZeroUsize,
     ptr::null,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{fence, AtomicUsize, Ordering},
 };
 use yaar_sys::{
     CloseHandle, GetLastError, GetModuleHandleW, GetProcAddress, NtCreateKeyedEventFn,
@@ -31,7 +31,7 @@ impl fmt::Debug for Signal {
             EMPTY => "empty",
             WAITING => "has_waiter",
             NOTIFIED => "notified",
-            _ => "unknown",
+            _ => unreachable!(),
         };
 
         f.debug_struct("OsSignal").field("state", &state).finish()
@@ -50,25 +50,25 @@ impl Signal {
         if state == EMPTY {
             state = self
                 .state
-                .compare_and_swap(EMPTY, NOTIFIED, Ordering::Relaxed);
+                .compare_and_swap(EMPTY, NOTIFIED, Ordering::Release);
             if state == EMPTY {
                 return;
             }
         }
 
         debug_assert_eq!(state, WAITING);
-        self.state.store(EMPTY, Ordering::Relaxed);
-        unsafe { Backend::futex_wake(&self.state) };
+        self.state.store(EMPTY, Ordering::Release);
+        unsafe { Futex::wake(&self.state) };
     }
 
-    pub fn wait(&self, timeout: Option<&mut OsDuration>) -> bool {
-        let mut state = self.state.load(Ordering::Relaxed);
+    pub fn try_wait(&self, timeout: Option<OsInstant>) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
         if state == EMPTY {
             state = self
                 .state
-                .compare_and_swap(EMPTY, WAITING, Ordering::Relaxed);
+                .compare_and_swap(EMPTY, WAITING, Ordering::Acquire);
             if state == EMPTY {
-                return unsafe { Backend::futex_wait(&self.state, WAITING, EMPTY, timeout) };
+                return unsafe { Futex::wait(&self.state, WAITING, EMPTY, timeout) };
             }
         }
 
@@ -87,12 +87,12 @@ static _NtReleaseKeyedEvent: AtomicUsize = AtomicUsize::new(0);
 static _WaitOnAddress: AtomicUsize = AtomicUsize::new(0);
 static _WakeByAddressSingle: AtomicUsize = AtomicUsize::new(0);
 
-enum Backend {
+enum Futex {
     WaitOnAddress,
     KeyedEvent(HANDLE),
 }
 
-impl Backend {
+impl Futex {
     unsafe fn get() -> Self {
         match HANDLE.load(Ordering::Acquire) {
             0 => {
@@ -101,7 +101,7 @@ impl Backend {
                 } else if let Some(handle) = Self::load_keyed_event() {
                     Self::KeyedEvent(handle.get())
                 } else {
-                    unreachable!("OsAutoResetEvent requires either WaitOnAddress (Win8+) or NT Keyed Events (WinXP+)");
+                    unreachable!("OsSignal requires either WaitOnAddress (Win8+) or NT Keyed Events (WinXP+)");
                 }
             }
             WAIT_ON_ADDRESS => Self::WaitOnAddress,
@@ -109,7 +109,7 @@ impl Backend {
         }
     }
 
-    pub unsafe fn futex_wake(ptr: &AtomicUsize) {
+    pub unsafe fn wake(ptr: &AtomicUsize) {
         match Self::get() {
             Self::KeyedEvent(handle) => {
                 let NtReleaseKeyedEvent = _NtReleaseKeyedEvent.load(Ordering::Relaxed);
@@ -125,62 +125,60 @@ impl Backend {
         }
     }
 
-    pub unsafe fn futex_wait(
+    pub unsafe fn wait(
         ptr: &AtomicUsize,
         expect: usize,
         reset: usize,
-        mut timeout: Option<&mut OsDuration>,
+        timeout: Option<OsInstant>,
     ) -> bool {
         match Self::get() {
             Self::KeyedEvent(handle) => {
                 let NtWaitForKeyedEvent = _NtWaitForKeyedEvent.load(Ordering::Relaxed);
                 let NtWaitForKeyedEvent: NtWaitForKeyedEventFn = transmute(NtWaitForKeyedEvent);
-                let timeout_end = timeout.as_ref().map(|t| OsInstant::now() + **t);
+                let wait_time = timeout.map(|t| t.saturating_duration_since(OsInstant::now()));
 
                 let mut timeout_int = 1;
-                let mut timeout_int_ptr = null();
-                if let Some(timeout) = timeout.as_ref() {
-                    timeout_int_ptr = &timeout_int;
-                    timeout_int = -((*timeout).as_nanos() / 100)
+                let mut timeout_ptr = null();
+                if let Some(wait_time) = wait_time {
+                    timeout_ptr = &timeout_int;
+                    timeout_int = -(wait_time.as_nanos() / 100)
                         .try_into()
                         .unwrap_or(LARGE_INTEGER::max_value());
                 }
 
                 let key = ptr as *const _ as PVOID;
                 if timeout_int != 0 {
-                    let status = NtWaitForKeyedEvent(handle, key, FALSE, timeout_int_ptr);
+                    let status = NtWaitForKeyedEvent(handle, key, FALSE, timeout_ptr);
                     debug_assert!(status == STATUS_SUCCESS || status == STATUS_TIMEOUT);
-                    if let (Some(timeout), Some(end)) = (timeout.as_mut(), timeout_end) {
-                        **timeout = OsInstant::now().saturating_duration_since(end);
-                    }
                     if status == STATUS_SUCCESS {
+                        fence(Ordering::Acquire);
                         return true;
                     }
                 }
 
                 if ptr.load(Ordering::Relaxed) == expect {
-                    if ptr.compare_and_swap(expect, reset, Ordering::Relaxed) == expect {
+                    if ptr.compare_and_swap(expect, reset, Ordering::Acquire) == expect {
                         return false;
                     }
                 }
 
                 let status = NtWaitForKeyedEvent(handle, key, FALSE, null());
                 debug_assert_eq!(status, STATUS_SUCCESS);
+                fence(Ordering::Acquire);
                 true
-            }
+            },
             Self::WaitOnAddress => {
                 let WaitOnAddress = _WaitOnAddress.load(Ordering::Relaxed);
                 let WaitOnAddress: WaitOnAddressFn = transmute(WaitOnAddress);
-                let timeout_end = timeout.as_ref().map(|t| OsInstant::now() + **t);
 
                 while ptr.load(Ordering::Acquire) == expect {
                     let timeout_ms = timeout
-                        .as_ref()
-                        .and_then(|t| (*t).as_millis().try_into().ok())
+                        .map(|t| t.saturating_duration_since(OsInstant::now()))
+                        .and_then(|d| d.as_millis().try_into().ok())
                         .unwrap_or(INFINITE);
 
                     if timeout_ms == 0 {
-                        let timed_out =
+                        let timed_out = 
                             ptr.compare_and_swap(expect, reset, Ordering::Relaxed) == expect;
                         return !timed_out;
                     }
@@ -192,10 +190,6 @@ impl Backend {
                         timeout_ms,
                     );
 
-                    if let (Some(timeout), Some(end)) = (timeout.as_mut(), timeout_end) {
-                        **timeout = OsInstant::now().saturating_duration_since(end);
-                    }
-
                     debug_assert!(status == TRUE || status == FALSE);
                     if status == FALSE {
                         debug_assert_eq!(GetLastError(), ERROR_TIMEOUT);
@@ -203,7 +197,7 @@ impl Backend {
                 }
 
                 true
-            }
+            },
         }
     }
 

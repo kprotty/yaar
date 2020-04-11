@@ -5,8 +5,10 @@ pub struct YieldContext {
 }
 
 pub unsafe trait AutoResetEvent: Sync + Sized + Default {
+    // Release barrier
     fn set(&self);
 
+    // Acquire barrier
     fn wait(&self);
 
     fn yield_now(context: YieldContext) -> bool;
@@ -71,12 +73,13 @@ mod if_os {
         }
 
         fn wait(&self) {
-            let notified = self.signal.wait(None);
+            let notified = self.signal.try_wait(None);
             debug_assert!(notified);
         }
 
         fn yield_now(context: YieldContext) -> bool {
-            const BITS: usize = (1024usize - 1).count_ones() as usize;
+            const SPINS: usize = 1024;
+            const BITS: usize = (SPINS - 1).count_ones() as usize;
 
             if !context.contended {
                 if context.iteration < BITS {
@@ -84,7 +87,7 @@ mod if_os {
                     return true;
                 } else if context.iteration < BITS + 10 {
                     let spin = context.iteration - (BITS - 1);
-                    (0..(spin * 1024)).for_each(|_| spin_loop_hint());
+                    (0..(spin * SPINS)).for_each(|_| spin_loop_hint());
                     return true;
                 }
             }
@@ -97,13 +100,15 @@ mod if_os {
         type Instant = OsInstant;
         type Duration = OsDuration;
 
-        fn try_wait_for(&self, timeout: &mut Self::Duration) -> bool {
-            self.signal.wait(Some(timeout))
+        fn try_wait_until(&self, timeout: Self::Instant) -> bool {
+            self.signal.try_wait(Some(timeout))
         }
 
-        fn try_wait_until(&self, timeout: Self::Instant) -> bool {
-            let mut timeout = OsInstant::now().saturating_duration_since(timeout);
-            timeout.as_nanos() != 0 && self.try_wait_for(&mut timeout)
+        fn try_wait_for(&self, timeout: &mut Self::Duration) -> bool {
+            let times_out = OsInstant::now() + *timeout;
+            let result = self.try_wait_until(times_out);
+            *timeout = times_out.saturating_duration_since(OsInstant::now());
+            result
         }
     }
 }
