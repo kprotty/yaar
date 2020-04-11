@@ -3,7 +3,7 @@ use crate::event::AutoResetEvent;
 use core::{
     cell::Cell,
     mem::MaybeUninit,
-    ptr::{write, drop_in_place, NonNull},
+    ptr::{drop_in_place, write, NonNull},
 };
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -50,10 +50,7 @@ impl<E> Parker<E> {
 
 impl<E: AutoResetEvent> Parker<E> {
     #[inline]
-    unsafe fn with_queue<T>(
-        &self,
-        f: impl FnOnce(&mut Option<NonNull<Waiter<E>>>) -> T,
-    ) -> T {
+    unsafe fn with_queue<T>(&self, f: impl FnOnce(&mut Option<NonNull<Waiter<E>>>) -> T) -> T {
         use lock_api::RawMutex;
 
         self.queue_lock.lock();
@@ -71,26 +68,31 @@ impl<E: AutoResetEvent> Parker<E> {
     ) -> ParkResult {
         let waiter = MaybeUninit::<Waiter<E>>::uninit();
         let waiter_ptr = NonNull::new_unchecked(waiter.as_ptr() as *mut _);
-        
-        if !self.with_queue(|head| validate((*head).is_some()) && {
-            write(waiter_ptr.as_ptr(), Waiter {
-                event: E::default(),
-                state: Cell::new(WaitState::Parked(token)),
-                next: Cell::new(None),
-                tail: Cell::new(waiter_ptr),
-                prev: Cell::new({
-                    if let Some(head) = *head {
-                        let head = &*head.as_ptr();
-                        let tail_ptr = head.tail.replace(waiter_ptr);
-                        (&*tail_ptr.as_ptr()).next.set(Some(waiter_ptr));
-                        Some(tail_ptr)
-                    } else {
-                        *head = Some(waiter_ptr);
-                        None
-                    }
-                }),
-            });
-            true
+
+        if !self.with_queue(|head| {
+            validate((*head).is_some()) && {
+                write(
+                    waiter_ptr.as_ptr(),
+                    Waiter {
+                        event: E::default(),
+                        state: Cell::new(WaitState::Parked(token)),
+                        next: Cell::new(None),
+                        tail: Cell::new(waiter_ptr),
+                        prev: Cell::new({
+                            if let Some(head) = *head {
+                                let head = &*head.as_ptr();
+                                let tail_ptr = head.tail.replace(waiter_ptr);
+                                (&*tail_ptr.as_ptr()).next.set(Some(waiter_ptr));
+                                Some(tail_ptr)
+                            } else {
+                                *head = Some(waiter_ptr);
+                                None
+                            }
+                        }),
+                    },
+                );
+                true
+            }
         }) {
             return ParkResult::Invalid;
         }
@@ -110,7 +112,7 @@ impl<E: AutoResetEvent> Parker<E> {
                 Self::remove(head, waiter_ref);
                 cancel((*head).is_some());
                 ParkResult::Cancelled
-            },
+            }
         });
 
         drop_in_place(waiter_ptr.as_ptr());
@@ -179,7 +181,7 @@ impl<E: AutoResetEvent> Parker<E> {
                         Self::remove(head, waiter);
                         unparked_list.push(waiter);
                         waiter.state.set(WaitState::Unparked(token));
-                    },
+                    }
                 }
             }
 
@@ -194,12 +196,9 @@ impl<E: AutoResetEvent> Parker<E> {
         callback_result
     }
 
-    unsafe fn remove(
-        head: &mut Option<NonNull<Waiter<E>>>,
-        waiter: &Waiter<E>,
-    )  {
+    unsafe fn remove(head: &mut Option<NonNull<Waiter<E>>>, waiter: &Waiter<E>) {
         // Get the head of the queue, returning false if the queue is empty.
-        let waiter_ptr = NonNull::new_unchecked(waiter as *const _ as *mut _);
+        let waiter_ptr = NonNull::from(waiter);
         let head_ptr = match *head {
             Some(p) => p,
             None => return,

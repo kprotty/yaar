@@ -167,7 +167,7 @@ impl Futex {
                 debug_assert_eq!(status, STATUS_SUCCESS);
                 fence(Ordering::Acquire);
                 true
-            },
+            }
             Self::WaitOnAddress => {
                 let WaitOnAddress = _WaitOnAddress.load(Ordering::Relaxed);
                 let WaitOnAddress: WaitOnAddressFn = transmute(WaitOnAddress);
@@ -179,7 +179,7 @@ impl Futex {
                         .unwrap_or(INFINITE);
 
                     if timeout_ms == 0 {
-                        let timed_out = 
+                        let timed_out =
                             ptr.compare_and_swap(expect, reset, Ordering::Relaxed) == expect;
                         return !timed_out;
                     }
@@ -198,7 +198,7 @@ impl Futex {
                 }
 
                 true
-            },
+            }
         }
     }
 

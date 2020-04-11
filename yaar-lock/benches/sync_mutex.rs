@@ -3,8 +3,8 @@ extern crate criterion;
 
 use criterion::Criterion;
 use std::{
-    mem::drop,
     convert::TryInto,
+    mem::drop,
     sync::{Arc, Barrier},
     thread,
     time::{Duration, Instant},
@@ -56,7 +56,7 @@ where
 
 fn bench_throughput<M>(ctx: BenchContext, iters: u64) -> Duration
 where
-    M: Mutex<BenchValue> + Send + Sync + 'static
+    M: Mutex<BenchValue> + Send + Sync + 'static,
 {
     run_bench(
         ctx,
@@ -88,7 +88,7 @@ where
 
 fn bench_latency<M>(ctx: BenchContext, iters: u64) -> Duration
 where
-    M: Mutex<BenchValue> + Send + Sync + 'static
+    M: Mutex<BenchValue> + Send + Sync + 'static,
 {
     run_bench(
         ctx,
@@ -129,7 +129,7 @@ where
 
 fn bench_mutex<M>(c: &mut Criterion, ctx: BenchContext)
 where
-    M: Mutex<BenchValue> + Send + Sync + 'static
+    M: Mutex<BenchValue> + Send + Sync + 'static,
 {
     let bench_type_name = match ctx.bench_type {
         BenchType::Latency => "latency",
@@ -167,16 +167,12 @@ fn bench_all(c: &mut Criterion, ctx: BenchContext) {
     bench_mutex::<nt_lock::Mutex<BenchValue>>(c, ctx);
 }
 
-fn bench_threads(
-    c: &mut Criterion,
-    bench_type: BenchType,
-    work_per_critical_section: usize,
-) {
+fn bench_threads(c: &mut Criterion, bench_type: BenchType, work_per_critical_section: usize) {
     let max_threads = num_cpus::get();
     let mut num_threads = Vec::new();
     num_threads.push(max_threads * 2);
     num_threads.push(max_threads);
-    
+
     let mut stop = false;
     let mut rest = max_threads / 2;
     while !stop && rest < max_threads {

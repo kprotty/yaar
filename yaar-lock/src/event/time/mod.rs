@@ -1,8 +1,8 @@
 use core::{
     mem::size_of,
     ops::{Add, AddAssign, Sub, SubAssign},
+    sync::atomic::{spin_loop_hint, AtomicBool, Ordering},
     time::Duration,
-    sync::atomic::{spin_loop_hint, Ordering, AtomicBool},
 };
 
 #[cfg(all(feature = "os", windows))]
@@ -73,19 +73,16 @@ impl OsInstant {
         let mut spin: usize = 0;
         loop {
             if !LOCKED.load(Ordering::Relaxed) {
-                if let Ok(_) = LOCKED.compare_exchange_weak(
-                    false,
-                    true,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
+                if let Ok(_) =
+                    LOCKED.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                {
                     break;
                 }
             }
             spin = spin.wrapping_add(size_of::<usize>());
             (0..spin.min(1024)).for_each(|_| spin_loop_hint());
         }
-        
+
         if CURRENT >= now {
             now = CURRENT;
         } else {

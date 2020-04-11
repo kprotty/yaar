@@ -4,12 +4,12 @@ use crate::{
 };
 
 use core::{
-    fmt,
     cell::Cell,
-    mem::MaybeUninit,
+    fmt,
     marker::PhantomData,
+    mem::MaybeUninit,
     ptr::{drop_in_place, NonNull},
-    sync::atomic::{fence, Ordering, AtomicU8, AtomicUsize},
+    sync::atomic::{fence, AtomicU8, AtomicUsize, Ordering},
 };
 
 const UNLOCKED: u8 = 0;
@@ -39,9 +39,7 @@ impl<E> fmt::Debug for Lock<E> {
             _ => "<locked>",
         };
 
-        f.debug_struct("Mutex")
-            .field("state", &state)
-            .finish()
+        f.debug_struct("Mutex").field("state", &state).finish()
     }
 }
 
@@ -200,7 +198,8 @@ impl<E: AutoResetEvent> Lock<E> {
             // Reset everything and try to acquire the lock again.
             // Mark that we're awake so that another thread can be woken up in unlock().
             //
-            // Safety: acquire_waking is guaranteed initialized by `event_initialized` above.
+            // Safety: acquire_waking is guaranteed initialized by `event_initialized`
+            // above.
             spin = 0;
             waiter.prev.set(MaybeUninit::new(None));
             if waiter.acquire_waking.get().assume_init() {
@@ -257,7 +256,7 @@ impl<E: AutoResetEvent> Lock<E> {
                     } else {
                         let next = current.next.get().assume_init();
                         let next = &*next.unwrap_unchecked().as_ptr();
-                        let current_ptr = NonNull::new(current as *const _ as *mut _);
+                        let current_ptr = NonNull::from(current);
                         next.prev.set(MaybeUninit::new(current_ptr));
                         current = next;
                     }

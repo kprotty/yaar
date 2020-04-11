@@ -188,7 +188,7 @@ impl<T> Mutex<T> {
                 node.next.set(head);
                 node.tail.set(match head {
                     Some(_) => None,
-                    None => NonNull::new(node as *const _ as *mut _),
+                    None => NonNull::from(node),
                 });
 
                 if let Err(e) = self.state.compare_exchange_weak(
@@ -249,7 +249,7 @@ impl<T> Mutex<T> {
                         }
                         None => {
                             let next = &*current.next.get().unwrap().as_ptr();
-                            next.prev.set(NonNull::new(current as *const _ as *mut _));
+                            next.prev.set(NonNull::from(current));
                             current = next;
                         }
                     }

@@ -22,9 +22,9 @@ impl Timer {
 
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     pub unsafe fn timestamp() -> OsDuration {
-        use yaar_sys::{timespec, CLOCK_MONOTONIC, clock_gettime};
-        use core::convert::TryInto;
         use crate::utils::UnwrapUnchecked;
+        use core::convert::TryInto;
+        use yaar_sys::{clock_gettime, timespec, CLOCK_MONOTONIC};
 
         let mut now_ts = MaybeUninit::uninit();
         let status = clock_gettime(CLOCK_MONOTONIC, now_ts.as_mut_ptr());
@@ -54,7 +54,7 @@ impl Timer {
             const CREATING: usize = 1;
             const INIT: usize = 2;
 
-            use core::sync::atomic::{Ordering, AtomicUsize};
+            use core::sync::atomic::{AtomicUsize, Ordering};
             static STATE: AtomicUsize = AtomicUsize::new(0);
             static mut INFO: MaybeUninit<mach_timebase_info> = MaybeUninit::uninit();
 
@@ -75,9 +75,6 @@ impl Timer {
         const NANOS_PER_SEC: u64 = 1_000_000_000;
         let now = mach_absolute_time();
         let nanos = (now * info.numer) / info.denom;
-        OsDuration::new(
-            nanos / NANOS_PER_SEC,
-            (nanos % NANOS_PER_SEC) as u32,
-        )
+        OsDuration::new(nanos / NANOS_PER_SEC, (nanos % NANOS_PER_SEC) as u32)
     }
 }

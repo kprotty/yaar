@@ -1,19 +1,14 @@
+use super::parker::{ParkResult, Parker};
 use crate::event::{AutoResetEvent, AutoResetEventTimed, YieldContext};
-use super::parker::{Parker, ParkResult};
 use core::{
     cell::UnsafeCell,
     fmt,
     mem::forget,
-    ptr::NonNull,
     ops::{Deref, DerefMut},
+    ptr::NonNull,
     sync::atomic::{AtomicU8, Ordering},
 };
-use lock_api::{
-    GuardSend,
-    RawMutex,
-    RawMutexFair,
-    RawMutexTimed,
-};
+use lock_api::{GuardSend, RawMutex, RawMutexFair, RawMutexTimed};
 
 #[cfg(feature = "os")]
 pub use if_os::*;
@@ -121,8 +116,8 @@ impl<E: AutoResetEvent> GenericRawMutex<E> {
             } {
                 ParkResult::Cancelled => return false,
                 ParkResult::Unparked(HANDOFF_TOKEN) => return true,
-                ParkResult::Unparked(RETRY_TOKEN) => {},
-                ParkResult::Invalid => {},
+                ParkResult::Unparked(RETRY_TOKEN) => {}
+                ParkResult::Invalid => {}
                 _ => unreachable!(),
             }
 
@@ -133,12 +128,10 @@ impl<E: AutoResetEvent> GenericRawMutex<E> {
 
     #[inline]
     fn release(&self, be_fair: bool) {
-        if let Err(_) = self.state.compare_exchange(
-            LOCKED,
-            UNLOCKED,
-            Ordering::Release,
-            Ordering::Relaxed,
-        ) {
+        if let Err(_) =
+            self.state
+                .compare_exchange(LOCKED, UNLOCKED, Ordering::Release, Ordering::Relaxed)
+        {
             self.release_slow(be_fair);
         }
     }
@@ -149,7 +142,11 @@ impl<E: AutoResetEvent> GenericRawMutex<E> {
             self.parker.unpark_one(
                 |_, token| {
                     assert_eq!(token, DEFAULT_TOKEN);
-                    if be_fair { HANDOFF_TOKEN } else { RETRY_TOKEN }
+                    if be_fair {
+                        HANDOFF_TOKEN
+                    } else {
+                        RETRY_TOKEN
+                    }
                 },
                 |result| {
                     if result.unparked != 0 && be_fair {
@@ -163,7 +160,7 @@ impl<E: AutoResetEvent> GenericRawMutex<E> {
                     } else {
                         self.state.store(UNLOCKED, Ordering::Release);
                     }
-                }
+                },
             )
         }
     }
@@ -226,7 +223,10 @@ unsafe impl<E: AutoResetEvent> RawMutexFair for GenericRawMutex<E> {
     }
 }
 
-unsafe impl<E: AutoResetEventTimed> RawMutexTimed for GenericRawMutex<E> where E::Instant: Copy {
+unsafe impl<E: AutoResetEventTimed> RawMutexTimed for GenericRawMutex<E>
+where
+    E::Instant: Copy,
+{
     type Duration = E::Duration;
     type Instant = E::Instant;
 
@@ -305,7 +305,10 @@ impl<E: AutoResetEvent, T> GenericMutex<E, T> {
     }
 }
 
-impl<E: AutoResetEventTimed, T> GenericMutex<E, T> where E::Instant: Copy {
+impl<E: AutoResetEventTimed, T> GenericMutex<E, T>
+where
+    E::Instant: Copy,
+{
     #[inline]
     pub fn try_lock_for(&self, timeout: E::Duration) -> Option<GenericMutexGuard<'_, E, T>> {
         if self.raw_mutex.try_lock_for(timeout) {
@@ -392,13 +395,11 @@ impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
         this: Self,
         f: impl FnOnce(&mut T) -> &mut U,
     ) -> GenericMappedMutexGuard<'a, E, U> {
-        unsafe {
-            let raw_mutex = &this.mutex.raw_mutex;
-            let value = f(&mut *this.mutex.value.get());
-            let value = NonNull::new_unchecked(value);
-            forget(this);
-            GenericMappedMutexGuard { raw_mutex, value }
-        }
+        let raw_mutex = &this.mutex.raw_mutex;
+        let value = f(unsafe { &mut *this.mutex.value.get() });
+        let value = NonNull::from(value);
+        forget(this);
+        GenericMappedMutexGuard { raw_mutex, value }
     }
 
     #[inline]
@@ -406,15 +407,13 @@ impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
         this: Self,
         f: impl FnOnce(&mut T) -> Option<&mut U>,
     ) -> Result<GenericMappedMutexGuard<'a, E, U>, Self> {
-        unsafe {
-            let raw_mutex = &this.mutex.raw_mutex;
-            if let Some(value) = f(&mut *this.mutex.value.get()) {
-                let value = NonNull::new_unchecked(value);
-                forget(this);
-                Ok(GenericMappedMutexGuard { raw_mutex, value })
-            } else {
-                Err(this)
-            }
+        let raw_mutex = &this.mutex.raw_mutex;
+        if let Some(value) = f(unsafe { &mut *this.mutex.value.get() }) {
+            let value = NonNull::from(value);
+            forget(this);
+            Ok(GenericMappedMutexGuard { raw_mutex, value })
+        } else {
+            Err(this)
         }
     }
 }
@@ -478,13 +477,11 @@ impl<'a, E: AutoResetEvent, T> GenericMappedMutexGuard<'a, E, T> {
         this: Self,
         f: impl FnOnce(&mut T) -> &mut U,
     ) -> GenericMappedMutexGuard<'a, E, U> {
-        unsafe {
-            let raw_mutex = this.raw_mutex;
-            let value = f(&mut *this.value.as_ptr());
-            let value = NonNull::new_unchecked(value);
-            forget(this);
-            GenericMappedMutexGuard { raw_mutex, value }
-        }
+        let raw_mutex = this.raw_mutex;
+        let value = f(unsafe { &mut *this.value.as_ptr() });
+        let value = NonNull::from(value);
+        forget(this);
+        GenericMappedMutexGuard { raw_mutex, value }
     }
 
     #[inline]
@@ -492,15 +489,13 @@ impl<'a, E: AutoResetEvent, T> GenericMappedMutexGuard<'a, E, T> {
         this: Self,
         f: impl FnOnce(&mut T) -> Option<&mut U>,
     ) -> Result<GenericMappedMutexGuard<'a, E, U>, Self> {
-        unsafe {
-            let raw_mutex = this.raw_mutex;
-            if let Some(value) = f(&mut *this.value.as_ptr()) {
-                let value = NonNull::new_unchecked(value);
-                forget(this);
-                Ok(GenericMappedMutexGuard { raw_mutex, value })
-            } else {
-                Err(this)
-            }
+        let raw_mutex = this.raw_mutex;
+        if let Some(value) = f(unsafe { &mut *this.value.as_ptr() }) {
+            let value = NonNull::from(value);
+            forget(this);
+            Ok(GenericMappedMutexGuard { raw_mutex, value })
+        } else {
+            Err(this)
         }
     }
 }
