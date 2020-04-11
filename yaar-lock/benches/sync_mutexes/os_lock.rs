@@ -1,33 +1,33 @@
 use std::cell::UnsafeCell;
 
-pub const NAME: &'static str = sys::Lock::NAME;
+pub const NAME: &'static str = os::Lock::NAME;
 
 unsafe impl<T: Send> Send for Mutex<T> {}
 unsafe impl<T: Send> Sync for Mutex<T> {}
 
 pub struct Mutex<T> {
-    sys_lock: sys::Lock,
+    os_lock: os::Lock,
     value: UnsafeCell<T>,
 }
 
 impl<T> Mutex<T> {
     pub fn new(value: T) -> Self {
         Self {
-            sys_lock: sys::Lock::new(),
+            os_lock: os::Lock::new(),
             value: UnsafeCell::new(value),
         }
     }
 
     pub fn lock<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        self.sys_lock.acquire();
+        self.os_lock.acquire();
         let result = f(unsafe { &mut *self.value.get() });
-        self.sys_lock.release();
+        self.os_lock.release();
         result
     }
 }
 
 #[cfg(windows)]
-mod sys {
+mod os {
     use std::cell::UnsafeCell;
 
     pub struct Lock(UnsafeCell<SRWLOCK>);

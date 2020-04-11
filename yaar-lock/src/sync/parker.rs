@@ -1,8 +1,5 @@
 use super::Lock;
-use crate::{
-    event::AutoResetEvent,
-    utils::UnwrapUnchecked,
-};
+use crate::event::AutoResetEvent;
 use core::{
     cell::Cell,
     mem::MaybeUninit,
@@ -98,12 +95,8 @@ impl<E: AutoResetEvent> Parker<E> {
             return ParkResult::Invalid;
         }
 
-        // Acquire
         let waiter_ref = &*waiter_ptr.as_ptr();
-        print!("\n {:?} suspending on {:p}", std::thread::current().id(), &waiter_ref.event);
-        let woke = try_park(&waiter_ref.event);
-        print!("\n {:?} resuming   on {:p}", std::thread::current().id(), &waiter_ref.event);
-        if woke {
+        if try_park(&waiter_ref.event) {
             drop_in_place(waiter_ptr.as_ptr());
             return match waiter_ref.state.get() {
                 WaitState::Unparked(token) => ParkResult::Unparked(token),
@@ -125,11 +118,11 @@ impl<E: AutoResetEvent> Parker<E> {
     }
 
     #[inline]
-    pub unsafe fn unpark_all(
+    pub unsafe fn unpark_all<T>(
         &self,
         mut unpark: impl FnMut(UnparkResult, usize) -> usize,
-        callback: impl FnOnce(UnparkResult),
-    ) {
+        callback: impl FnOnce(UnparkResult) -> T,
+    ) -> T {
         self.unpark(
             |result, token| UnparkFilter::Unpark(unpark(result, token)),
             callback,
@@ -137,11 +130,11 @@ impl<E: AutoResetEvent> Parker<E> {
     }
 
     #[inline]
-    pub unsafe fn unpark_one(
+    pub unsafe fn unpark_one<T>(
         &self,
         unpark: impl FnOnce(UnparkResult, usize) -> usize,
-        callback: impl FnOnce(UnparkResult),
-    ) {
+        callback: impl FnOnce(UnparkResult) -> T,
+    ) -> T {
         let mut unpark = Some(unpark);
         self.unpark(
             |result, token| match unpark.take() {
@@ -152,23 +145,21 @@ impl<E: AutoResetEvent> Parker<E> {
         )
     }
 
-    pub unsafe fn unpark(
+    pub unsafe fn unpark<T>(
         &self,
         mut filter: impl FnMut(UnparkResult, usize) -> UnparkFilter,
-        callback: impl FnOnce(UnparkResult),
-    ) {
+        callback: impl FnOnce(UnparkResult) -> T,
+    ) -> T {
         // List of waiters that need to be unparked
         let mut unparked_list = WaiterList::new();
+        let mut result = UnparkResult {
+            unparked: 0,
+            skipped: 0,
+            has_more: false,
+            _sealed: (),
+        };
 
-        self.with_queue(|head| {
-            let mut result = UnparkResult {
-                unparked: 0,
-                skipped: 0,
-                has_more: false,
-                _sealed: (),
-            };
-
-            // Start from the tail of the queue
+        let callback_result = self.with_queue(|head| {
             let mut current = *head;
             while let Some(waiter) = current {
                 let waiter = &*waiter.as_ptr();
@@ -180,8 +171,7 @@ impl<E: AutoResetEvent> Parker<E> {
                     WaitState::Unparked(_) => unreachable!("Thread unparked still in park list"),
                 };
 
-                let f = filter(result, token);
-                match f {
+                match filter(result, token) {
                     UnparkFilter::Stop => break,
                     UnparkFilter::Skip => result.skipped += 1,
                     UnparkFilter::Unpark(token) => {
@@ -193,13 +183,15 @@ impl<E: AutoResetEvent> Parker<E> {
                 }
             }
 
-            result.has_more = result.has_more || result.skipped > 0;
-            callback(result);
+            result.has_more = (*head).is_some();
+            callback(result)
         });
 
         for waiter in unparked_list.iter() {
             waiter.event.set();
         }
+
+        callback_result
     }
 
     unsafe fn remove(
@@ -207,14 +199,15 @@ impl<E: AutoResetEvent> Parker<E> {
         waiter: &Waiter<E>,
     ) -> bool {
         // Get the head of the queue, returning false if the queue is empty.
-        let head_ptr = *head;
-        let head_ref = match head_ptr {
-            Some(p) => &*p.as_ptr(),
+        let waiter_ptr = NonNull::new_unchecked(waiter as *const _ as *mut _);
+        let head_ptr = match *head {
+            Some(p) => p,
             None => return false,
         };
 
         let next = waiter.next.get();
         let prev = waiter.prev.get();
+
         if let Some(next) = next {
             (&*next.as_ptr()).prev.set(prev);
         }
@@ -222,11 +215,16 @@ impl<E: AutoResetEvent> Parker<E> {
             (&*prev.as_ptr()).next.set(next);
         }
 
-        let waiter = NonNull::new_unchecked(waiter as *const _ as *mut _);
-        if waiter == head_ptr.unwrap_unchecked() {
+        let head_ref = &*head_ptr.as_ptr();
+        if waiter_ptr == head_ptr {
             *head = next;
-        } else if waiter == head_ref.tail.get() {
-            head_ref.tail.set(prev.unwrap_unchecked());
+            if let Some(next) = next {
+                (&*next.as_ptr()).tail.set(waiter.tail.get());
+            }
+        } else if waiter_ptr == head_ref.tail.get() {
+            if let Some(prev) = prev {
+                head_ref.tail.set(prev);
+            }
         }
 
         (*head).is_none()

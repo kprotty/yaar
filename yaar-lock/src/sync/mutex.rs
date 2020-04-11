@@ -6,7 +6,7 @@ use core::{
     mem::forget,
     ptr::NonNull,
     ops::{Deref, DerefMut},
-    sync::atomic::{spin_loop_hint, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
 };
 use lock_api::{
     GuardSend,
@@ -32,35 +32,30 @@ mod if_os {
 
 const UNLOCKED: u8 = 0b00;
 const LOCKED: u8 = 0b01;
-const WAKING: usize = 1 << 8;
-const WAITING: usize = 1 << 16;
+const PARKED: u8 = 0b10;
 
 const DEFAULT_TOKEN: usize = 0;
 const RETRY_TOKEN: usize = 1;
 const HANDOFF_TOKEN: usize = 2;
 
 pub struct GenericRawMutex<E> {
-    state: AtomicUsize,
+    state: AtomicU8,
     parker: Parker<E>,
 }
 
 impl<E> GenericRawMutex<E> {
     pub const fn new() -> Self {
         Self {
-            state: AtomicUsize::new(UNLOCKED as usize),
+            state: AtomicU8::new(UNLOCKED),
             parker: Parker::new(),
         }
     }
 }
 
 impl<E: AutoResetEvent> GenericRawMutex<E> {
-    fn byte_state(&self) -> &AtomicU8 {
-        unsafe { &*(&self.state as *const AtomicUsize as *const _) }
-    }
-
     #[inline]
     fn acquire(&self, try_park: impl FnMut(&E) -> bool) -> bool {
-        match self.byte_state().compare_exchange_weak(
+        match self.state.compare_exchange_weak(
             UNLOCKED,
             LOCKED,
             Ordering::Acquire,
@@ -72,120 +67,110 @@ impl<E: AutoResetEvent> GenericRawMutex<E> {
     }
 
     #[cold]
-    fn acquire_slow(&self, mut try_park: impl FnMut(&E) -> bool)  -> bool {
+    fn acquire_slow(&self, mut try_park: impl FnMut(&E) -> bool) -> bool {
         let mut spin: usize = 0;
+        let mut state = self.state.load(Ordering::Relaxed);
 
         loop {
-            let state = self.state.load(Ordering::Relaxed);
-
-            if state & (LOCKED as usize) == 0 {
-                if let Ok(_) = self.byte_state().compare_exchange_weak(
-                    UNLOCKED,
-                    LOCKED,
+            if state & LOCKED == 0 {
+                match self.state.compare_exchange_weak(
+                    state,
+                    state | LOCKED,
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
-                    return true;
+                    Ok(_) => return true,
+                    Err(e) => state = e,
                 }
-                spin_loop_hint();
                 continue;
             }
 
             if E::yield_now(YieldContext {
-                contended: state & WAITING != 0,
+                contended: state & PARKED != 0,
                 iteration: spin,
                 _sealed: (),
             }) {
                 spin = spin.wrapping_add(1);
+                state = self.state.load(Ordering::Relaxed);
                 continue;
             }
 
-            if let Err(_) = self.state.compare_exchange_weak(
-                state,
-                state.checked_add(WAITING)
-                    .expect("Max threads waiting on mutex overflowed"),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                spin_loop_hint();
-                continue;
+            if state & PARKED == 0 {
+                if let Err(e) = self.state.compare_exchange_weak(
+                    state,
+                    state | PARKED,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    state = e;
+                    continue;
+                }
             }
 
             match unsafe {
                 self.parker.park(
                     DEFAULT_TOKEN,
-                    || true,
+                    || self.state.load(Ordering::Relaxed) == LOCKED | PARKED,
                     |event| try_park(event),
-                    |_| {},
+                    |was_last_thread| {
+                        if was_last_thread {
+                            self.state.fetch_and(!PARKED, Ordering::Relaxed);
+                        }
+                    },
                 )
             } {
-                ParkResult::Cancelled => {
-                    self.state.fetch_sub(WAITING, Ordering::Relaxed);
-                    return false
-                },
-                ParkResult::Unparked(token) => {
-                    self.state.fetch_sub(WAITING | WAKING, Ordering::Relaxed);
-                    if token == HANDOFF_TOKEN {
-                        return true;
-                    }
-                },
+                ParkResult::Cancelled => return false,
+                ParkResult::Unparked(HANDOFF_TOKEN) => return true,
+                ParkResult::Unparked(RETRY_TOKEN) => {},
+                ParkResult::Invalid => {},
                 _ => unreachable!(),
             }
 
             spin = 0;
-            spin_loop_hint();
+            state = self.state.load(Ordering::Relaxed);
         }
     }
 
     #[inline]
     fn release(&self, be_fair: bool) {
-        if be_fair {
-            unimplemented!("TODO: fairness")
-        }
-
-        self.byte_state().store(UNLOCKED, Ordering::Release);
-        let state = self.state.load(Ordering::Relaxed);
-        if state & (WAITING | WAKING | (LOCKED as usize)) == WAITING {
-            self.release_slow();
+        if let Err(_) = self.state.compare_exchange(
+            LOCKED,
+            UNLOCKED,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            self.release_slow(be_fair);
         }
     }
 
     #[cold]
-    fn release_slow(&self) {
-        let mut state = self.state.load(Ordering::Relaxed);
-        loop {
-            if state & (WAITING | WAKING | (LOCKED as usize)) != WAITING {
-                return;
-            }
-            match self.state.compare_exchange_weak(
-                state,
-                state | WAKING,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Err(e) => state = e,
-                Ok(_) => break,
-            }
-        }
-
+    fn release_slow(&self, be_fair: bool) {
         unsafe {
             self.parker.unpark_one(
                 |_, token| {
-                    debug_assert_eq!(token, DEFAULT_TOKEN);
-                    RETRY_TOKEN
+                    assert_eq!(token, DEFAULT_TOKEN);
+                    if be_fair { HANDOFF_TOKEN } else { RETRY_TOKEN }
                 },
                 |result| {
-                    if result.unparked == 0 {
-                        self.state.fetch_and(!WAKING, Ordering::Relaxed);
+                    if result.unparked != 0 && be_fair {
+                        if !result.has_more {
+                            self.state.store(LOCKED, Ordering::Relaxed);
+                        }
+                        return;
                     }
-                },
-            );
+                    if result.has_more {
+                        self.state.store(PARKED, Ordering::Release);
+                    } else {
+                        self.state.store(UNLOCKED, Ordering::Release);
+                    }
+                }
+            )
         }
     }
 
     #[cold]
     fn bump_slow(&self) {
-        self.release(true);
+        self.release_slow(true);
         self.lock();
     }
 }
@@ -197,11 +182,11 @@ unsafe impl<E: AutoResetEvent> RawMutex for GenericRawMutex<E> {
 
     #[inline]
     fn try_lock(&self) -> bool {
-        let mut state = self.byte_state().load(Ordering::Relaxed);
-        while state == UNLOCKED {
-            match self.byte_state().compare_exchange_weak(
-                UNLOCKED,
-                LOCKED,
+        let mut state = self.state.load(Ordering::Relaxed);
+        while state & LOCKED == 0 {
+            match self.state.compare_exchange_weak(
+                state,
+                state | LOCKED,
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
@@ -235,7 +220,7 @@ unsafe impl<E: AutoResetEvent> RawMutexFair for GenericRawMutex<E> {
 
     #[inline]
     fn bump(&self) {
-        if self.state.load(Ordering::Relaxed) & WAITING != 0 {
+        if self.state.load(Ordering::Relaxed) & PARKED != 0 {
             self.bump_slow();
         }
     }

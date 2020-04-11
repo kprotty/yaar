@@ -20,6 +20,13 @@ impl<T> Mutex<T> {
     }
 
     pub fn lock<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        self.acquire();
+        let result = f(unsafe { &mut *self.value.get() });
+        self.release();
+        result
+    }
+
+    fn acquire(&self) {
         let mut spin: usize = 8;
         loop {
             if !self.is_locked.load(Ordering::Relaxed) {
@@ -29,7 +36,7 @@ impl<T> Mutex<T> {
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
-                    break;
+                    return;
                 }
             }
             if spin < 1024 {
@@ -40,8 +47,9 @@ impl<T> Mutex<T> {
                 spin = spin.wrapping_add(1024);
             }
         }
-        let result = f(unsafe { &mut *self.value.get() });
+    }
+
+    fn release(&self) {
         self.is_locked.store(false, Ordering::Release);
-        result
     }
 }

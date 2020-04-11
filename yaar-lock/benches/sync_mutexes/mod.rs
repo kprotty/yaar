@@ -42,6 +42,19 @@ impl<T> Mutex<T> for yaar_lock::sync::Mutex<T> {
     }
 }
 
+pub mod yaar_sync_lock;
+impl<T> Mutex<T> for yaar_sync_lock::Mutex<T> {
+    const NAME: &'static str = "yaar_lock::sync:Lock";
+
+    fn new(value: T) -> Self {
+        Self::new(value)
+    }
+
+    fn locked<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        self.lock(f)
+    }
+}
+
 pub mod std_lock;
 impl<T> Mutex<T> for std_lock::Mutex<T> {
     const NAME: &'static str = "std_lock";
@@ -68,9 +81,9 @@ impl<T> Mutex<T> for spin_lock::Mutex<T> {
     }
 }
 
-pub mod sys_lock;
-impl<T> Mutex<T> for sys_lock::Mutex<T> {
-    const NAME: &'static str = sys_lock::NAME;
+pub mod os_lock;
+impl<T> Mutex<T> for os_lock::Mutex<T> {
+    const NAME: &'static str = os_lock::NAME;
 
     fn new(value: T) -> Self {
         Self::new(value)

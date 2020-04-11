@@ -154,13 +154,14 @@ where
 }
 
 fn bench_all(c: &mut Criterion, ctx: BenchContext) {
-    bench_mutex::<yaar_lock::sync::Mutex<BenchValue>>(c, ctx);
     bench_mutex::<std::sync::Mutex<BenchValue>>(c, ctx);
     bench_mutex::<parking_lot::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<yaar_sync_lock::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<yaar_lock::sync::Mutex<BenchValue>>(c, ctx);
 
     bench_mutex::<std_lock::Mutex<BenchValue>>(c, ctx);
     bench_mutex::<spin_lock::Mutex<BenchValue>>(c, ctx);
-    bench_mutex::<sys_lock::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<os_lock::Mutex<BenchValue>>(c, ctx);
 
     #[cfg(windows)]
     bench_mutex::<nt_lock::Mutex<BenchValue>>(c, ctx);
@@ -172,11 +173,24 @@ fn bench_threads(
     work_per_critical_section: usize,
 ) {
     let max_threads = num_cpus::get();
+    let mut num_threads = Vec::new();
+    num_threads.push(max_threads * 2);
+    num_threads.push(max_threads);
+    
+    let mut stop = false;
+    let mut rest = max_threads / 2;
+    while !stop && rest < max_threads {
+        if rest == 1 {
+            if !num_threads.contains(&2) {
+                num_threads.push(2);
+            }
+            stop = true;
+        }
+        num_threads.push(rest);
+        rest /= 2;
+    }
 
-    let mut last_tested = 0;
-    let mut num_threads = 4;
-    while num_threads < max_threads / 2 {
-        last_tested = num_threads;
+    for &num_threads in num_threads.iter().rev() {
         bench_all(
             c,
             BenchContext {
@@ -185,40 +199,7 @@ fn bench_threads(
                 work_per_critical_section,
             },
         );
-        if num_threads < 2 {
-            num_threads += 1;
-        } else {
-            num_threads *= 2;
-        }
     }
-
-    if last_tested < max_threads / 2 {
-        bench_all(
-            c,
-            BenchContext {
-                bench_type,
-                num_threads: max_threads / 2,
-                work_per_critical_section,
-            },
-        );
-    }
-
-    bench_all(
-        c,
-        BenchContext {
-            bench_type,
-            num_threads: max_threads,
-            work_per_critical_section,
-        },
-    );
-    bench_all(
-        c,
-        BenchContext {
-            bench_type,
-            num_threads: max_threads * 2,
-            work_per_critical_section,
-        },
-    );
 }
 
 fn lock_latency_short(c: &mut Criterion) {
