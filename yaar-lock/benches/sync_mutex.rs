@@ -154,9 +154,9 @@ where
 }
 
 fn bench_all(c: &mut Criterion, ctx: BenchContext) {
+    bench_mutex::<yaar_lock::sync::Mutex<BenchValue>>(c, ctx);
     bench_mutex::<std::sync::Mutex<BenchValue>>(c, ctx);
     bench_mutex::<parking_lot::Mutex<BenchValue>>(c, ctx);
-    bench_mutex::<yaar_lock::sync::Mutex<BenchValue>>(c, ctx);
 
     bench_mutex::<std_lock::Mutex<BenchValue>>(c, ctx);
     bench_mutex::<spin_lock::Mutex<BenchValue>>(c, ctx);
@@ -174,7 +174,7 @@ fn bench_threads(
     let max_threads = num_cpus::get();
 
     let mut last_tested = 0;
-    let mut num_threads = 1;
+    let mut num_threads = 4;
     while num_threads < max_threads / 2 {
         last_tested = num_threads;
         bench_all(

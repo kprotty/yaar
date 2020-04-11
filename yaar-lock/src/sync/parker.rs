@@ -1,5 +1,8 @@
 use super::Lock;
-use crate::event::AutoResetEvent;
+use crate::{
+    event::AutoResetEvent,
+    utils::UnwrapUnchecked,
+};
 use core::{
     cell::Cell,
     mem::MaybeUninit,
@@ -55,6 +58,7 @@ impl<E: AutoResetEvent> Parker<E> {
         f: impl FnOnce(&mut Option<NonNull<Waiter<E>>>) -> T,
     ) -> T {
         use lock_api::RawMutex;
+
         self.queue_lock.lock();
         let result = f(&mut *self.queue.as_ptr());
         self.queue_lock.unlock();
@@ -70,22 +74,22 @@ impl<E: AutoResetEvent> Parker<E> {
     ) -> ParkResult {
         let waiter = MaybeUninit::<Waiter<E>>::uninit();
         let waiter_ptr = NonNull::new_unchecked(waiter.as_ptr() as *mut _);
-        let waiter_ref = &*waiter_ptr.as_ptr();
-
+        
         if !self.with_queue(|head| validate() && {
             write(waiter_ptr.as_ptr(), Waiter {
                 event: E::default(),
                 state: Cell::new(WaitState::Parked(token)),
-                prev: Cell::new(None),
-                next: Cell::new(*head),
-                tail: Cell::new({
+                next: Cell::new(None),
+                tail: Cell::new(waiter_ptr),
+                prev: Cell::new({
                     if let Some(head) = *head {
                         let head = &*head.as_ptr();
-                        head.prev.set(Some(waiter_ptr));
-                        head.tail.get()
+                        let tail_ptr = head.tail.replace(waiter_ptr);
+                        (&*tail_ptr.as_ptr()).next.set(Some(waiter_ptr));
+                        Some(tail_ptr)
                     } else {
                         *head = Some(waiter_ptr);
-                        waiter_ptr
+                        None
                     }
                 }),
             });
@@ -95,7 +99,11 @@ impl<E: AutoResetEvent> Parker<E> {
         }
 
         // Acquire
-        if try_park(&waiter_ref.event) {
+        let waiter_ref = &*waiter_ptr.as_ptr();
+        print!("\n {:?} suspending on {:p}", std::thread::current().id(), &waiter_ref.event);
+        let woke = try_park(&waiter_ref.event);
+        print!("\n {:?} resuming   on {:p}", std::thread::current().id(), &waiter_ref.event);
+        if woke {
             drop_in_place(waiter_ptr.as_ptr());
             return match waiter_ref.state.get() {
                 WaitState::Unparked(token) => ParkResult::Unparked(token),
@@ -162,10 +170,9 @@ impl<E: AutoResetEvent> Parker<E> {
 
             // Start from the tail of the queue
             let mut current = *head;
-            current = current.map(|p| (&*p.as_ptr()).tail.get());
             while let Some(waiter) = current {
                 let waiter = &*waiter.as_ptr();
-                current = waiter.prev.get();
+                current = waiter.next.get();
                 result.has_more = current.is_some();
 
                 let token = match waiter.state.get() {
@@ -173,7 +180,8 @@ impl<E: AutoResetEvent> Parker<E> {
                     WaitState::Unparked(_) => unreachable!("Thread unparked still in park list"),
                 };
 
-                match filter(result, token) {
+                let f = filter(result, token);
+                match f {
                     UnparkFilter::Stop => break,
                     UnparkFilter::Skip => result.skipped += 1,
                     UnparkFilter::Unpark(token) => {
@@ -199,36 +207,29 @@ impl<E: AutoResetEvent> Parker<E> {
         waiter: &Waiter<E>,
     ) -> bool {
         // Get the head of the queue, returning false if the queue is empty.
-        let head_ref = match *head {
+        let head_ptr = *head;
+        let head_ref = match head_ptr {
             Some(p) => &*p.as_ptr(),
             None => return false,
         };
 
-        // Fix up the links of surrounding waiter nodes
-        let prev = waiter.prev.get();
         let next = waiter.next.get();
-        if let Some(prev) = prev {
-            (&*prev.as_ptr()).next.set(next);
-        }
+        let prev = waiter.prev.get();
         if let Some(next) = next {
             (&*next.as_ptr()).prev.set(prev);
         }
-
-        let tail_ptr = head_ref.tail.get();
-        let waiter_ptr = NonNull::new_unchecked(waiter as *const _ as *mut _);
-
-        // Fix the tail of the queue & the head if this was the last waiter.
-        let mut was_last_waiter = false;
-        if waiter_ptr == tail_ptr {
-            if let Some(prev) = prev {
-                head_ref.tail.set(prev);
-            } else {
-                *head = None;
-                was_last_waiter = true;
-            }
+        if let Some(prev) = prev {
+            (&*prev.as_ptr()).next.set(next);
         }
 
-        was_last_waiter
+        let waiter = NonNull::new_unchecked(waiter as *const _ as *mut _);
+        if waiter == head_ptr.unwrap_unchecked() {
+            *head = next;
+        } else if waiter == head_ref.tail.get() {
+            head_ref.tail.set(prev.unwrap_unchecked());
+        }
+
+        (*head).is_none()
     }
 }
 

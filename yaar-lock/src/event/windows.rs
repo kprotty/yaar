@@ -52,12 +52,14 @@ impl Signal {
                 .state
                 .compare_and_swap(EMPTY, NOTIFIED, Ordering::Release);
             if state == EMPTY {
+                print!("\n non-blocking notify to {:p}", self);
                 return;
             }
         }
 
         debug_assert_eq!(state, WAITING);
         self.state.store(EMPTY, Ordering::Release);
+        print!("\n futex-wake notify to {:p}", self);
         unsafe { Futex::wake(&self.state) };
     }
 
@@ -68,12 +70,16 @@ impl Signal {
                 .state
                 .compare_and_swap(EMPTY, WAITING, Ordering::Acquire);
             if state == EMPTY {
-                return unsafe { Futex::wait(&self.state, WAITING, EMPTY, timeout) };
+                print!("\n futex-wait for {:p}", self);
+                let result = unsafe { Futex::wait(&self.state, WAITING, EMPTY, timeout) };
+                print!("\n futex-wait on {:p} notified with {:?}", self, result);
+                return result;
             }
         }
 
         debug_assert_eq!(state, NOTIFIED);
         self.state.store(EMPTY, Ordering::Relaxed);
+        print!("\n non-blocking wait on {:p}", self);
         true
     }
 }
@@ -96,10 +102,10 @@ impl Futex {
     unsafe fn get() -> Self {
         match HANDLE.load(Ordering::Acquire) {
             0 => {
-                if Self::load_wait_on_address() {
-                    Self::WaitOnAddress
-                } else if let Some(handle) = Self::load_keyed_event() {
+                if let Some(handle) = Self::load_keyed_event() {
                     Self::KeyedEvent(handle.get())
+                } else if Self::load_wait_on_address() {
+                    Self::WaitOnAddress
                 } else {
                     unreachable!("OsSignal requires either WaitOnAddress (Win8+) or NT Keyed Events (WinXP+)");
                 }
