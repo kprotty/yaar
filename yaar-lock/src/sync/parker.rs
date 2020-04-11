@@ -65,14 +65,14 @@ impl<E: AutoResetEvent> Parker<E> {
     pub unsafe fn park(
         &self,
         token: usize,
-        validate: impl FnOnce() -> bool,
+        validate: impl FnOnce(bool) -> bool,
         try_park: impl FnOnce(&E) -> bool,
         cancel: impl FnOnce(bool),
     ) -> ParkResult {
         let waiter = MaybeUninit::<Waiter<E>>::uninit();
         let waiter_ptr = NonNull::new_unchecked(waiter.as_ptr() as *mut _);
         
-        if !self.with_queue(|head| validate() && {
+        if !self.with_queue(|head| validate((*head).is_some()) && {
             write(waiter_ptr.as_ptr(), Waiter {
                 event: E::default(),
                 state: Cell::new(WaitState::Parked(token)),
@@ -104,11 +104,11 @@ impl<E: AutoResetEvent> Parker<E> {
             };
         }
 
-        let result = self.with_queue(|queue| match waiter_ref.state.get() {
+        let result = self.with_queue(|head| match waiter_ref.state.get() {
             WaitState::Unparked(token) => ParkResult::Unparked(token),
             WaitState::Parked(_) => {
-                let was_last_waiter = Self::remove(queue, waiter_ref);
-                cancel(was_last_waiter);
+                Self::remove(head, waiter_ref);
+                cancel((*head).is_some());
                 ParkResult::Cancelled
             },
         });
@@ -197,12 +197,12 @@ impl<E: AutoResetEvent> Parker<E> {
     unsafe fn remove(
         head: &mut Option<NonNull<Waiter<E>>>,
         waiter: &Waiter<E>,
-    ) -> bool {
+    )  {
         // Get the head of the queue, returning false if the queue is empty.
         let waiter_ptr = NonNull::new_unchecked(waiter as *const _ as *mut _);
         let head_ptr = match *head {
             Some(p) => p,
-            None => return false,
+            None => return,
         };
 
         let next = waiter.next.get();
@@ -226,8 +226,6 @@ impl<E: AutoResetEvent> Parker<E> {
                 head_ref.tail.set(prev);
             }
         }
-
-        (*head).is_none()
     }
 }
 

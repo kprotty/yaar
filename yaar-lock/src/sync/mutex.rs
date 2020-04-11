@@ -110,7 +110,7 @@ impl<E: AutoResetEvent> GenericRawMutex<E> {
             match unsafe {
                 self.parker.park(
                     DEFAULT_TOKEN,
-                    || self.state.load(Ordering::Relaxed) == LOCKED | PARKED,
+                    |_| self.state.load(Ordering::Relaxed) == LOCKED | PARKED,
                     |event| try_park(event),
                     |was_last_thread| {
                         if was_last_thread {
