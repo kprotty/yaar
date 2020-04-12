@@ -110,6 +110,7 @@ impl<E: AutoResetEvent> Lock<E> {
 
     #[cold]
     unsafe fn lock_slow(&self) {
+        // Lazyily allocate the waiter to improve fast path contended acquire.
         let mut spin: usize = 0;
         let mut event_initialized = false;
         let waiter = Waiter {
@@ -257,7 +258,7 @@ impl<E: AutoResetEvent> Lock<E> {
                         let next = current.next.get().assume_init();
                         let next = &*next.unwrap_unchecked().as_ptr();
                         let current_ptr = NonNull::from(current);
-                        next.prev.set(MaybeUninit::new(current_ptr));
+                        next.prev.set(MaybeUninit::new(Some(current_ptr)));
                         current = next;
                     }
                 }

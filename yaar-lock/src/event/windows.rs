@@ -56,9 +56,10 @@ impl Signal {
             }
         }
 
-        debug_assert_eq!(state, WAITING);
-        self.state.store(EMPTY, Ordering::Release);
-        unsafe { Futex::wake(&self.state) };
+        if state == WAITING {
+            self.state.store(EMPTY, Ordering::Release);
+            unsafe { Futex::wake(&self.state) };
+        }
     }
 
     pub fn try_wait(&self, timeout: Option<OsInstant>) -> bool {
@@ -73,7 +74,8 @@ impl Signal {
             }
         }
 
-        debug_assert_eq!(state, NOTIFIED);
+        assert_ne!(state, WAITING, "Multiple threads waiting on same OsSignal");
+        assert_eq!(state, NOTIFIED, "Invalid OsSignal state");
         self.state.store(EMPTY, Ordering::Relaxed);
         true
     }

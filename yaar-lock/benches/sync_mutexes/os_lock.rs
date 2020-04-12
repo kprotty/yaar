@@ -57,3 +57,47 @@ mod os {
         fn ReleaseSRWLockExclusive(srwlock: *mut SRWLOCK);
     }
 }
+
+#[cfg(unix)]
+mod os {
+    use std::cell::UnsafeCell;
+    use yaar_sys::{
+        EINVAL,
+        pthread_mutex_t,
+        PTHREAD_MUTEX_INITIALIZER,
+        pthread_mutex_lock,
+        pthread_mutex_unlock,
+        pthread_mutex_destroy,
+    };
+
+    pub struct Lock(UnsafeCell<pthread_mutex_t>);
+
+    impl Drop for Lock {
+        fn drop(&mut self) {
+            let status = unsafe { pthread_mutex_destroy(self.0.get()) };
+            if cfg!(target_os = "dragonfly") {
+                debug_assert!(status == 0 || status == EINVAL);
+            } else {
+                debug_assert_eq!(status, 0);
+            }
+        }
+    }
+
+    impl Lock {
+        pub const NAME: &'static str = "pthread_mutex_t";
+
+        pub fn new() -> Self {
+            Self(UnsafeCell::new(PTHREAD_MUTEX_INITIALIZER))
+        }
+
+        pub fn acquire(&self) {
+            let status = unsafe { pthread_mutex_lock(self.0.get()) };
+            debug_assert_eq!(status, 0);
+        }
+
+        pub fn release(&self) {
+            let status = unsafe { pthread_mutex_unlock(self.0.get()) };
+            debug_assert_eq!(status, 0);
+        }
+    }
+}

@@ -24,13 +24,13 @@ impl Timer {
     pub unsafe fn timestamp() -> OsDuration {
         use crate::utils::UnwrapUnchecked;
         use core::convert::TryInto;
-        use yaar_sys::{clock_gettime, timespec, CLOCK_MONOTONIC};
+        use yaar_sys::{clock_gettime, CLOCK_MONOTONIC};
 
         let mut now_ts = MaybeUninit::uninit();
         let status = clock_gettime(CLOCK_MONOTONIC, now_ts.as_mut_ptr());
         debug_assert_eq!(status, 0);
 
-        let mut now_ts = now_ts.assume_init();
+        let now_ts = now_ts.assume_init();
         OsDuration::new(
             now_ts.tv_sec.try_into().unwrap_unchecked(),
             now_ts.tv_nsec.try_into().unwrap_unchecked(),

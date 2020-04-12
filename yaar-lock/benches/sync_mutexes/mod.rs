@@ -108,3 +108,18 @@ impl<T> Mutex<T> for nt_lock::Mutex<T> {
         self.lock(f)
     }
 }
+
+#[cfg(unix)]
+pub mod yield_lock;
+#[cfg(unix)]
+impl<T> Mutex<T> for yield_lock::Mutex<T> {
+    const NAME: &'static str = "sched_yield";
+
+    fn new(value: T) -> Self {
+        Self::new(value)
+    }
+
+    fn locked<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        self.lock(f)
+    }
+}

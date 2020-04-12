@@ -165,6 +165,8 @@ fn bench_all(c: &mut Criterion, ctx: BenchContext) {
 
     #[cfg(windows)]
     bench_mutex::<nt_lock::Mutex<BenchValue>>(c, ctx);
+    #[cfg(unix)]
+    bench_mutex::<yield_lock::Mutex<BenchValue>>(c, ctx);
 }
 
 fn bench_threads(c: &mut Criterion, bench_type: BenchType, work_per_critical_section: usize) {
