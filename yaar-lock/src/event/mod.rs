@@ -28,9 +28,14 @@ mod windows;
 #[cfg(all(feature = "os", windows))]
 use windows::Signal;
 
-#[cfg(all(feature = "os", unix))]
+#[cfg(all(feature = "os", any(target_os = "linux", target_os = "android")))]
+mod linux;
+#[cfg(all(feature = "os", any(target_os = "linux", target_os = "android")))]
+use linux::Signal;
+
+#[cfg(all(feature = "os", unix, not(any(target_os = "linux", target_os = "android"))))]
 mod posix;
-#[cfg(all(feature = "os", unix))]
+#[cfg(all(feature = "os", unix, not(any(target_os = "linux", target_os = "android"))))]
 use posix::Signal;
 
 #[cfg(feature = "os")]
