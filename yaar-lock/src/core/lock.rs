@@ -1,3 +1,10 @@
+// Copyright 2020 kprotty
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
 use crate::{
     event::{AutoResetEvent, YieldContext},
     utils::UnwrapUnchecked,
@@ -7,10 +14,18 @@ use core::{
     cell::Cell,
     fmt,
     marker::PhantomData,
-    mem::MaybeUninit,
+    mem::{size_of, MaybeUninit},
     ptr::{drop_in_place, NonNull},
     sync::atomic::{fence, AtomicU8, AtomicUsize, Ordering},
 };
+
+#[cfg(feature = "os")]
+use crate::event::OsAutoResetEvent;
+
+/// A [`Lock`] implementation backed by [`OsAutoResetEvent`].
+#[cfg(feature = "os")]
+#[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
+pub type OsLock = Lock<OsAutoResetEvent>;
 
 const UNLOCKED: u8 = 0;
 const LOCKED: u8 = 1;
@@ -26,6 +41,29 @@ struct Waiter<E> {
     tail: Cell<MaybeUninit<Option<NonNull<Self>>>>,
 }
 
+/// A lightweight [`lock_api::RawMutex`] implementation based on a modified
+/// version of the uncontended wakeup [`Fast Mutex`] algorithm. This serves as
+/// the core backing for [`Parker`].
+///
+/// This mutex is small in size and performs best in specific extreme situations
+/// on modern OS's:
+///
+/// * No Contention: Only one thread is locking and unlocking the mutex for the
+///   majority.
+/// * High Contention: Maxed out parallelism where each thread is racing on the
+///   mutex.
+/// * Long Critical Sections: When threads are spending a considerable amount of
+///   time holding the lock.
+///
+/// It achieves this through two primary concepts as seen in the algorithm:
+/// * Unlock() via atomic store instead of bus-locked instruction (rmw, cmpxchg)
+/// * Only one thread is being unparked at a time instead of always unparking on
+///   unlock()
+/// * Assuming the platform supports byte level atomics and has a pointer width
+///   larger than that of a byte.
+///
+/// [`Parker`]: [`yaar_lock::core::Parker`]
+/// [`Fast Mutex`]: https://locklessinc.com/articles/keyed_events/
 pub struct Lock<E> {
     state: AtomicUsize,
     _phantom: PhantomData<E>,
@@ -50,6 +88,7 @@ impl<E> Default for Lock<E> {
 }
 
 impl<E> Lock<E> {
+    /// Create a new lock in an unlocked state.
     #[inline]
     pub const fn new() -> Self {
         Self {
@@ -105,6 +144,8 @@ unsafe impl<E: AutoResetEvent> lock_api::RawMutex for Lock<E> {
 impl<E: AutoResetEvent> Lock<E> {
     #[inline]
     fn byte_state(&self) -> &AtomicU8 {
+        // Safety: the target platform adheres to the requirements in the doc comment
+        assert!(size_of::<AtomicUsize>() > size_of::<AtomicU8>());
         unsafe { &*(&self.state as *const AtomicUsize as *const AtomicU8) }
     }
 

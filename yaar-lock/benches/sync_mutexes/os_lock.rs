@@ -62,12 +62,8 @@ mod os {
 mod os {
     use std::cell::UnsafeCell;
     use yaar_sys::{
-        EINVAL,
-        pthread_mutex_t,
+        pthread_mutex_destroy, pthread_mutex_lock, pthread_mutex_t, pthread_mutex_unlock, EINVAL,
         PTHREAD_MUTEX_INITIALIZER,
-        pthread_mutex_lock,
-        pthread_mutex_unlock,
-        pthread_mutex_destroy,
     };
 
     pub struct Lock(UnsafeCell<pthread_mutex_t>);

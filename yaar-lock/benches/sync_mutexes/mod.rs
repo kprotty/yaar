@@ -30,8 +30,8 @@ impl<T> Mutex<T> for parking_lot::Mutex<T> {
     }
 }
 
-impl<T> Mutex<T> for yaar_lock::sync::Mutex<T> {
-    const NAME: &'static str = "yaar_lock::sync::Mutex";
+impl<T> Mutex<T> for yaar_lock::sync::OsMutex<T> {
+    const NAME: &'static str = "yaar_lock::sync::OsMutex";
 
     fn new(value: T) -> Self {
         Self::new(value)

@@ -1,7 +1,5 @@
-mod lock;
-pub use lock::*;
+mod raw_mutex;
+pub use raw_mutex::*;
 
 mod mutex;
 pub use mutex::*;
-
-pub mod parker;

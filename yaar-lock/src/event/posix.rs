@@ -1,42 +1,19 @@
-use super::{
-    OsInstant,
-    OsDuration,
-    OsAutoResetEvent,
-    AutoResetEvent,
-    YieldContext,
-};
+use super::{AutoResetEvent, OsAutoResetEvent, OsDuration, OsInstant, YieldContext};
 use core::{
-    fmt,
-    ptr::{write, drop_in_place},
     cell::UnsafeCell,
     convert::TryInto,
+    fmt,
     marker::PhantomData,
-    mem::{size_of, align_of, MaybeUninit},
-    sync::atomic::{Ordering, AtomicUsize},
+    mem::{align_of, size_of, MaybeUninit},
+    ptr::{drop_in_place, write},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use yaar_sys::{
-    time_t,
-    c_void,
-    timespec,
-    ETIMEDOUT,
-    EINVAL,
-    malloc,
-    free,
-    pthread_key_t,
-    pthread_key_create,
-    pthread_getspecific,
-    pthread_setspecific,
-    pthread_mutex_t,
-    PTHREAD_MUTEX_INITIALIZER,
-    pthread_mutex_lock,
-    pthread_mutex_unlock,
-    pthread_mutex_destroy,
-    pthread_cond_t,
-    PTHREAD_COND_INITIALIZER,
-    pthread_cond_wait,
-    pthread_cond_timedwait,
-    pthread_cond_signal,
-    pthread_cond_destroy,
+    c_void, free, malloc, pthread_cond_destroy, pthread_cond_signal, pthread_cond_t,
+    pthread_cond_timedwait, pthread_cond_wait, pthread_getspecific, pthread_key_create,
+    pthread_key_t, pthread_mutex_destroy, pthread_mutex_lock, pthread_mutex_t,
+    pthread_mutex_unlock, pthread_setspecific, time_t, timespec, EINVAL, ETIMEDOUT,
+    PTHREAD_COND_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
 };
 
 const EMPTY: usize = 0;
@@ -52,7 +29,7 @@ impl fmt::Debug for Signal {
         let state = match self.state.load(Ordering::Acquire) {
             EMPTY => "empty",
             NOTIFIED => "notified",
-            ptr => unsafe { (&*(ptr as *const ThreadSignal)).state() }
+            ptr => unsafe { (&*(ptr as *const ThreadSignal)).state() },
         };
 
         f.debug_struct("OsSignal").field("state", &state).finish()
@@ -65,7 +42,7 @@ impl Signal {
             state: AtomicUsize::new(EMPTY),
         }
     }
-    
+
     pub fn notify(&self) {
         let mut state = self.state.load(Ordering::Acquire);
         if state == EMPTY {
@@ -83,13 +60,13 @@ impl Signal {
         }
     }
 
-    pub fn try_wait(&self, timeout: Option<OsInstant>) -> bool {
+    pub fn try_wait(&self, timeout: Option<&OsInstant>) -> bool {
         let mut state = self.state.load(Ordering::Acquire);
         if state == EMPTY {
             let thread_signal_ptr = ThreadSignal::get();
-            state = self
-                .state
-                .compare_and_swap(EMPTY, thread_signal_ptr as usize, Ordering::AcqRel);
+            state =
+                self.state
+                    .compare_and_swap(EMPTY, thread_signal_ptr as usize, Ordering::AcqRel);
             if state == EMPTY {
                 state = thread_signal_ptr as usize;
             }
@@ -101,7 +78,7 @@ impl Signal {
         }
 
         let thread_signal = unsafe { &*(state as *const ThreadSignal) };
-        thread_signal.try_wait(timeout)        
+        thread_signal.try_wait(timeout)
     }
 }
 
@@ -167,7 +144,7 @@ impl ThreadSignal {
         })
     }
 
-    fn try_wait(&self, timeout: Option<OsInstant>) -> bool {
+    fn try_wait(&self, timeout: Option<&OsInstant>) -> bool {
         self.locked(|state| unsafe {
             if *state == NOTIFIED {
                 *state = EMPTY;
@@ -178,12 +155,12 @@ impl ThreadSignal {
             while *state == WAITING {
                 if let Some(timeout) = timeout {
                     let now = OsInstant::now();
-                    if timeout <= now {
+                    if *timeout <= now {
                         *state = EMPTY;
                         return false;
                     }
 
-                    if let Some(ts) = Self::timeout_to_ts(timeout - now) {
+                    if let Some(ts) = Self::timeout_to_ts(*timeout - now) {
                         let status = pthread_cond_timedwait(self.cond.get(), self.mutex.get(), &ts);
                         if ts.tv_sec < 0 {
                             debug_assert!(status == 0 || status == ETIMEDOUT || status == EINVAL);
@@ -233,8 +210,8 @@ impl ThreadSignal {
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     unsafe fn ts_now() -> timespec {
-        use yaar_sys::{timeval, gettimeofday};
-        
+        use yaar_sys::{gettimeofday, timeval};
+
         let mut now = MaybeUninit::uninit();
         let status = gettimeofday(now.as_mut_ptr(), null_mut());
         debug_assert_eq!(status, 0);
@@ -248,11 +225,7 @@ impl ThreadSignal {
 
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     unsafe fn ts_now() -> timespec {
-        use yaar_sys::{
-            CLOCK_MONOTONIC,
-            CLOCK_REALTIME,
-            clock_gettime,
-        };
+        use yaar_sys::{clock_gettime, CLOCK_MONOTONIC, CLOCK_REALTIME};
 
         let mut now = MaybeUninit::uninit();
         let clock = if cfg!(target_os = "android") {
@@ -260,7 +233,7 @@ impl ThreadSignal {
         } else {
             CLOCK_MONOTONIC
         };
-        
+
         let status = clock_gettime(clock, now.as_mut_ptr());
         debug_assert_eq!(status, 0);
         now.assume_init()
@@ -270,19 +243,20 @@ impl ThreadSignal {
         static SIGNAL: LocalKey<ThreadSignal> = LocalKey::new();
 
         SIGNAL.get(|ptr| unsafe {
-            write(ptr, Self {
-                state: UnsafeCell::new(EMPTY),
-                cond: UnsafeCell::new(PTHREAD_COND_INITIALIZER),
-                mutex: UnsafeCell::new(PTHREAD_MUTEX_INITIALIZER),
-            });
+            write(
+                ptr,
+                Self {
+                    state: UnsafeCell::new(EMPTY),
+                    cond: UnsafeCell::new(PTHREAD_COND_INITIALIZER),
+                    mutex: UnsafeCell::new(PTHREAD_MUTEX_INITIALIZER),
+                },
+            );
 
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))] {
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+            {
                 use yaar_sys::{
-                    CLOCK_MONOTONIC,
-                    pthread_condattr_init,
-                    pthread_condattr_setclock,
-                    pthread_condattr_destroy,
-                    pthread_cond_init,
+                    pthread_cond_init, pthread_condattr_destroy, pthread_condattr_init,
+                    pthread_condattr_setclock, CLOCK_MONOTONIC,
                 };
 
                 let mut attr = MaybeUninit::uninit();
@@ -332,7 +306,7 @@ impl<T: Sized> LocalKey<T> {
                 }
                 self.key.assume_init()
             };
-            
+
             let mut ptr = pthread_getspecific(key) as *mut T;
             if ptr.is_null() {
                 ptr = self.alloc_value(key, init);
@@ -357,16 +331,19 @@ impl<T: Sized> LocalKey<T> {
                 // Try to initialize the thread local key by acquiring the CREATING lock.
                 // Limit the pthread_key_create to one thread to avoid key starvation elsewhere.
                 Self::UNINIT => {
-                    state = self.state.compare_and_swap(state, Self::CREATING, Ordering::AcqRel);
+                    state = self
+                        .state
+                        .compare_and_swap(state, Self::CREATING, Ordering::AcqRel);
                     if state == Self::UNINIT {
-                        let status = pthread_key_create(self.key.as_ptr() as *mut _, Some(Self::destructor));
+                        let status =
+                            pthread_key_create(self.key.as_ptr() as *mut _, Some(Self::destructor));
                         state = match status {
                             0 => Self::READY,
                             _ => Self::ERROR,
                         };
                         self.state.store(state, Ordering::Release);
                     }
-                },
+                }
                 // Another thread is busy creating the thread local key.
                 // Spin on the state until the thread is ready
                 Self::CREATING => {
@@ -380,8 +357,8 @@ impl<T: Sized> LocalKey<T> {
                         spin = 0;
                     }
                     state = self.state.load(Ordering::Acquire);
-                },
-                // 
+                }
+                //
                 Self::READY => return,
                 _ => unreachable!("OS failed to allocate thread local key"),
             }

@@ -1,6 +1,6 @@
 use lock_api::RawMutex;
 use std::cell::UnsafeCell;
-use yaar_lock::{event::OsAutoResetEvent, sync::Lock};
+use yaar_lock::{core::Lock, event::OsAutoResetEvent};
 
 pub struct Mutex<T> {
     lock: Lock<OsAutoResetEvent>,

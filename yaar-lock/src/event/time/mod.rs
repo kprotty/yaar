@@ -1,9 +1,21 @@
+// Copyright 2020 kprotty
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+use crate::{core::Lock, event::OsAutoResetEvent};
 use core::{
-    mem::size_of,
     ops::{Add, AddAssign, Sub, SubAssign},
-    sync::atomic::{spin_loop_hint, AtomicBool, Ordering},
     time::Duration,
 };
+use lock_api::RawMutex;
+
+/// Sources and code documentation copied and modified from
+/// [`std::time::Instant`].
+///
+/// [`std::time::Instant`]: https://github.com/rust-lang/rust/blob/d3c79346a3e7ddbb5fb417810f226ac5a9209007/src/libstd/time.rs
 
 #[cfg(all(feature = "os", windows))]
 mod windows;
@@ -15,8 +27,20 @@ mod posix;
 #[cfg(all(feature = "os", unix))]
 use posix::*;
 
+/// OS-specific duration types for synchronization primitives
+#[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
 pub type OsDuration = Duration;
 
+/// A measurement of a monotonically nondecreasing clock often used for
+/// measuring the time of an operation.
+///
+/// OsInstants represent a moment in time and are useful when measuring the
+/// duration or comparing two instants.
+///
+/// OsInstants are guaranteed to be no less than any previously measured
+/// instant. They're not, however, guaranteed to advance in a steady manner
+/// (e.g. some seconds may longer or shorter than others).
+#[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
 #[derive(Copy, Clone, Eq, Ord, PartialEq, PartialOrd, Hash, Debug)]
 pub struct OsInstant {
     timestamp: Duration,
@@ -61,68 +85,87 @@ impl Sub<Self> for OsInstant {
 }
 
 impl OsInstant {
-    unsafe fn timestamp() -> OsDuration {
-        let mut now = Timer::timestamp();
-        if Timer::IS_ACTUALLY_MONOTONIC {
-            return now;
-        }
-
-        static LOCKED: AtomicBool = AtomicBool::new(false);
-        static mut CURRENT: OsDuration = OsDuration::from_secs(0);
-
-        let mut spin: usize = 0;
-        loop {
-            if !LOCKED.load(Ordering::Relaxed) {
-                if let Ok(_) =
-                    LOCKED.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                {
-                    break;
-                }
+    /// Get the current timestamp from the OS with a nondecreasing guarantee.
+    fn timestamp() -> OsDuration {
+        unsafe {
+            // Return the timestamp immediately if the OS is assumed
+            // to guarantee a monotonic increasing timestamp.
+            let mut now = Timer::timestamp();
+            if Timer::IS_ACTUALLY_MONOTONIC {
+                return now;
             }
-            spin = spin.wrapping_add(size_of::<usize>());
-            (0..spin.min(1024)).for_each(|_| spin_loop_hint());
-        }
 
-        if CURRENT >= now {
-            now = CURRENT;
-        } else {
-            CURRENT = now;
-        }
+            static LOCK: Lock<OsAutoResetEvent> = Lock::new();
+            static mut CURRENT: OsDuration = OsDuration::from_secs(0);
 
-        LOCKED.store(false, Ordering::Release);
-        now
+            // If not, acquire the lock on the current timestamp and update the global
+            // value. We do this to ensure that the timestamp reported by the OS
+            // doesn't go backwards.
+            LOCK.lock();
+            if CURRENT >= now {
+                now = CURRENT;
+            } else {
+                CURRENT = now;
+            }
+            LOCK.unlock();
+
+            now
+        }
     }
 
+    /// Returns an instant corresponding to the current moment in time.
     pub fn now() -> Self {
         Self {
-            timestamp: unsafe { Self::timestamp() },
+            timestamp: Self::timestamp(),
         }
     }
 
+    /// Returns the amount of time elapsed from another instant to this one.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if `earlier` is later than `self`.
     pub fn duration_since(&self, earlier: Self) -> Duration {
         self.checked_duration_since(earlier)
             .expect("Supplied instant is later than self")
     }
 
+    /// Returns the amount of time elapsed from another instant to this one,
+    /// or None if that instant is later than this one.
     pub fn checked_duration_since(&self, earlier: Self) -> Option<Duration> {
         self.timestamp.checked_sub(earlier.timestamp)
     }
 
+    /// Returns the amount of time elapsed from another instant to this one,
+    /// or zero duration if that instant is earlier than this one.
     pub fn saturating_duration_since(&self, earlier: Self) -> Duration {
         self.checked_duration_since(earlier)
             .unwrap_or(Duration::new(0, 0))
     }
 
+    /// Returns the amount of time elapsed since this instant was created.
+    ///
+    /// # Panics
+    ///
+    /// This function may panic if the current time is earlier than this
+    /// instant, which is something that can happen if an `Instant` is
+    /// produced synthetically.
     pub fn elapsed(&self) -> Duration {
         Self::now().duration_since(*self)
     }
 
+    /// Returns `Some(t)` where `t` is the time `self + duration` if `t` can be
+    /// represented as `Instant` (which means it's inside the bounds of the
+    /// underlying data structure), `None` otherwise.
     pub fn checked_add(&self, duration: Duration) -> Option<Self> {
         self.timestamp
             .checked_add(duration)
             .map(|timestamp| Self { timestamp })
     }
 
+    /// Returns `Some(t)` where `t` is the time `self - duration` if `t` can be
+    /// represented as `Instant` (which means it's inside the bounds of the
+    /// underlying data structure), `None` otherwise.
     pub fn checked_sub(&self, duration: Duration) -> Option<Self> {
         self.timestamp
             .checked_sub(duration)

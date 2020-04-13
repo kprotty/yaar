@@ -1,3 +1,10 @@
+// Copyright 2020 kprotty
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
 use super::Lock;
 use crate::event::AutoResetEvent;
 use core::{
@@ -5,6 +12,13 @@ use core::{
     mem::MaybeUninit,
     ptr::{drop_in_place, write, NonNull},
 };
+
+#[cfg(feature = "os")]
+use crate::event::OsAutoResetEvent;
+
+#[cfg(feature = "os")]
+#[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
+pub type OsParker = Parker<OsAutoResetEvent>;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum ParkResult {

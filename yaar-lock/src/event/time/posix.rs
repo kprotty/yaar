@@ -4,22 +4,28 @@ use core::mem::MaybeUninit;
 pub struct Timer;
 
 impl Timer {
+    /// According to std::time::Instant::now(), these platforms have been
+    /// observed to report monotonic clocks which go backwards in time.
     #[cfg(any(
-        target_os = "ios",
-        target_os = "macos",
-        target_os = "fuschia",
-        all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")),
+        all(target_os = "openbsd", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "s390x")
+        ),
     ))]
-    pub const IS_ACTUALLY_MONOTONIC: bool = true;
-
-    #[cfg(not(any(
-        target_os = "ios",
-        target_os = "macos",
-        target_os = "fuschia",
-        all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")),
-    )))]
     pub const IS_ACTUALLY_MONOTONIC: bool = false;
 
+    #[cfg(not(any(
+        all(target_os = "openbsd", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "s390x")
+        ),
+    )))]
+    pub const IS_ACTUALLY_MONOTONIC: bool = true;
+
+    /// Get the current timestamp as reported by the OS in nanoseconds for
+    /// non-darwin systems.
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     pub unsafe fn timestamp() -> OsDuration {
         use crate::utils::UnwrapUnchecked;
@@ -37,6 +43,8 @@ impl Timer {
         )
     }
 
+    /// Get the current timestamp as reported by the OS in nanoseconds for
+    /// darwin-based systems.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub unsafe fn timestamp() -> OsDuration {
         #[derive(Copy, Clone)]

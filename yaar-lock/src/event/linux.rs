@@ -2,20 +2,11 @@ use super::OsInstant;
 use core::{
     fmt,
     ptr::null,
-    sync::atomic::{Ordering, AtomicUsize},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use yaar_sys::{
-    c_int,
-    syscall,
-    SYS_futex,
-    FUTEX_WAIT,
-    FUTEX_WAKE,
-    FUTEX_PRIVATE_FLAG,
-    EINTR,
-    EAGAIN,
-    ETIMEDOUT,
-    timespec,
-    time_t,
+    c_int, syscall, time_t, timespec, SYS_futex, EAGAIN, EINTR, ETIMEDOUT, FUTEX_PRIVATE_FLAG,
+    FUTEX_WAIT, FUTEX_WAKE,
 };
 
 const EMPTY: usize = 0;
@@ -63,7 +54,7 @@ impl Signal {
         }
     }
 
-    pub fn try_wait(&self, timeout: Option<OsInstant>) -> bool {
+    pub fn try_wait(&self, timeout: Option<&OsInstant>) -> bool {
         let mut state = self.state.load(Ordering::Acquire);
         if state == EMPTY {
             state = self
@@ -83,10 +74,12 @@ impl Signal {
 }
 
 unsafe fn errno() -> c_int {
-    #[cfg(target_os = "linux")] {
+    #[cfg(target_os = "linux")]
+    {
         *yaar_sys::__errno_location()
     }
-    #[cfg(target_os = "android")] {
+    #[cfg(target_os = "android")]
+    {
         *yaar_sys::__errno()
     }
 }
@@ -105,7 +98,7 @@ unsafe fn futex_wait(
     ptr: &AtomicUsize,
     expect: usize,
     reset: usize,
-    timeout: Option<OsInstant>,
+    timeout: Option<&OsInstant>,
 ) -> bool {
     // x32 Linux uses a non-standard type for tv_nsec in timespec.
     // See https://sourceware.org/bugzilla/show_bug.cgi?id=16437
@@ -119,12 +112,13 @@ unsafe fn futex_wait(
     while ptr.load(Ordering::Acquire) == expect {
         let timeout = if let Some(timeout) = timeout {
             let now = OsInstant::now();
-            if timeout <= now {
-                let timed_out = ptr.compare_and_swap(expect, reset, Ordering::Acquire) == expect;
+            if *timeout <= now {
+                let timed_out = ptr.load(Ordering::Acquire) == expect
+                    && ptr.compare_and_swap(expect, reset, Ordering::Acquire) == expect;
                 return !timed_out;
             }
 
-            let diff = timeout - now;
+            let diff = *timeout - now;
             if diff.as_secs() as time_t as u64 != diff.as_secs() {
                 None
             } else {
@@ -153,9 +147,9 @@ unsafe fn futex_wait(
         debug_assert!(status == 0 || status == -1);
         if status == -1 {
             debug_assert!(
-                errno() == EINTR ||
-                errno() == EAGAIN ||
-                (timeout.is_some() && errno() == ETIMEDOUT)
+                errno() == EINTR
+                    || errno() == EAGAIN
+                    || (timeout.is_some() && errno() == ETIMEDOUT)
             );
         }
     }

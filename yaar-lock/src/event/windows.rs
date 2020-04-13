@@ -1,3 +1,10 @@
+// Copyright 2020 kprotty
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 
@@ -62,7 +69,7 @@ impl Signal {
         }
     }
 
-    pub fn try_wait(&self, timeout: Option<OsInstant>) -> bool {
+    pub fn try_wait(&self, timeout: Option<&OsInstant>) -> bool {
         let mut state = self.state.load(Ordering::Acquire);
         if state == EMPTY {
             state = self
@@ -132,7 +139,7 @@ impl Futex {
         ptr: &AtomicUsize,
         expect: usize,
         reset: usize,
-        timeout: Option<OsInstant>,
+        timeout: Option<&OsInstant>,
     ) -> bool {
         match Self::get() {
             Self::KeyedEvent(handle) => {

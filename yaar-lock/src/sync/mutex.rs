@@ -1,14 +1,14 @@
-use super::parker::{ParkResult, Parker};
-use crate::event::{AutoResetEvent, AutoResetEventTimed, YieldContext};
+use super::GenericRawMutex;
+/// Documentation copied and modified from lock_api.
+use crate::event::{AutoResetEvent, AutoResetEventTimed};
 use core::{
     cell::UnsafeCell,
     fmt,
     mem::forget,
     ops::{Deref, DerefMut},
     ptr::NonNull,
-    sync::atomic::{AtomicU8, Ordering},
 };
-use lock_api::{GuardSend, RawMutex, RawMutexFair, RawMutexTimed};
+use lock_api::{RawMutex, RawMutexFair, RawMutexTimed};
 
 #[cfg(feature = "os")]
 pub use if_os::*;
@@ -18,229 +18,27 @@ mod if_os {
     use super::*;
     use crate::event::OsAutoResetEvent;
 
-    pub type Mutex<T> = GenericMutex<OsAutoResetEvent, T>;
+    /// A [`GenericMutex`] backed by [`OsAutoResetEvent`].
+    #[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
+    pub type OsMutex<T> = GenericMutex<OsAutoResetEvent, T>;
 
-    pub type MutexGuard<'a, T> = GenericMutexGuard<'a, OsAutoResetEvent, T>;
+    /// A [`GenericMutexMutex`] for [`Mutex`].
+    #[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
+    pub type OsMutexGuard<'a, T> = GenericMutexGuard<'a, OsAutoResetEvent, T>;
 
-    pub type MappedMutexGuard<'a, T> = GenericMappedMutexGuard<'a, OsAutoResetEvent, T>;
+    /// A [`GenericMappedMutexGuard`] for [`Mutex`].
+    #[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
+    pub type OsMappedMutexGuard<'a, T> = GenericMappedMutexGuard<'a, OsAutoResetEvent, T>;
 }
 
-const UNLOCKED: u8 = 0b00;
-const LOCKED: u8 = 0b01;
-const PARKED: u8 = 0b10;
-
-const DEFAULT_TOKEN: usize = 0;
-const RETRY_TOKEN: usize = 1;
-const HANDOFF_TOKEN: usize = 2;
-
-pub struct GenericRawMutex<E> {
-    state: AtomicU8,
-    parker: Parker<E>,
-}
-
-impl<E> GenericRawMutex<E> {
-    pub const fn new() -> Self {
-        Self {
-            state: AtomicU8::new(UNLOCKED),
-            parker: Parker::new(),
-        }
-    }
-}
-
-impl<E: AutoResetEvent> GenericRawMutex<E> {
-    #[inline]
-    fn acquire(&self, try_park: impl FnMut(&E) -> bool) -> bool {
-        match self.state.compare_exchange_weak(
-            UNLOCKED,
-            LOCKED,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => true,
-            Err(_) => self.acquire_slow(try_park),
-        }
-    }
-
-    #[cold]
-    fn acquire_slow(&self, mut try_park: impl FnMut(&E) -> bool) -> bool {
-        let mut spin: usize = 0;
-        let mut state = self.state.load(Ordering::Relaxed);
-
-        loop {
-            if state & LOCKED == 0 {
-                match self.state.compare_exchange_weak(
-                    state,
-                    state | LOCKED,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return true,
-                    Err(e) => state = e,
-                }
-                continue;
-            }
-
-            if E::yield_now(YieldContext {
-                contended: state & PARKED != 0,
-                iteration: spin,
-                _sealed: (),
-            }) {
-                spin = spin.wrapping_add(1);
-                state = self.state.load(Ordering::Relaxed);
-                continue;
-            }
-
-            if state & PARKED == 0 {
-                if let Err(e) = self.state.compare_exchange_weak(
-                    state,
-                    state | PARKED,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    state = e;
-                    continue;
-                }
-            }
-
-            match unsafe {
-                self.parker.park(
-                    DEFAULT_TOKEN,
-                    |_| self.state.load(Ordering::Relaxed) == LOCKED | PARKED,
-                    |event| try_park(event),
-                    |was_last_thread| {
-                        if was_last_thread {
-                            self.state.fetch_and(!PARKED, Ordering::Relaxed);
-                        }
-                    },
-                )
-            } {
-                ParkResult::Cancelled => return false,
-                ParkResult::Unparked(HANDOFF_TOKEN) => return true,
-                ParkResult::Unparked(RETRY_TOKEN) => {}
-                ParkResult::Invalid => {}
-                _ => unreachable!(),
-            }
-
-            spin = 0;
-            state = self.state.load(Ordering::Relaxed);
-        }
-    }
-
-    #[inline]
-    fn release(&self, be_fair: bool) {
-        if let Err(_) =
-            self.state
-                .compare_exchange(LOCKED, UNLOCKED, Ordering::Release, Ordering::Relaxed)
-        {
-            self.release_slow(be_fair);
-        }
-    }
-
-    #[cold]
-    fn release_slow(&self, be_fair: bool) {
-        unsafe {
-            self.parker.unpark_one(
-                |_, token| {
-                    assert_eq!(token, DEFAULT_TOKEN);
-                    if be_fair {
-                        HANDOFF_TOKEN
-                    } else {
-                        RETRY_TOKEN
-                    }
-                },
-                |result| {
-                    if result.unparked != 0 && be_fair {
-                        if !result.has_more {
-                            self.state.store(LOCKED, Ordering::Relaxed);
-                        }
-                        return;
-                    }
-                    if result.has_more {
-                        self.state.store(PARKED, Ordering::Release);
-                    } else {
-                        self.state.store(UNLOCKED, Ordering::Release);
-                    }
-                },
-            )
-        }
-    }
-
-    #[cold]
-    fn bump_slow(&self) {
-        self.release_slow(true);
-        self.lock();
-    }
-}
-
-unsafe impl<E: AutoResetEvent> RawMutex for GenericRawMutex<E> {
-    const INIT: Self = Self::new();
-
-    type GuardMarker = GuardSend;
-
-    #[inline]
-    fn try_lock(&self) -> bool {
-        let mut state = self.state.load(Ordering::Relaxed);
-        while state & LOCKED == 0 {
-            match self.state.compare_exchange_weak(
-                state,
-                state | LOCKED,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(e) => state = e,
-            }
-        }
-        false
-    }
-
-    #[inline]
-    fn lock(&self) {
-        let acquired = self.acquire(|event| {
-            event.wait();
-            true
-        });
-        debug_assert!(acquired);
-    }
-
-    #[inline]
-    fn unlock(&self) {
-        self.release(false);
-    }
-}
-
-unsafe impl<E: AutoResetEvent> RawMutexFair for GenericRawMutex<E> {
-    #[inline]
-    fn unlock_fair(&self) {
-        self.release(true)
-    }
-
-    #[inline]
-    fn bump(&self) {
-        if self.state.load(Ordering::Relaxed) & PARKED != 0 {
-            self.bump_slow();
-        }
-    }
-}
-
-unsafe impl<E: AutoResetEventTimed> RawMutexTimed for GenericRawMutex<E>
-where
-    E::Instant: Copy,
-{
-    type Duration = E::Duration;
-    type Instant = E::Instant;
-
-    #[inline]
-    fn try_lock_for(&self, mut timeout: Self::Duration) -> bool {
-        self.acquire(|event| event.try_wait_for(&mut timeout))
-    }
-
-    #[inline]
-    fn try_lock_until(&self, timeout: Self::Instant) -> bool {
-        self.acquire(|event| event.try_wait_until(timeout))
-    }
-}
-
+/// A mutual exclusion primitive useful for protecting shared data
+///
+/// This mutex will block threads waiting for the lock to become available. The
+/// mutex can also be statically initialized or created via a `new`
+/// constructor. Each mutex has a type parameter which represents the data that
+/// it is protecting. The data can only be accessed through the RAII guards
+/// returned from `lock` and `try_lock`, which guarantees that the data is only
+/// ever accessed when the mutex is locked.
 pub struct GenericMutex<E, T> {
     raw_mutex: GenericRawMutex<E>,
     value: UnsafeCell<T>,
@@ -262,6 +60,7 @@ impl<E, T> From<T> for GenericMutex<E, T> {
 }
 
 impl<E, T> GenericMutex<E, T> {
+    /// Creates a new mutex in an unlocked state ready for use.
     pub const fn new(value: T) -> Self {
         Self {
             raw_mutex: GenericRawMutex::new(),
@@ -269,16 +68,28 @@ impl<E, T> GenericMutex<E, T> {
         }
     }
 
+    /// Consumes this mutex, returning the underlying data.
     pub fn into_inner(self) -> T {
         self.value.into_inner()
     }
 
+    /// Returns a mutable reference to the underlying data.
+    ///
+    /// Since this call borrows the `Mutex` mutably, no actual locking needs to
+    /// take place---the mutable borrow statically guarantees no locks exist.
     pub fn get_mut(&mut self) -> &mut T {
         unsafe { &mut *self.value.get() }
     }
 }
 
 impl<E: AutoResetEvent, T> GenericMutex<E, T> {
+    /// Attempts to acquire this lock.
+    ///
+    /// If the lock could not be acquired at this time, then `None` is returned.
+    /// Otherwise, an RAII guard is returned. The lock will be unlocked when the
+    /// guard is dropped.
+    ///
+    /// This function does not block.
     #[inline]
     pub fn try_lock(&self) -> Option<GenericMutexGuard<'_, E, T>> {
         if self.raw_mutex.try_lock() {
@@ -288,27 +99,60 @@ impl<E: AutoResetEvent, T> GenericMutex<E, T> {
         }
     }
 
+    // Acquires a mutex, blocking the current thread until it is able to do so.
+    /// This function will block the local thread until it is available to
+    /// acquire the mutex. Upon returning, the thread is the only thread
+    /// with the mutex held. An RAII guard is returned to allow scoped
+    /// unlock of the lock. When the guard goes out of scope, the mutex will
+    /// be unlocked.
+    ///
+    /// Attempts to lock a mutex in the thread which already holds the lock will
+    /// result in a deadlock.
     #[inline]
     pub fn lock(&self) -> GenericMutexGuard<'_, E, T> {
         self.raw_mutex.lock();
         GenericMutexGuard { mutex: self }
     }
 
+    /// Forcibly unlocks the mutex.
+    ///
+    /// This is useful when combined with `mem::forget` to hold a lock without
+    /// the need to maintain a `GenericMutexGuard` object alive, for example
+    /// when dealing with FFI.
+    ///
+    /// # Safety
+    ///
+    /// This method must only be called if the current thread logically owns a
+    /// `GenericMutexGuard` but that guard has be discarded using `mem::forget`.
+    /// Behavior is undefined if a mutex is unlocked when not locked.   
     #[inline]
     pub unsafe fn force_unlock(&self) {
         self.raw_mutex.unlock();
     }
 
+    /// Forcibly unlocks the mutex using a fair unlock procotol.
+    ///
+    /// This is useful when combined with `mem::forget` to hold a lock without
+    /// the need to maintain a `GenericMutexGuard` object alive, for example
+    /// when dealing with FFI.
+    ///
+    /// # Safety
+    ///
+    /// This method must only be called if the current thread logically owns a
+    /// `GenericMutexGuard` but that guard has be discarded using `mem::forget`.
+    /// Behavior is undefined if a mutex is unlocked when not locked.
     #[inline]
     pub unsafe fn force_unlock_fair(&self) {
         self.raw_mutex.unlock_fair();
     }
 }
 
-impl<E: AutoResetEventTimed, T> GenericMutex<E, T>
-where
-    E::Instant: Copy,
-{
+impl<E: AutoResetEventTimed, T> GenericMutex<E, T> {
+    /// Attempts to acquire this lock until a timeout is reached.
+    ///
+    /// If the lock could not be acquired before the timeout expired, then
+    /// `None` is returned. Otherwise, an RAII guard is returned. The lock will
+    /// be unlocked when the guard is dropped.
     #[inline]
     pub fn try_lock_for(&self, timeout: E::Duration) -> Option<GenericMutexGuard<'_, E, T>> {
         if self.raw_mutex.try_lock_for(timeout) {
@@ -318,6 +162,11 @@ where
         }
     }
 
+    /// Attempts to acquire this lock until a timeout is reached.
+    ///
+    /// If the lock could not be acquired before the timeout expired, then
+    /// `None` is returned. Otherwise, an RAII guard is returned. The lock will
+    /// be unlocked when the guard is dropped.
     #[inline]
     pub fn try_lock_until(&self, timeout: E::Instant) -> Option<GenericMutexGuard<'_, E, T>> {
         if self.raw_mutex.try_lock_until(timeout) {
@@ -337,6 +186,11 @@ impl<E: AutoResetEvent, T: fmt::Debug> fmt::Debug for GenericMutex<E, T> {
     }
 }
 
+/// An RAII implementation of a "scoped lock" of a mutex. When this structure is
+/// dropped (falls out of scope), the lock will be unlocked.
+///
+/// The data protected by the mutex can be accessed through this guard via its
+/// `Deref` and `DerefMut` implementations.
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct GenericMutexGuard<'a, E: AutoResetEvent, T> {
     mutex: &'a GenericMutex<E, T>,
@@ -366,12 +220,27 @@ impl<'a, E: AutoResetEvent, T> Drop for GenericMutexGuard<'a, E, T> {
 }
 
 impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
+    /// Unlocks the mutex using a fair unlock protocol.
+    ///
+    /// By default, mutexes are unfair and allow the current thread to re-lock
+    /// the mutex before another has the chance to acquire the lock, even if
+    /// that thread has been blocked on the mutex for a long time. This is the
+    /// default because it allows much higher throughput as it avoids forcing a
+    /// context switch on every mutex unlock. This can result in one thread
+    /// acquiring a mutex many more times than other threads.
+    ///
+    /// However in some cases it can be beneficial to ensure fairness by forcing
+    /// the lock to pass on to a waiting thread if there is one. This is done by
+    /// using this method instead of dropping the `GenericMutexGuard` normally.
     #[inline]
     pub fn unlock_fair(this: Self) {
         this.mutex.raw_mutex.unlock_fair();
         forget(this)
     }
 
+    // Temporarily unlocks the mutex to execute the given function.
+    /// This is safe because `&mut` guarantees that there exist no other
+    /// references to the data protected by the mutex.
     #[inline]
     pub fn unlocked<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
         this.mutex.raw_mutex.unlock();
@@ -380,6 +249,12 @@ impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
         value
     }
 
+    /// Temporarily unlocks the mutex to execute the given function.
+    ///
+    /// The mutex is unlocked using a fair unlock protocol.
+    ///
+    /// This is safe because `&mut` guarantees that there exist no other
+    /// references to the data protected by the mutex.
     #[inline]
     pub fn unlocked_fair<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
         this.mutex.raw_mutex.unlock_fair();
@@ -387,9 +262,16 @@ impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
         this.mutex.raw_mutex.lock();
         value
     }
-}
 
-impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
+    /// Makes a new `GenericMappedMutexGuard` for a component of the locked
+    /// data.
+    ///
+    /// This operation cannot fail as the `GenericMutexGuard` passed
+    /// in already locked the mutex.
+    ///
+    /// This is an associated function that needs to be
+    /// used as `GenericMutexGuard::map(...)`. A method would interfere with
+    /// methods of the same name on the contents of the locked data.
     #[inline]
     pub fn map<U>(
         this: Self,
@@ -402,6 +284,16 @@ impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
         GenericMappedMutexGuard { raw_mutex, value }
     }
 
+    /// Attempts to make a new `GenericMappedMutexGuard` for a component of the
+    /// locked data. The original guard is returned if the closure returns
+    /// `None`.
+    ///
+    /// This operation cannot fail as the `GenericMutexGuard` passed
+    /// in already locked the mutex.
+    ///
+    /// This is an associated function that needs to be
+    /// used as `GenericMutexGuard::try_map(...)`. A method would interfere with
+    /// methods of the same name on the contents of the locked data.
     #[inline]
     pub fn try_map<U>(
         this: Self,
@@ -418,6 +310,13 @@ impl<'a, E: AutoResetEvent, T> GenericMutexGuard<'a, E, T> {
     }
 }
 
+/// An RAII mutex guard returned by `GenericMutexGuard::map`, which can point to
+/// a subfield of the protected data.
+///
+/// The main difference between `GenericMappedMutexGuard` and
+/// `GenericMutexGuard` is that the former doesn't support temporarily unlocking
+/// and re-locking, since that could introduce soundness issues if the locked
+/// object is modified by another thread.
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct GenericMappedMutexGuard<'a, E: AutoResetEvent, T> {
     value: NonNull<T>,
@@ -448,30 +347,33 @@ impl<'a, E: AutoResetEvent, T> Drop for GenericMappedMutexGuard<'a, E, T> {
 }
 
 impl<'a, E: AutoResetEvent, T> GenericMappedMutexGuard<'a, E, T> {
+    /// Unlocks the mutex using a fair unlock protocol.
+    ///
+    /// By default, mutexes are unfair and allow the current thread to re-lock
+    /// the mutex before another has the chance to acquire the lock, even if
+    /// that thread has been blocked on the mutex for a long time. This is the
+    /// default because it allows much higher throughput as it avoids forcing a
+    /// context switch on every mutex unlock. This can result in one thread
+    /// acquiring a mutex many more times than other threads.
+    ///
+    /// However in some cases it can be beneficial to ensure fairness by forcing
+    /// the lock to pass on to a waiting thread if there is one. This is done by
+    /// using this method instead of dropping the `GenericMutexGuard` normally.
     #[inline]
     pub fn unlock_fair(this: Self) {
         this.raw_mutex.unlock_fair();
         forget(this)
     }
 
-    #[inline]
-    pub fn unlocked<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
-        this.raw_mutex.unlock();
-        let value = f();
-        this.raw_mutex.lock();
-        value
-    }
-
-    #[inline]
-    pub fn unlocked_fair<U>(this: &mut Self, f: impl FnOnce() -> U) -> U {
-        this.raw_mutex.unlock_fair();
-        let value = f();
-        this.raw_mutex.lock();
-        value
-    }
-}
-
-impl<'a, E: AutoResetEvent, T> GenericMappedMutexGuard<'a, E, T> {
+    /// Makes a new `GenericMappedMutexGuard` for a component of the locked
+    /// data.
+    ///
+    /// This operation cannot fail as the `GenericMappedMutexGuard` passed
+    /// in already locked the mutex.
+    ///
+    /// This is an associated function that needs to be
+    /// used as `GenericMappedMutexGuard::map(...)`. A method would interfere
+    /// with methods of the same name on the contents of the locked data.
     #[inline]
     pub fn map<U>(
         this: Self,
@@ -484,6 +386,17 @@ impl<'a, E: AutoResetEvent, T> GenericMappedMutexGuard<'a, E, T> {
         GenericMappedMutexGuard { raw_mutex, value }
     }
 
+    /// Attempts to make a new `GenericMappedMutexGuard` for a component of the
+    /// locked data. The original guard is returned if the closure returns
+    /// `None`.
+    ///
+    /// This operation cannot fail as the `GenericMappedMutexGuard` passed
+    /// in already locked the mutex.
+    ///
+    /// This is an associated function that needs to be
+    /// used as `GenericMappedMutexGuard::try_map(...)`. A method would
+    /// interfere with methods of the same name on the contents of the
+    /// locked data.
     #[inline]
     pub fn try_map<U>(
         this: Self,

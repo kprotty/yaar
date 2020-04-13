@@ -157,7 +157,7 @@ fn bench_all(c: &mut Criterion, ctx: BenchContext) {
     bench_mutex::<std::sync::Mutex<BenchValue>>(c, ctx);
     bench_mutex::<parking_lot::Mutex<BenchValue>>(c, ctx);
     bench_mutex::<yaar_sync_lock::Mutex<BenchValue>>(c, ctx);
-    bench_mutex::<yaar_lock::sync::Mutex<BenchValue>>(c, ctx);
+    bench_mutex::<yaar_lock::sync::OsMutex<BenchValue>>(c, ctx);
 
     bench_mutex::<std_lock::Mutex<BenchValue>>(c, ctx);
     bench_mutex::<spin_lock::Mutex<BenchValue>>(c, ctx);
