@@ -98,14 +98,15 @@ where
             let mut avg_latency = 0u128;
             for i in 0..(iters as u128) {
                 let start = Instant::now();
-                mutex.locked(|shared_value| {
+                let elapsed = mutex.locked(|shared_value| {
+                    let elapsed = start.elapsed().as_nanos();
                     for _ in 0..work {
                         **shared_value += local_value;
                         **shared_value *= 1.01;
                         local_value = **shared_value;
                     }
+                    elapsed
                 });
-                let elapsed = start.elapsed().as_nanos();
                 if elapsed != 0 {
                     avg_latency = ((avg_latency * i) + elapsed) / (i + 1);
                 }
