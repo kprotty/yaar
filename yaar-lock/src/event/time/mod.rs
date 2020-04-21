@@ -5,12 +5,11 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use crate::{core::Lock, event::OsAutoResetEvent};
 use core::{
+    convert::TryInto,
     ops::{Add, AddAssign, Sub, SubAssign},
     time::Duration,
 };
-use lock_api::RawMutex;
 
 /// Sources and code documentation copied and modified from
 /// [`std::time::Instant`].
@@ -43,7 +42,7 @@ pub type OsDuration = Duration;
 #[cfg_attr(feature = "nightly", doc(cfg(feature = "os")))]
 #[derive(Copy, Clone, Eq, Ord, PartialEq, PartialOrd, Hash, Debug)]
 pub struct OsInstant {
-    timestamp: Duration,
+    timestamp: u64,
 }
 
 impl AddAssign<Duration> for OsInstant {
@@ -86,7 +85,7 @@ impl Sub<Self> for OsInstant {
 
 impl OsInstant {
     /// Get the current timestamp from the OS with a nondecreasing guarantee.
-    fn timestamp() -> OsDuration {
+    fn timestamp() -> u64 {
         unsafe {
             // Return the timestamp immediately if the OS is assumed
             // to guarantee a monotonic increasing timestamp.
@@ -95,19 +94,50 @@ impl OsInstant {
                 return now;
             }
 
-            static LOCK: Lock<OsAutoResetEvent> = Lock::new();
-            static mut CURRENT: OsDuration = OsDuration::from_secs(0);
-
             // If not, acquire the lock on the current timestamp and update the global
             // value. We do this to ensure that the timestamp reported by the OS
             // doesn't go backwards.
-            LOCK.lock();
-            if CURRENT >= now {
-                now = CURRENT;
-            } else {
-                CURRENT = now;
+            
+            // On 64-bit & higher platforms its more efficient to use a cas loop
+            #[cfg(target_pointer_width = "64")] {
+                use core::sync::atomic::{Ordering, AtomicU64};
+                static CURRENT: AtomicU64 = AtomicU64::new(0);
+
+                let mut current = CURRENT.load(Ordering::Relaxed);
+                loop {
+                    if current >= now {
+                        now = current;
+                        break;
+                    } else {
+                        match CURRENT.compare_exchange_weak(
+                            current,
+                            now,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(e) => current = e,
+                        }
+                    }
+                }
             }
-            LOCK.unlock();
+
+            // On platforms that dont support 64bit load & cas, use a Lock
+            #[cfg(not(target_pointer_width = "64"))] {
+                use lock_api::RawMutex;
+                use crate::{core::Lock, event::OsAutoResetEvent};
+                
+                static mut CURRENT: u64 = 0;
+                static LOCK: Lock<OsAutoResetEvent> = Lock::new();
+                
+                LOCK.lock();
+                if CURRENT >= now {
+                    now = CURRENT;
+                } else {
+                    CURRENT = now;
+                }
+                LOCK.unlock();
+            }
 
             now
         }
@@ -133,7 +163,9 @@ impl OsInstant {
     /// Returns the amount of time elapsed from another instant to this one,
     /// or None if that instant is later than this one.
     pub fn checked_duration_since(&self, earlier: Self) -> Option<Duration> {
-        self.timestamp.checked_sub(earlier.timestamp)
+        self.timestamp
+            .checked_sub(earlier.timestamp)
+            .map(Duration::from_nanos)
     }
 
     /// Returns the amount of time elapsed from another instant to this one,
@@ -158,8 +190,11 @@ impl OsInstant {
     /// represented as `Instant` (which means it's inside the bounds of the
     /// underlying data structure), `None` otherwise.
     pub fn checked_add(&self, duration: Duration) -> Option<Self> {
-        self.timestamp
-            .checked_add(duration)
+        duration
+            .as_nanos()
+            .try_into()
+            .ok()
+            .and_then(|dur: u64| self.timestamp.checked_add(dur))
             .map(|timestamp| Self { timestamp })
     }
 
@@ -167,8 +202,11 @@ impl OsInstant {
     /// represented as `Instant` (which means it's inside the bounds of the
     /// underlying data structure), `None` otherwise.
     pub fn checked_sub(&self, duration: Duration) -> Option<Self> {
-        self.timestamp
-            .checked_sub(duration)
+        duration
+            .as_nanos()
+            .try_into()
+            .ok()
+            .and_then(|dur: u64| self.timestamp.checked_sub(dur))
             .map(|timestamp| Self { timestamp })
     }
 }

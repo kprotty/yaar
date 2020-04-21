@@ -1,4 +1,3 @@
-use super::OsDuration;
 use crate::utils::UnwrapUnchecked;
 use core::{
     convert::TryInto,
@@ -18,7 +17,7 @@ impl Timer {
     pub const IS_ACTUALLY_MONOTONIC: bool = true;
 
     /// Get the current timestamp as reported by the OS.
-    pub unsafe fn timestamp() -> OsDuration {
+    pub unsafe fn timestamp() -> u64 {
         let tick_resolution = {
             const UNINIT: usize = 0;
             const CREATING: usize = 1;
@@ -62,7 +61,6 @@ impl Timer {
         debug_assert_eq!(status, TRUE);
 
         ticks /= tick_resolution;
-        let nanos: u64 = ticks.try_into().unwrap_unchecked();
-        OsDuration::from_nanos(nanos)
+        ticks.try_into().unwrap_unchecked()
     }
 }
