@@ -18,13 +18,13 @@ impl Timer {
 
     /// Get the current timestamp as reported by the OS.
     pub unsafe fn timestamp() -> u64 {
-        let tick_resolution = {
+        let frequency = {
             const UNINIT: usize = 0;
             const CREATING: usize = 1;
             const READY: usize = 2;
 
             static mut FREQUENCY: LARGE_INTEGER = 0;
-            const NANOS_PER_SEC: LARGE_INTEGER = 1_000_000_000;
+
             static STATE: AtomicUsize = AtomicUsize::new(UNINIT);
 
             /// Cold path to create the tick frequency manually.
@@ -36,7 +36,6 @@ impl Timer {
                 let mut frequency = 0;
                 let status = QueryPerformanceFrequency(&mut frequency);
                 debug_assert_eq!(status, TRUE);
-                frequency /= NANOS_PER_SEC;
 
                 if STATE.load(Ordering::Relaxed) == UNINIT {
                     if STATE.compare_and_swap(UNINIT, CREATING, Ordering::Relaxed) == UNINIT {
@@ -60,7 +59,9 @@ impl Timer {
         let status = QueryPerformanceCounter(&mut ticks);
         debug_assert_eq!(status, TRUE);
 
-        ticks /= tick_resolution;
-        ticks.try_into().unwrap_unchecked()
+        const NANOS_PER_SEC: LARGE_INTEGER = 1_000_000_000;
+        ((ticks * NANOS_PER_SEC) / frequency)
+            .try_into()
+            .unwrap_unchecked()
     }
 }

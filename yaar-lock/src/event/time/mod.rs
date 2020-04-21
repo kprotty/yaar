@@ -97,10 +97,11 @@ impl OsInstant {
             // If not, acquire the lock on the current timestamp and update the global
             // value. We do this to ensure that the timestamp reported by the OS
             // doesn't go backwards.
-            
+
             // On 64-bit & higher platforms its more efficient to use a cas loop
-            #[cfg(target_pointer_width = "64")] {
-                use core::sync::atomic::{Ordering, AtomicU64};
+            #[cfg(target_pointer_width = "64")]
+            {
+                use core::sync::atomic::{AtomicU64, Ordering};
                 static CURRENT: AtomicU64 = AtomicU64::new(0);
 
                 let mut current = CURRENT.load(Ordering::Relaxed);
@@ -123,13 +124,14 @@ impl OsInstant {
             }
 
             // On platforms that dont support 64bit load & cas, use a Lock
-            #[cfg(not(target_pointer_width = "64"))] {
-                use lock_api::RawMutex;
+            #[cfg(not(target_pointer_width = "64"))]
+            {
                 use crate::{core::Lock, event::OsAutoResetEvent};
-                
+                use lock_api::RawMutex;
+
                 static mut CURRENT: u64 = 0;
                 static LOCK: Lock<OsAutoResetEvent> = Lock::new();
-                
+
                 LOCK.lock();
                 if CURRENT >= now {
                     now = CURRENT;

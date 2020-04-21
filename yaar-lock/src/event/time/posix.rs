@@ -23,13 +23,12 @@ impl Timer {
     )))]
     pub const IS_ACTUALLY_MONOTONIC: bool = true;
 
-    /// Number of nanoseconds in a second
-    const NANOS_PER_SEC: u64 = 1_000_000_000;
-
     /// Get the current timestamp as reported by the OS in nanoseconds for
     /// non-darwin systems.
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     pub unsafe fn timestamp() -> u64 {
+        const NANOS_PER_SEC: u64 = 1_000_000_000;
+
         use crate::utils::UnwrapUnchecked;
         use core::convert::TryInto;
         use yaar_sys::{clock_gettime, CLOCK_MONOTONIC};
@@ -41,7 +40,7 @@ impl Timer {
         let now_ts = now_ts.assume_init();
         let secs: u64 = now_ts.tv_sec.try_into().unwrap_unchecked();
         let nsecs: u64 = now_ts.tv_nsec.try_into().unwrap_unchecked();
-        nsecs + (secs * NANOS_PER_SEC);
+        nsecs + (secs * NANOS_PER_SEC)
     }
 
     /// Get the current timestamp as reported by the OS in nanoseconds for
@@ -81,7 +80,6 @@ impl Timer {
             }
         };
 
-        
         let now = mach_absolute_time();
         (now * info.numer) / info.denom
     }
