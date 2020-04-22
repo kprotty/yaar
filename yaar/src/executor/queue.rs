@@ -1,12 +1,13 @@
-use super::task::{Task, Priority};
-use lock_api::{Mutex, RawMutex};
-use yaar_lock::utils::CachePadded;
+use super::task::{Priority, Task};
 use core::{
     cell::Cell,
-    ptr::{write, NonNull},
+    fmt,
     mem::MaybeUninit,
-    sync::atomic::{spin_loop_hint, Ordering, AtomicUsize},
+    ptr::{write, NonNull},
+    sync::atomic::{spin_loop_hint, AtomicUsize, Ordering},
 };
+use lock_api::{Mutex, RawMutex};
+use yaar_lock::utils::CachePadded;
 
 #[derive(Default, Debug)]
 pub struct ListQueue {
@@ -80,6 +81,20 @@ impl Default for LocalQueue {
     }
 }
 
+impl fmt::Debug for LocalQueue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalQueue")
+            .field("size", &self.len())
+            .finish()
+    }
+}
+
 impl LocalQueue {
     const SIZE: usize = 256;
+
+    pub fn len(&self) -> usize {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Relaxed);
+        tail.wrapping_sub(head)
+    }
 }

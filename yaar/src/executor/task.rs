@@ -1,18 +1,20 @@
 use core::{
-    ptr::NonNull,
     cell::UnsafeCell,
     marker::PhantomData,
     mem::{align_of, transmute},
+    ptr::NonNull,
 };
 
-/// Priorities are hints to the scheduler for controlling the order or latency in which tasks are executed on workers.
-/// An example use case would be soft back-pressure control for work/task generation.
+/// Priorities are hints to the scheduler for controlling the order or latency
+/// in which tasks are executed on workers. An example use case would be soft
+/// back-pressure control for work/task generation.
 pub enum Priority {
     /// Hint that the task should be scheduled last or after most other tasks.
     /// In relation to back-pressure, this represents tasks that create work.
     Low = 0,
     /// Hint that the task should be scheduled fairly like any other tasks.
-    /// In relation ot back-presure, this represents tasks that either create work or complete work.
+    /// In relation ot back-presure, this represents tasks that either create
+    /// work or complete work.
     Normal = 1,
     ///
     High = 2,
@@ -28,7 +30,7 @@ impl Into<usize> for Priority {
 
 impl From<usize> for Priority {
     fn from(value: usize) -> Self {
-        match value & 0b11 { 
+        match value & 0b11 {
             0 => Self::Low,
             1 => Self::Normal,
             2 => Self::High,
@@ -54,7 +56,7 @@ impl Into<usize> for Locality {
 
 impl From<usize> for Locality {
     fn from(value: usize) -> Self {
-        match value & 0b11 { 
+        match value & 0b11 {
             0 => Self::Worker,
             1 => Self::Node,
             2 => Self::Scheduler,
@@ -80,7 +82,7 @@ impl Task {
         let resume_fn = NonNull::new(unsafe { transmute(resume_fn) });
         Self {
             next: UnsafeCell::new(TaggedPtr::new(None, priority)),
-            resume: UnsafeCell::new(TaggedPtr::new(resume_fn, locality))
+            resume: UnsafeCell::new(TaggedPtr::new(resume_fn, locality)),
         }
     }
 
