@@ -210,6 +210,7 @@ impl ThreadSignal {
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     unsafe fn ts_now() -> timespec {
+        use crate::utils::UnwrapUnchecked;
         use yaar_sys::{gettimeofday, timeval};
 
         let mut now = MaybeUninit::uninit();

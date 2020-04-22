@@ -81,6 +81,6 @@ impl Timer {
         };
 
         let now = mach_absolute_time();
-        (now * info.numer) / info.denom
+        (now * info.numer as u64) / info.denom as u64
     }
 }
