@@ -7,9 +7,9 @@ use std::{
     mem::drop,
     sync::{Arc, Barrier},
     thread,
-    time::Duration,
+    time::{Instant, Duration},
 };
-use yaar_lock::event::OsInstant as Instant;
+// use yaar_lock::event::OsInstant as Instant;
 use yaar_lock::utils::CachePadded;
 
 mod sync_mutexes;
