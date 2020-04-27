@@ -1,8 +1,11 @@
 mod task;
 pub use task::*;
 
-mod queue;
-pub use queue::*;
+mod platform;
+pub use platform::*;
+
+mod worker;
+pub use worker::*;
 
 mod node;
 pub use node::*;

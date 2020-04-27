@@ -1,7 +1,5 @@
 
 
-pub trait Platform {
-    type WorkerData;
-    type NodeData;
-    
+pub trait Platform: Sync {
+
 }

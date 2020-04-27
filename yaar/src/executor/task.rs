@@ -44,8 +44,7 @@ pub enum Locality {
     Worker = 0,
     Node = 1,
     Scheduler = 2,
-    /// Reserved
-    Distributed = 3,
+    Reserved = 3,
 }
 
 impl Into<usize> for Locality {
