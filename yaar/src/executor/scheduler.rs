@@ -1,8 +1,8 @@
-use super::{Platform, Node, Task};
+use super::{Platform, Node, Runnable};
 use core::{
+    pin::Pin,
     ptr::NonNull,
     num::NonZeroUsize,
-    slice::from_raw_parts,
 };
 
 pub struct Scheduler<P: Platform> {
@@ -11,9 +11,11 @@ pub struct Scheduler<P: Platform> {
     nodes_len: NonZeroUsize,
 }
 
+unsafe impl<P: Platform> Sync for Scheduler<P> {}
+
 impl<P: Platform> Scheduler<P> {
-    pub unsafe fn run<P: Platform>(
-        task: NonNull<Task>,
+    pub unsafe fn run(
+        runnable: Pin<&Runnable>,
         platform: &P,
         nodes: &[NonNull<Node<P>>],
     ) {
@@ -23,7 +25,6 @@ impl<P: Platform> Scheduler<P> {
             nodes_len: NonZeroUsize::new_unchecked(nodes.len()),
         };
 
-        
+
     }
 }
-
