@@ -1,62 +1,45 @@
-mod event;
-pub use event::*;
-
-mod header;
-use header::*;
+mod waker;
+pub use waker::*;
 
 mod future;
 pub use future::*;
 
+mod join_handle;
+pub use join_handle::*;
+
+mod poll_context;
+pub use poll_context::*;
+
 use super::{Platform, Worker};
 use core::{
     pin::Pin,
-    sync::atomic::{Ordering, AtomicUsize},
+    sync::atomic::AtomicPtr,
 };
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Locality {
-    Worker,
-    Node = 0,
-    Scheduler,
-}
+pub(crate) type TaskResumeFn<P> = fn(&mut Task<P>, Pin<&Worker<P>>);
 
-impl Default for Locality {
-    fn default() -> Self {
-        Self::Node
-    }
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Priority {
-    Low,
-    Normal = 0,
-    High,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
-#[derive(Default)]
-#[repr(align(16))]
 pub struct Task<P: Platform> {
-    _pinned: PhantomPinned,
-    state: AtomicUsize,
-    resume: unsafe fn(&Self, Pin<&Worker<P>>),
+    state: AtomicPtr<Self>,
+    resume: TaskResumeFn<P>,
+}
+
+impl<P: Platform> From<TaskResumeFn<P>> for Task<P> {
+    fn from(resume: TaskResumeFn<P>) -> Self {
+        Self::new(resume)
+    }
 }
 
 impl<P: Platform> Task<P> {
-    pub fn new(resume: unsafe fn(&Self, Pin<&Worker<P>>)) -> Self {
+    #[inline]
+    pub fn new(resume: TaskResumeFn<P>) -> Self {
         Self {
-            _pinned: PhantomPinned,
+            state: AtomicPtr::default(),
             resume,
-            state: AtomicUsize::new()
         }
     }
 
     #[inline]
-    pub unsafe fn resume(&self, worker: Pin<&Worker<P>>) {
+    pub fn resume(&mut self, worker: Pin<&Worker<P>>) {
         (self.resume)(self, worker)
     }
+}

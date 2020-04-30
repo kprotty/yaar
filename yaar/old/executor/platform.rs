@@ -1,5 +1,5 @@
 
 
 pub trait Platform: Sync {
-    
+
 }
