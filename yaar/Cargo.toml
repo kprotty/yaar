@@ -16,7 +16,11 @@ optimized around configuration and no_std.
 [features]
 default = []
 nightly = []
-full = []
+full = ["std"]
+
+std = ["alloc", "os"]
+alloc = []
+os = ["yaar-sys"]
 
 [dependencies]
 lock_api = "0.3"
