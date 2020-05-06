@@ -1,8 +1,8 @@
-mod task;
-pub use task::{Task, TaskResumeFn};
+pub mod task;
 
-mod list;
-pub use list::{LinkedList, GlobalList, LocalList};
+pub mod future;
+
+pub mod list;
 
 mod worker;
 pub use worker::Worker;
