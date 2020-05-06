@@ -1,5 +1,0 @@
-
-
-pub trait Platform: Sync {
-
-}

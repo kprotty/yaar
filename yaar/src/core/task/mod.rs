@@ -1,6 +1,8 @@
+pub mod list;
+
 pub mod future;
 
-use super::{Platform, Worker};
+use super::Worker;
 use core::{
     pin::Pin,
     ptr::NonNull,
@@ -23,21 +25,21 @@ pub enum TaskPriority {
     Critical,
 }
 
-pub type TaskResumeFn<P> = unsafe fn(
-    Pin<&mut Task<P>>,
-    Pin<&Worker<P>>
-) -> Option<Pin<&mut Task<P>>>;
+pub type TaskResumeFn = unsafe fn(
+    Pin<&mut Task>,
+    Pin<&Worker>
+) -> Option<Pin<&mut Task>>;
 
 #[repr(align(4))]
-pub struct Task<P: Platform> {
+pub struct Task {
     _pinned: PhantomPinned,
     state: AtomicPtr<Self>,
-    pub(crate) resume: NonNull<TaskResumeFn<P>>,
+    pub(crate) resume: NonNull<TaskResumeFn>,
 }
 
-impl<P: Platform> Task<P> {
+impl Task {
     #[inline]
-    pub fn new(resume: NonNull<TaskResumeFn<P>>) -> Self {
+    pub fn new(resume: NonNull<TaskResumeFn>) -> Self {
         Self {
             _pinned: PhantomPinned,
             state: AtomicPtr::default(),
@@ -46,7 +48,7 @@ impl<P: Platform> Task<P> {
     }
 
     #[inline]
-    pub unsafe fn resume(self: Pin<&mut Self>, worker: Pin<&Worker<P>>) {
+    pub unsafe fn resume(self: Pin<&mut Self>, worker: Pin<&Worker>) {
         (*self.resume.as_ref())(self, worker)
     }
 

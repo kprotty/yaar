@@ -12,6 +12,3 @@ pub use node::Node;
 
 mod scheduler;
 pub use scheduler::Scheduler;
-
-mod platform;
-pub use platform::Platform;

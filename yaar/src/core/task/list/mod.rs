@@ -1,20 +1,23 @@
+mod buffer;
+pub use buffer::{TaskBuffer, TaskListBuffer};
+
+mod queue;
+pub use queue::{TaskListQueue};
+
 use core::{
     pin::Pin,
     ptr::{null_mut, NonNull},
 };
-use crate::executor::{
-    Platform,
-    task::{Task, TaskPriority},
-};
+use super::{Task, TaskPriority};
 
 #[derive(Default, Debug)]
-pub struct LinkedList<P: Platform> {
-    head: Option<NonNull<Task<P>>>,
-    tail: Option<NonNull<Task<P>>>,
+pub struct TaskList {
+    head: Option<NonNull<Task>>,
+    tail: Option<NonNull<Task>>,
     size: usize,
 }
 
-impl<'a, P: Platform> From<Pin<&'a mut Task<P>>> for LinkedList<P> {
+impl<'a> From<Pin<&'a mut Task>> for TaskList {
     #[inline]
     fn from(task: Pin<&'a mut Task<P>>) -> Self {
         let mut list = Self::new();
@@ -23,7 +26,7 @@ impl<'a, P: Platform> From<Pin<&'a mut Task<P>>> for LinkedList<P> {
     }
 }
 
-impl<P: Platform> LinkedList<P> {
+impl TaskList {
     #[inline]
     pub const fn new() -> Self {
         Self {
@@ -40,7 +43,7 @@ impl<P: Platform> LinkedList<P> {
 
     pub unsafe fn push(
         &mut self,
-        task: Pin<&mut Task<P>>,
+        task: Pin<&mut Task>,
     ) {
         self.size += 1;
         let task = NonNull::from(task.into_inner_unchecked());
@@ -73,7 +76,7 @@ impl<P: Platform> LinkedList<P> {
     }
 
     /// Pop a task from the front of the queue.
-    pub unsafe fn pop(&mut self) -> Option<NonNull<Task<P>>> {
+    pub unsafe fn pop(&mut self) -> Option<NonNull<Task>> {
         self.size -= 1;
         self.head.map(|task| {
             let (task_ptr, _) = Task::decode(task);

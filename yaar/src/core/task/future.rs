@@ -1,13 +1,13 @@
-use crate::executor::{
-    Platform, Worker,
-    task::{Task, TaskResumeFn},
+use super::{
+    Task,
+    TaskResumeFn,
+    super::Worker,
 };
 use core::{
     pin::Pin,
     future::Future,
     ptr::{self, NonNull},
     mem::MaybeUninit,
-    marker::PhantomData,
     task::{Waker, Context, Poll, RawWaker, RawWakerVTable},
     sync::atomic::{Ordering, AtomicUsize},
 };
@@ -34,20 +34,20 @@ enum FutureState<F: Future> {
 }
 
 #[repr(C)]
-pub struct TaskFuture<P: Platform, F: Future, W: TaskWaker> {
-    task: Task<P>,
+pub struct TaskFuture<F: Future, W: TaskWaker> {
+    task: Task,
     task_waker: W,
-    future_state: FutureState<F>,
+    future_state: FutureState,
 }
 
-impl<P: Platform, F: Future, W: TaskWaker> Drop for TaskFuture<P, F, W> {
+impl<F: Future, W: TaskWaker> Drop for TaskFuture<F, W> {
     fn drop(&mut self) {
-
+        unimplemented!(); // TODO
     }
 }
 
-impl<P: Platform, F: Future, W: TaskWaker> TaskFuture<P, F, W> {
-    const VTABLE: TaskVTable<P> = TaskVTable {
+impl<F: Future, W: TaskWaker> TaskFuture<F, W> {
+    const VTABLE: TaskVTable = TaskVTable {
         clone: Self::waker_clone,
         wake: Self::waker_wake,
         wake_by_ref: Self::waker_wake_by_ref,
@@ -63,70 +63,70 @@ impl<P: Platform, F: Future, W: TaskWaker> TaskFuture<P, F, W> {
         }
     }
 
-    unsafe fn waker_clone(task: Pin<&Task<P>>) {
+    unsafe fn waker_clone(task: Pin<&Task>) {
 
     }
 
-    unsafe fn waker_wake(task: Pin<&Task<P>>) {
+    unsafe fn waker_wake(task: Pin<&Task>) {
         
     }
 
-    unsafe fn waker_wake_by_ref(task: Pin<&Task<P>>) {
+    unsafe fn waker_wake_by_ref(task: Pin<&Task>) {
         
     }
 
-    unsafe fn waker_drop(task: Pin<&Task<P>>) {
+    unsafe fn waker_drop(task: Pin<&Task>) {
         
     }
 
-    unsafe fn task_resume(task: Pin<&Task<P>>) {
+    unsafe fn task_resume(task: Pin<&Task>) {
         
     }
 }
 
 #[repr(C)]
-struct TaskVTable<P: Platform> {
+struct TaskVTable {
     resume: TaskResumeFn,
-    clone: unsafe fn(task: NonNull<Task<P>>),
-    wake: unsafe fn(task: NonNull<Task<P>>),
-    wake_by_ref: unsafe fn(task: NonNull<Task<P>>),
-    drop: unsafe fn(task: NonNull<Task<P>>),
+    clone: unsafe fn(task: NonNull<Task>),
+    wake: unsafe fn(task: NonNull<Task>),
+    wake_by_ref: unsafe fn(task: NonNull<Task>),
+    drop: unsafe fn(task: NonNull<Task>),
 }
 
 #[repr(C)]
-pub(crate) struct TaskPollContext<P: Platform> {
+pub(crate) struct TaskPollContext {
     waker: Waker,
-    worker: NonNull<Worker<P>>,
-    next_task: Option<NonNull<Task<P>>>,
+    worker: NonNull<Worker>,
+    next_task: Option<NonNull<Task>>,
 }
 
-impl<P: Platform> TaskPollContext<P> {
+impl TaskPollContext {
     const VTABLE: RawWakerVTable = RawWakerVTable::new(
         |ptr| unsafe {
-            let vtable = *(ptr as *const Task<P>).resume.cast::<TaskVTable<P>>();
-            (vtable.as_ref().clone)(NonNull::new_unchecked(ptr as *mut Task<P>));
+            let vtable = (*(ptr as *const Task)).resume.cast::<TaskVTable>();
+            (vtable.as_ref().clone)(NonNull::new_unchecked(ptr as *mut Task));
             RawWaker::new(ptr, &Self::VTABLE)
         },
         |ptr| unsafe {
-            let vtable = *(ptr as *const Task<P>).resume.cast::<TaskVTable<P>>();
-            (vtable.as_ref().wake)(NonNull::new_unchecked(ptr as *mut Task<P>));
+            let vtable = (*(ptr as *const Task)).resume.cast::<TaskVTable>();
+            (vtable.as_ref().wake)(NonNull::new_unchecked(ptr as *mut Task));
         },
         |ptr| unsafe {
-            let vtable = *(ptr as *const Task<P>).resume.cast::<TaskVTable<P>>();
-            (vtable.as_ref().wake_by_ref)(NonNull::new_unchecked(ptr as *mut Task<P>));
+            let vtable = (*(ptr as *const Task)).resume.cast::<TaskVTable>();
+            (vtable.as_ref().wake_by_ref)(NonNull::new_unchecked(ptr as *mut Task));
         },
         |ptr| unsafe {
-            let vtable = *(ptr as *const Task<P>).resume.cast::<TaskVTable<P>>();
-            (vtable.as_ref().drop)(NonNull::new_unchecked(ptr as *mut Task<P>));
+            let vtable = (*(ptr as *const Task)).resume.cast::<TaskVTable>();
+            (vtable.as_ref().drop)(NonNull::new_unchecked(ptr as *mut Task));
         },
     );
 
     unsafe fn poll<F: Future>(
         &mut self,
         future: &mut F,
-        task: NonNull<Task<P>>,
-        worker: NonNull<Worker<P>>,
-    ) -> Result<(Poll<F::Output>, Option<Pin<&mut Task<P>>>), TaskFutureError> {
+        task: NonNull<Task>,
+        worker: NonNull<Worker>,
+    ) -> Result<(Poll<F::Output>, Option<Pin<&mut Task>>), TaskFutureError> {
         let mut poll_context = Self {
             waker: Waker::from_raw(RawWaker::new(
                 task.as_ptr() as *const (),
@@ -159,15 +159,15 @@ impl<P: Platform> TaskPollContext<P> {
         })
     }
 
-    pub unsafe fn waker_to_task(waker: &Waker) -> Option<NonNull<Task<P>>> {
+    pub unsafe fn waker_to_task(waker: &Waker) -> Option<NonNull<Task>> {
         assert_eq!(mem::size_of::<Waker>(), mem::size_of::<[usize; 2]>());
         let vtable_ptr = &Self::VTABLE as *const _ as usize;
         let raw_waker: [usize; 2] = ptr::read(waker as *const _ as *const _);
 
         if raw_waker[0] == vtable_ptr {
-            Some(NonNull::new_unchecked(raw_waker[1] as *mut Task<P>))
+            Some(NonNull::new_unchecked(raw_waker[1] as *mut Task))
         } else if raw_waker[1] == vtable_ptr {
-            Some(NonNull::new_unchecked(raw_waker[0] as *mut Task<P>))
+            Some(NonNull::new_unchecked(raw_waker[0] as *mut Task))
         } else {
             None
         }
@@ -176,19 +176,11 @@ impl<P: Platform> TaskPollContext<P> {
     pub unsafe fn try_with<T>(
         callback: impl FnOnce(&mut Self) -> T,
     ) -> impl Fuutre<Output = Option<T>> { 
-        struct TryWith<P, F, T>
-        where
-            P: Platform,
-            F: FnOnce(&mut TaskPollContext<P>) -> T
-        {
+        struct TryWith<F, T> where F: FnOnce(&mut TaskPollContext<P>) -> T {
             callback: Option<F>,
         }
 
-        impl<P, F, T> Future for TryWith<P, F, T>
-        where
-            P: Platform,
-            F: FnOnce(&mut TaskPollContext<P>) -> T,
-        {
+        impl<F, T> Future for TryWith<F, T> where F: FnOnce(&mut TaskPollContext<P>) -> T{
             type Output = Option<T>;
 
             fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -199,7 +191,7 @@ impl<P: Platform> TaskPollContext<P> {
 
                 Poll::Ready(unsafe {
                     Self::waker_to_task(ctx.waker()).map(|_| {
-                        let poll_context_ptr = ctx.waker() as *const _ as *mut TaskPollContext<P>;
+                        let poll_context_ptr = ctx.waker() as *const _ as *mut TaskPollContext;
                         callback(NonNull::new_unchecked(poll_context_ptr).as_mut())
                     })
                 })
@@ -212,24 +204,21 @@ impl<P: Platform> TaskPollContext<P> {
     }
 }
 
-pub fn try_with_worker<P, F, T>(
+pub fn try_with_worker<F, T>(
     callback: F,
 ) -> impl Future<Output = Option<T>> 
 where
-    P: Platform,
-    F: FnOnce(&Worker<P>) -> T,
+    F: FnOnce(&Worker<P>) -> T
 {
-    struct TryWithWorker<P, F, T>
+    struct TryWithWorker<F, T>
     where
-        P: Platform,
         F: FnOnce(&Worker<P>) -> T,
     {
         callback: Option<F>,
     }
 
-    impl<P, F, T> Future for TryWithWorker<P, F, T>
+    impl<F, T> Future for TryWithWorker<F, T>
     where
-        P: Platform,
         F: FnOnce(&Worker<P>) -> T,
     {
         type Output = Option<T>;
@@ -240,7 +229,7 @@ where
                 .take()
                 .expect("try_with_worker() polled after completion");
 
-            let mut try_with = TaskPollContext::<P>::try_with(|poll_context| {
+            let mut try_with = TaskPollContext::try_with(|poll_context| {
                 callback(unsafe { poll_context.worker.as_ref() })
             });
 
@@ -253,12 +242,11 @@ where
     }
 }
 
-pub fn try_yield_to<P: Platform>(
+pub fn try_yield_to(
     waker: Waker,
 ) -> impl Future<Output = Result<(), Waker>> {
-    struct TryYieldTo<P: Platform> {
+    struct TryYieldTo {
         waker: Option<Waker>,
-        _phantom: PhantomData<*mut P>,
     }
 
     impl<P: Platform> Future for TryYieldTo<P> {
@@ -272,8 +260,8 @@ pub fn try_yield_to<P: Platform>(
 
             let mut waker = Some(waker);
             Poll::Ready(unsafe {
-                TaskPollContext::<P>::waker_to_task(&task)
-                    .map(|task| TaskPollContext::<P>::try_with(|poll_ctx| {
+                TaskPollContext::waker_to_task(&task)
+                    .map(|task| TaskPollContext::try_with(|poll_ctx| {
                         poll_ctx.next_task = Some(task);
                         mem::drop(waker.take());
                     }))
@@ -290,6 +278,5 @@ pub fn try_yield_to<P: Platform>(
 
     TryYieldTo {
         waker: Some(waker),
-        _phantom: PhantomData,
     }
 }
