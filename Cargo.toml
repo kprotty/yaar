@@ -5,9 +5,21 @@ edition = "2018"
 authors = ["kprotty <kbutcher6200@gmail.com>"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+documentation = "https://docs.rs/yaar"
+homepage = "https://github.com/kprotty/yaar"
 repository = "https://github.com/kprotty/yaar"
-categories = ["no-std", "asynchronous", "concurrency", "network-programming"]
-keywords = ["io", "async", "await", "non-blocking", "futures", "no-std", "thread", "mutex"]
+categories = [
+  "no-std",
+  "concurrency",
+  "asynchronous",
+  "network-programming",
+]
+keywords = [
+  "no-std", "windows", "linux", "unix",
+  "thread", "mutex", "lock", "rwlock",
+  "async", "await", "non-blocking", "futures",
+  "io", "iocp", "io_uring", "epoll", "kevent",
+]
 description = """
 Yet another asynchronous runtime 
 optimized around configuration and no_std.
@@ -17,15 +29,10 @@ optimized around configuration and no_std.
 default = []
 nightly = []
 std = ["os"]
-full = ["runtime", "sync", "io", "std"]
+full = ["std", "executor"]
 
-io = ["os"]
 os = []
-core = []
-sync = []
-runtime = ["core", "os"]
-
-[dependencies]
+executor = []
 
 [package.metadata.playground]
 features = ["full"]
