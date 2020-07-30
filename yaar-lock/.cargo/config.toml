@@ -1,4 +1,0 @@
-[alias]
-bench_sync_mutex = ["bench", "sync_mutex", "--features=full,os"]
-bench_sync_mutex_latency = ["bench", "sync_mutex_latency", "--features=full,os"]
-bench_sync_mutex_throughput = ["bench", "sync_mutex_throughput", "--features=full,os"]
