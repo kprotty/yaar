@@ -8,7 +8,7 @@
 use super::Thread;
 use core::{
     fmt,
-    marker::PhantomPinned,
+    marker::{PhantomData, PhantomPinned},
     pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::AtomicPtr,
@@ -226,5 +226,35 @@ impl TaskBatch {
             self.size -= 1;
             task
         })
+    }
+
+    /// Iterate for the the ordered tasks enqueued in a [`TaskBatch`]
+    pub fn iter<'a>(&'a self) -> TaskBatchIter<'a> {
+        TaskBatchIter {
+            current: self.head,
+            _lifetime: PhantomData,
+        }
+    }
+}
+
+/// Iterator over the ordered tasks enqueued in a [`TaskBatch`]
+pub struct TaskBatchIter<'a> {
+    current: Option<NonNull<Task>>,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+impl<'a> fmt::Debug for TaskBatchIter<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskBatchIter").finish()
+    }
+}
+
+impl<'a> Iterator for TaskBatchIter<'a> {
+    type Item = NonNull<Task>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut task = self.current?;
+        self.current = NonNull::new(unsafe { *task.as_mut().next.get_mut() });
+        Some(task)
     }
 }

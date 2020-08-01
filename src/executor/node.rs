@@ -5,7 +5,12 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use core::{fmt, marker::PhantomPinned, pin::Pin, ptr::NonNull};
+use core::{
+    fmt,
+    marker::{PhantomData, PhantomPinned},
+    pin::Pin,
+    ptr::NonNull,
+};
 
 /// A node cluster represents an ordered collection of nodes that can be
 /// scheduled together.
@@ -150,6 +155,48 @@ impl NodeCluster {
             node
         })
     }
+
+    /// Iterate the [`Node`]s in the order that they were added to this
+    /// [`NodeCluster`].
+    pub fn iter<'a>(&self) -> NodeIter<'a> {
+        NodeIter::new(self.head)
+    }
+}
+
+/// Used to iterate all the [`Node`]s that are connected in a [`NodeCluster`].
+pub struct NodeIter<'a> {
+    start: Option<NonNull<Node>>,
+    current: Option<NonNull<Node>>,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+impl<'a> fmt::Debug for NodeIter<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeIter").finish()
+    }
+}
+
+impl<'a> NodeIter<'a> {
+    const fn new(start: Option<NonNull<Node>>) -> Self {
+        Self {
+            start,
+            current: start,
+            _lifetime: PhantomData,
+        }
+    }
+}
+
+impl<'a> Iterator for NodeIter<'a> {
+    type Item = NonNull<Node>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.current?;
+        self.current = unsafe { node.as_ref().next };
+        if self.current == self.start {
+            self.current = None;
+        }
+        Some(node)
+    }
 }
 
 /// TODO: documentation for a Node
@@ -170,5 +217,14 @@ impl Default for Node {
             _pinned: PhantomPinned,
             next: None,
         }
+    }
+}
+
+impl Node {
+    /// Returns an iterator used to visit all the [`Node`]s in the
+    /// [`NodeCluster`] that this Node belongs to, starting from this node
+    /// itself
+    pub fn iter<'a>(&'a self) -> NodeIter<'a> {
+        NodeIter::new(Some(NonNull::from(self)))
     }
 }

@@ -79,5 +79,24 @@ fn task_batch() {
         assert_eq!(batch.pop(), NonNull::new(&mut t2));
         assert_eq!(batch.pop(), NonNull::new(&mut t3));
         assert_eq!(batch.pop(), None);
+
+        // Test batch iteration
+
+        batch.push(Pin::new_unchecked(&mut t1));
+        batch.push(Pin::new_unchecked(&mut t2));
+        batch.push(Pin::new_unchecked(&mut t3));
+
+        {
+            let mut tasks = batch.iter();
+            assert_eq!(tasks.next(), NonNull::new(&mut t1));
+            assert_eq!(tasks.next(), NonNull::new(&mut t2));
+            assert_eq!(tasks.next(), NonNull::new(&mut t3));
+            assert_eq!(tasks.next(), None);
+        }
+
+        assert_eq!(batch.pop(), NonNull::new(&mut t1));
+        assert_eq!(batch.pop(), NonNull::new(&mut t2));
+        assert_eq!(batch.pop(), NonNull::new(&mut t3));
+        assert_eq!(batch.pop(), None);
     }
 }
