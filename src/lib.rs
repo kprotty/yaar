@@ -16,7 +16,7 @@
 //! come.
 
 #![no_std]
-#![cfg_attr(feature = "nightly", feature(doc_cfg, const_fn, target_has_atomic))]
+#![cfg_attr(feature = "nightly", feature(doc_cfg, const_fn))]
 #![warn(
     missing_docs,
     unreachable_pub,

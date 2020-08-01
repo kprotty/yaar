@@ -12,3 +12,6 @@ pub use task::{Task, TaskBatch, TaskCallback};
 
 mod thread;
 pub use thread::Thread;
+
+mod node;
+pub use node::{Node, NodeCluster};
