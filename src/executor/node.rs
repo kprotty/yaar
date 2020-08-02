@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use super::GlobalQueue;
 use core::{
     fmt,
     marker::{PhantomData, PhantomPinned},
@@ -203,6 +204,7 @@ impl<'a> Iterator for NodeIter<'a> {
 pub struct Node {
     _pinned: PhantomPinned,
     next: Option<NonNull<Self>>,
+    run_queue: GlobalQueue,
 }
 
 impl fmt::Debug for Node {
@@ -216,6 +218,7 @@ impl Default for Node {
         Self {
             _pinned: PhantomPinned,
             next: None,
+            run_queue: GlobalQueue::default(),
         }
     }
 }

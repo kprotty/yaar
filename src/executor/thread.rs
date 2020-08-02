@@ -6,10 +6,12 @@
 // copied, modified, or distributed except according to those terms.
 
 use core::{fmt, marker::PhantomPinned};
+use super::LocalQueue;
 
 /// TODO: documentation for a Thread
 pub struct Thread {
     _pinned: PhantomPinned,
+    run_queue: LocalQueue,
 }
 
 impl fmt::Debug for Thread {
@@ -22,6 +24,7 @@ impl Default for Thread {
     fn default() -> Self {
         Self {
             _pinned: PhantomPinned,
+            run_queue: LocalQueue::default(),
         }
     }
 }

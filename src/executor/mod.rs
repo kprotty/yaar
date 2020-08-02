@@ -15,3 +15,6 @@ pub use thread::Thread;
 
 mod node;
 pub use node::{Node, NodeCluster};
+
+mod queue;
+pub(crate) use queue::{GlobalQueue, LocalQueue};
