@@ -1,98 +1,59 @@
-// Copyright 2019-2020 kprotty
-//
-// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
-// copied, modified, or distributed except according to those terms.
-
-use super::{Task, TaskBatch};
+use super::{super::sync::CachePadded, Batch, Task};
 use core::{
-    fmt,
-    cell::UnsafeCell,
-    marker::PhantomPinned,
+    hint::unreachable_unchecked,
+    mem::MaybeUninit,
     pin::Pin,
-    ptr::NonNull,
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    ptr::{self, NonNull},
+    sync::atomic::{spin_loop_hint, AtomicUsize, Ordering},
 };
 
-#[derive(Default)]
 pub struct GlobalQueue {
-    _pinned: PhantomPinned,
-    head: AtomicPtr<Task>,
-    tail: AtomicUsize,
-    stub: AtomicPtr<Task>,
+    head: CachePadded<AtomicUsize>,
 }
 
-unsafe impl Send for GlobalQueue {}
-unsafe impl Sync for GlobalQueue {}
+impl Default for GlobalQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-impl fmt::Debug for GlobalQueue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GlobalQueue")
-            .field("is_empty", &self.is_empty())
-            .finish()
+impl Drop for GlobalQueue {
+    fn drop(&mut self) {
+        debug_assert_eq!(*self.head.get_mut(), 0);
     }
 }
 
 impl GlobalQueue {
-    pub fn init(self: Pin<&mut Self>) {
-        unimplemented!("TODO")
+    pub const fn new() -> Self {
+        GlobalQueue {
+            head: CachePadded::new(AtomicUsize::new(0)),
+        }
     }
 
-    /// 
-    #[inline]
-    fn stub_ptr(&self) -> NonNull<Task> {
-        NonNull::new(&self.stub as *const _ as *mut Task).unwrap()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        unimplemented!("TODO")
-    }
-
-    pub fn push(&self, batch: TaskBatch) {
-        unimplemented!("TODO")
-    }
-
-    fn try_pop(&self) -> Option<GlobalQueueReceiver<'_>> {
-        unimplemented!("TODO")
-    }
-}
-
-/// A GlobalQueueReceiver represents ownership of the dequeue end of a GlobalQueue.
-/// As long as this object is alive, no other task can dequeue from the GlobalQueue.
-/// This allows the global queue to be implemented with a Single-Consumer for performance.
-///
-/// Dequeueing from a GlobalQueue is modeled as an iterator of tasks that it sees available.
-/// Due to the nature of the underlying algorithm, it may lose and regain visibility of tasks at any time.
-/// This means that polling for new tasks after [`GlobalQueueReceiver::next`] returns `None` is still a valid strategy.
-struct GlobalQueueReceiver<'a> {
-    queue: &'a GlobalQueue,
-    tail: NonNull<Task>,
-}
-
-impl<'a> Iterator for GlobalQueueReceiver<'a> {
-    type Item = NonNull<Task>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        unimplemented!("TODO")
+    pub fn push(&self, mut batch: Batch) {
+        if let Some(batch_head) = batch.head {
+            let mut head = self.head.load(Ordering::Relaxed);
+            loop {
+                unsafe { *batch.tail.as_mut().next.get_mut() = head };
+                match self.head.compare_exchange_weak(
+                    head,
+                    batch_head.as_ptr() as usize,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return,
+                    Err(e) => head = e,
+                }
+            }
+        }
     }
 }
 
-/// A LocalQueue is a bounded Single-Producer-Multi-Consumer queue of tasks.
-/// It is backed by a FIFO ring buffer + a LIFO task slot.
 pub struct LocalQueue {
-    next: AtomicPtr<Task>,
     head: AtomicUsize,
     tail: AtomicUsize,
-    buffer: [MaybeUninit<AtomicPtr<Task>>; Self::BUFFER_SIZE],
-}
-
-impl fmt::Debug for LocalQueue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LocalQueue")
-            .field("is_empty", &self.is_empty())
-            .finish()
-    }
+    overflow: AtomicUsize,
+    buffer: CachePadded<[AtomicUsize; Self::BUFFER_SIZE]>,
 }
 
 impl Default for LocalQueue {
@@ -101,134 +62,70 @@ impl Default for LocalQueue {
     }
 }
 
+impl Drop for LocalQueue {
+    fn drop(&mut self) {
+        debug_assert_eq!(*self.tail.get_mut(), *self.head.get_mut());
+        debug_assert_eq!(*self.overflow.get_mut(), 0);
+    }
+}
+
 impl LocalQueue {
     const BUFFER_SIZE: usize = 256;
 
-    /// Creates a new, empty, local queue/
     pub fn new() -> Self {
         Self {
-            next: AtomicPtr::default(),
-            head: AtomicUsize::default(),
-            tail: AtomicUsize::default(),
-            buffer: unsafe { MaybeUninit::uninit().assume_init() },
-        }
-    }
-    
-    /// Returns true if this local queue is observed to be empty
-    pub fn is_empty(&self) -> bool {
-        loop {
-            // load the tail, head, and next in order.
-            // Acquire barrier to make sure any loads here dont get re-ordered.
-            let tail = self.tail.load(Ordering::Acquire);
-            let head = self.head.load(Ordering::Acquire);
-            let next = self.next.load(Ordering::Acquire);
-
-            // need to recheck the tail to make sure that the buffer didn't change in the mean time.
-            if tail == self.tail.load(Ordering::Relaxed) {
-                return head == tail && next.is_null();
-            }
-        }
-    }
-
-    #[inline]
-    unsafe fn read(&self, index: usize) -> NonNull<Task> {
-
-    }
-
-    #[inline]
-    unsafe fn write(&self, index: usize, task: NonNull<Task>) {
-        
-    }
-
-    /// Enqueue a batch of tasks to this local buffer.
-    /// If `push_next` then tries to push one of the batch tasks to the LIFO slot.
-    /// If there's more tasks in the batch than there are in the buffer,
-    ///     if overflows half of the buffer's tasks into a batch as an `Err`.
-    ///
-    /// # Safety
-    ///
-    /// This method must only be called by the producer thread of this LocalQueue
-    pub unsafe fn try_push(
-        &self,
-        push_next: bool,
-        mut batch: TaskBatch,
-    ) -> Result<(), TaskBatch> {
-        // Try to push the first task of the batch to the self.next LIFO slot
-        let mut has_next_task = false;
-        if push_next {
-            if let Some(task) = batch.pop() {
-                let mut next = self.next.load(Ordering::Relaxed);
-                loop {
-                    // If theres already a task in the next slot, then replace it with the new task.
-                    // Release ordering on success to ensure stealer threads see valid task field writes.
-                    if let Some(mut old_next) = NonNull::new(next) {
-                        match self.next.compare_exchange_weak(
-                            old_next.as_ptr(),
-                            task.as_ptr(),
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        ) {
-                            Err(e) => next = e,
-                            Ok(_) => {
-                                batch.push_front(Pin::new_unchecked(old_next.as_mut()));
-                                has_next_task = true;
-                                break;
-                            }
-                        }
-
-                    // The next slot is empty, move the task into it without a bus lock instruction.
-                    // Release ordering on success to ensure stealer threads see valid task field writes.
-                    } else {
-                        self.next.store(task.as_ptr(), Ordering::Release);
-                        break;
-                    }
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            overflow: AtomicUsize::new(0),
+            buffer: CachePadded::new(unsafe {
+                let mut buffer: MaybeUninit<[_; Self::BUFFER_SIZE]> =
+                    MaybeUninit::uninit();
+                let buffer_ptr = buffer.as_mut_ptr() as *mut AtomicUsize;
+                for i in 0..Self::BUFFER_SIZE {
+                    ptr::write(buffer_ptr.add(i), AtomicUsize::new(0));
                 }
-            }
+                buffer.assume_init()
+            }),
         }
+    }
 
-        // Prepare to update our local buffer with tasks from the task batch.
-        // The tail load here could be unsynchronized since we're the only thread that updates it.
+    unsafe fn read(&self, index: usize) -> NonNull<Task> {
+        let slot = self.buffer.get_unchecked(index % Self::BUFFER_SIZE);
+        let ptr = slot.load(Ordering::Relaxed);
+        NonNull::new_unchecked(ptr as *mut Task)
+    }
+
+    unsafe fn write(&self, index: usize, value: NonNull<Task>) {
+        let slot = self.buffer.get_unchecked(index % Self::BUFFER_SIZE);
+        let ptr = value.as_ptr() as usize;
+        slot.store(ptr, Ordering::Relaxed);
+    }
+
+    pub unsafe fn push(&self, mut batch: Batch) {
         let mut tail = self.tail.load(Ordering::Relaxed);
         let mut head = self.head.load(Ordering::Relaxed);
-        loop {
+
+        while !batch.is_empty() {
             let size = tail.wrapping_sub(head);
-            assert!(
-                size <= Self::BUFFER_SIZE,
-                "invalid local queue size of {}",
-                size,
-            );
-            
-            // If theres space in our local buffer, try to push tasks from the batch there.
-            // Store tasks to the buffer using atomics as a stealer thread could be simulaniously reading.
+            assert!(size <= Self::BUFFER_SIZE, "invalid queue size");
+
             let remaining = Self::BUFFER_SIZE - size;
-            if remaining != 0 {
-                let new_tail = core::iter::repeat_with(|| batch.pop())
-                    .filter_map(|task| task)
-                    .take(remaining)
-                    .fold(tail, |tail, task| {
-                        let slot = self.buffer.get_unchecked(tail % Self::BUFFER_SIZE);
-                        (*slot.as_ptr()).store(task.as_ptr(), Ordering::Relaxed);
-                        tail.wrapping_add(1)
+            if remaining > 0 {
+                let new_tail =
+                    batch.drain().take(remaining).fold(tail, |new_tail, task| {
+                        self.write(new_tail, task);
+                        new_tail.wrapping_add(1)
                     });
-                
-                // Update the tail of the run queue after writing tasks to it.
-                // After the update, re-check the head to see if any stealers made more space.
-                // Note that it is O.K. if the head load is re-ordered above the tail store here.
-                // Release barrier to ensure that stealer threads see the writes to the buffer above.
-                if tail != new_tail {
-                    self.tail.store(new_tail, Ordering::Release);
-                    head = self.head.load(Ordering::Relaxed);
+
+                if new_tail != tail {
                     tail = new_tail;
-                    continue;
-                
-                // Nothing left to push so it was successfull
-                } else if batch.len() == 0 {
-                    return Ok(());
+                    self.tail.store(new_tail, Ordering::Release);
                 }
+
+                head = self.head.load(Ordering::Relaxed);
+                continue;
             }
-            
-            // Try to steal half of the tasks out of the local queue to make future pushes succeed.
-            // Acquire barrier so that the buffer reads below aren't re-ordered before the steal succeeds.
+
             let steal = Self::BUFFER_SIZE / 2;
             if let Err(e) = self.head.compare_exchange_weak(
                 head,
@@ -240,95 +137,188 @@ impl LocalQueue {
                 continue;
             }
 
-            // Managed to mark half the tasks in the buffer as stolen, turn them into a batch.
-            // No need to do a racy read as seen in [`try_steal_from_local`] since we're the only producers.
-            let mut overflow_batch = TaskBatch::new();
-            for offset in 0..steal {
-                let index = head.wrapping_add(offset);
-                let slot = self.buffer.get_unchecked(index % Self::BUFFER_SIZE);
-                let task = (*slot.as_ptr()).load(Ordering::Relaxed);
-                overflow_batch.push_back(Pin::new_unchecked(&mut *task));
-            }
-            
-            // Append the pushed batch after the stolen tasks since they were in the buffer already.
-            overflow_batch.push_back(batch);
-            return Err(overflow_batch);
-        }
-    }
+            let mut overflowed_batch = (0..steal)
+                .map(|i| self.read(head.wrapping_add(i)))
+                .chain(batch.into_iter())
+                .map(|task| Pin::new_unchecked(&mut *task.as_ptr()))
+                .collect::<Batch>();
 
-    /// Try to dequeue a task from this local buffer.
-    /// If `pop_next` then the LIFO slot will be checked & dequeued for a task.
-    ///
-    /// # Safety
-    ///
-    /// This method must only be called by the producer thread of this LocalQueue
-    pub unsafe fn try_pop(&self, pop_next: bool) -> Option<NonNull<Task>> {
-        // If pop_next, try to consume the LIFO `next` slot if it has a task.
-        // No memory barriers are necessarily needed here since all task writes originated on this thread.
-        if pop_next {
-            let mut next = self.next.load(Ordering::Relaxed);
-            while let Some(next_task) = NonNull::new(next) {
-                match self.next.compare_exchange_weak(
-                    next,
-                    ptr::null_mut(),
-                    Ordering::Relaxed,
+            let mut overflow = self.overflow.load(Ordering::Relaxed);
+            loop {
+                *overflowed_batch.tail.as_mut().next.get_mut() = overflow;
+                let new_overflow = overflowed_batch
+                    .head
+                    .unwrap_or_else(|| unreachable_unchecked())
+                    .as_ptr() as usize;
+
+                if overflow == 0 {
+                    self.overflow.store(new_overflow, Ordering::Release);
+                    return;
+                }
+
+                match self.overflow.compare_exchange_weak(
+                    overflow,
+                    new_overflow,
+                    Ordering::Release,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => return Some(next_task),
-                    Err(e) => next = e,
+                    Ok(_) => return,
+                    Err(e) => overflow = e,
                 }
             }
         }
+    }
 
-        // Try to dequeue a task from the local buffer.
-        // Note that the tail load here could be unsynchronized.
+    pub unsafe fn try_pop(&self) -> (Option<NonNull<Task>>, bool) {
         let tail = self.tail.load(Ordering::Relaxed);
         let mut head = self.head.load(Ordering::Relaxed);
+
         loop {
             let size = tail.wrapping_sub(head);
-            assert!(
-                size <= Self::BUFFER_SIZE,
-                "invalid local queue size of {}",
-                size,
-            );
-            
-            // If the local queue is empty, nothing left to poll locally.
+            assert!(size <= Self::BUFFER_SIZE, "invalid run queue size");
+
             if size == 0 {
-                return None;
+                break;
             }
 
-            // Try to steal one task off from the front of the local queue.
-            // No memory barriers as its OK if the task read below gets re-orderd above this CAS.
-            // It is ok because we are the only thread which is able to write to the local buffer.
-            if let Err(e) = self.head.compare_exchange_weak(
+            match self.head.compare_exchange_weak(
                 head,
                 head.wrapping_add(1),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                head = e;
+                Ok(_) => return (Some(self.read(head)), false),
+                Err(e) => head = e,
+            }
+        }
+
+        let mut overflow = self.overflow.load(Ordering::Relaxed);
+        while overflow != 0 {
+            match self.overflow.compare_exchange_weak(
+                overflow,
+                0,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return self.inject(tail, overflow),
+                Err(e) => overflow = e,
+            }
+        }
+
+        (None, false)
+    }
+
+    pub unsafe fn try_steal_from_local(
+        &self,
+        target: &Self,
+    ) -> (Option<NonNull<Task>>, bool) {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Relaxed);
+        assert_eq!(tail, head, "non empty runq when stealing from local");
+
+        let mut target_head = target.head.load(Ordering::Relaxed);
+        loop {
+            let target_tail = target.tail.load(Ordering::Acquire);
+            let target_size = target_tail.wrapping_sub(target_head);
+            let steal = target_size - (target_size / 2);
+
+            if steal > Self::BUFFER_SIZE {
+                spin_loop_hint();
+                target_head = target.head.load(Ordering::Relaxed);
                 continue;
             }
 
-            let slot = 
+            if steal == 0 {
+                let target_overflow = target.overflow.load(Ordering::Relaxed);
+                if target_overflow == 0 {
+                    break;
+                }
+
+                match target.overflow.compare_exchange_weak(
+                    target_overflow,
+                    0,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return self.inject(tail, target_overflow),
+                    Err(_) => {
+                        spin_loop_hint();
+                        target_head = target.head.load(Ordering::Relaxed);
+                        continue;
+                    }
+                }
+            }
+
+            let mut new_target_head = target_head;
+            let mut target_tasks = (0..steal).map(|_| {
+                let task = target.read(new_target_head);
+                new_target_head = new_target_head.wrapping_add(1);
+                task
+            });
+
+            let first_task = target_tasks.next();
+            let new_tail = target_tasks.fold(tail, |new_tail, task| {
+                self.write(new_tail, task);
+                new_tail.wrapping_add(1)
+            });
+
+            if let Err(e) = target.head.compare_exchange_weak(
+                target_head,
+                new_target_head,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                target_head = e;
+                continue;
+            }
+
+            let has_more = new_tail != tail;
+            if has_more {
+                self.tail.store(new_tail, Ordering::Release);
+            }
+
+            return (first_task, has_more);
         }
+
+        (None, false)
     }
 
-    /// Try to dequeue a batch of tasks from the target LocalQueue buffer.
-    ///
-    /// # Safety
-    ///
-    /// This method must only be called by the producer thread of this LocalQueue.
-    /// The `target` LocalQueue that is being stolen from must not be/alias-to `self`.
-    pub unsafe fn try_steal_from_local(&self, target: &Self) -> Option<NonNull<Task>> {
-        unimplemented!("TODO")
+    pub unsafe fn try_steal_from_global(&self, target: &GlobalQueue) -> (Option<NonNull<Task>>, bool) {
+        let mut task_ptr = target.load(Ordering::)
     }
 
-    ///
-    /// # Safety
-    ///
-    /// This method must only be called by the producer thread of this LocalQueue
-    pub unsafe fn try_steal_from_global(&self, target: &GlobalQueue) -> Option<NonNull<Task>> {
-        unimplemented!("TODO")
+    unsafe fn inject(
+        &self,
+        tail: usize,
+        mut task_ptr: usize,
+    ) -> (Option<NonNull<Task>>, bool) {
+        let mut task_iter = core::iter::from_fn(|| {
+            NonNull::new(task_ptr as *mut Task).map(|mut task| {
+                task_ptr = *task.as_mut().next.get_mut();
+                task
+            })
+        });
+
+        let first_task = task_iter.next();
+
+        let new_tail = task_iter
+            .take(Self::BUFFER_SIZE)
+            .fold(tail, |new_tail, task| {
+                self.write(new_tail, task);
+                new_tail.wrapping_sub(1)
+            });
+
+        if new_tail != tail {
+            self.tail.store(new_tail, Ordering::Release);
+        }
+
+        let has_more = task_ptr != 0;
+        if has_more {
+            let overflow = self.overflow.load(Ordering::Relaxed);
+            assert_eq!(overflow, 0, "non empty overflow when injecting");
+            self.overflow.store(task_ptr, Ordering::Release);
+        }
+
+        (first_task, has_more)
     }
 }

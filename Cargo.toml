@@ -32,7 +32,8 @@ std = ["os"]
 full = ["std", "executor"]
 
 os = []
-executor = []
+sync = []
+executor = ["sync"]
 
 [package.metadata.playground]
 features = ["full"]
