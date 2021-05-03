@@ -1,4 +1,0 @@
-[alias]
-t = ["test", "--features=full"]
-c = ["check", "--features=full"]
-d = ["doc", "--features=full,nightly"]

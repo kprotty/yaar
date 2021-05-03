@@ -1,7 +1,12 @@
-[workspace]
-members = [
-    "yaar",
-    "yaar-lock",
-    "yaar-reactor",
-    "yaar-lock/benches",
-]
+[package]
+name = "yaar"
+version = "0.1.0"
+authors = ["kprotty"]
+edition = "2018"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/kprotty/yaar"
+
+[features]
+default = []
+std = []
