@@ -14,12 +14,12 @@
 
 use crate::sync::parker::Parker;
 use core::{
-    pin::Pin,
     cell::{Cell, UnsafeCell},
-    ptr::NonNull,
-    marker::PhantomPinned,
     hint::unreachable_unchecked,
-    sync::atomic::{AtomicUsize, Ordering, fence},
+    marker::PhantomPinned,
+    pin::Pin,
+    ptr::NonNull,
+    sync::atomic::{fence, AtomicUsize, Ordering},
 };
 
 const UNLOCKED: usize = 0;
@@ -76,7 +76,7 @@ impl<T> Lock<T> {
             waiter: Waiter,
         }
 
-        let park_waiter = ParkWaiter{
+        let park_waiter = ParkWaiter {
             parker: P::default(),
             waiter: Waiter {
                 _pinned: PhantomPinned,
@@ -87,14 +87,14 @@ impl<T> Lock<T> {
                     let park_waiter = crate::container_of!(&*waiter, ParkWaiter<P>, waiter);
                     let parker = Pin::new_unchecked(&(*park_waiter).parker);
                     parker.unpark();
-                }
+                },
             },
         };
 
         let park_waiter = unsafe { Pin::new_unchecked(&park_waiter) };
         let parker = unsafe { park_waiter.map_unchecked(|pw| &pw.parker) };
         let waiter = &park_waiter.waiter;
-        
+
         let mut adaptive_spin = 0;
         let mut did_prepare = false;
         let mut state = self.state.load(Ordering::Relaxed);
@@ -215,7 +215,7 @@ impl<T> Lock<T> {
                 Some(new_tail) => {
                     head.tail.set(Some(new_tail));
                     self.state.fetch_and(!WAKING, Ordering::Release);
-                },
+                }
                 None => loop {
                     match self.state.compare_exchange_weak(
                         state,
@@ -231,7 +231,7 @@ impl<T> Lock<T> {
                         fence(Ordering::Acquire);
                         continue 'dequeue;
                     }
-                }
+                },
             }
 
             (tail.unpark)(unsafe { Pin::new_unchecked(tail) });

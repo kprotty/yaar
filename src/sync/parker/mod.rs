@@ -12,14 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-use core::{pin::Pin, time::Duration};
+mod block_on;
+
+pub(crate) use block_on::block_on;
+
+use core::pin::Pin;
 
 pub unsafe trait Parker: Default + Sync {
-    fn prepare(self: Pin<&Self>);
+    type Instant;
 
-    fn park(self: Pin<&Self>, timeout: Option<Duration>) -> bool;
-
-    fn unpark(self: Pin<&Self>);
+    fn now() -> Self::Instant;
 
     fn yield_now(iteration: usize) -> bool;
+
+    fn prepare(self: Pin<&Self>);
+
+    fn park(self: Pin<&Self>, deadline: Option<&Self::Instant>) -> bool;
+
+    fn unpark(self: Pin<&Self>);
 }
