@@ -14,7 +14,7 @@
 
 mod block_on;
 
-pub(crate) use block_on::block_on;
+pub use block_on::{block_for, block_on, block_until};
 
 use core::pin::Pin;
 

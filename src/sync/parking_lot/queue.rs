@@ -14,7 +14,7 @@
 
 use core::{
     cell::Cell, cmp::Ordering as CmpOrdering, marker::PhantomPinned, mem::size_of, pin::Pin,
-    ptr::NonNull, sync::atomic::AtomicUsize,
+    ptr::NonNull,
 };
 
 #[derive(Default)]
@@ -213,7 +213,7 @@ impl<'a> WaitQueue<'a> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.head.is_none()
+        self.head.get().is_none()
     }
 
     pub unsafe fn insert(&self, node: Pin<&WaitNode>) {

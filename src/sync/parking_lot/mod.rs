@@ -12,31 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
+mod atomic_waker;
 mod lock;
 mod parking_lot;
 mod queue;
 
 use core::mem::size_of;
-pub use parking_lot::{ParkToken, Parked, ParkFairness, ParkingLot, Unparked};
+pub use parking_lot::{ParkToken, Parked, ParkingLot, Unparked};
 
 pub trait WithParkingLot {
     fn with_parking_lot<F>(&self, address: usize, f: impl FnOnce(&ParkingLot) -> F) -> F;
 }
 
-pub struct SharededParkingLot<const N: usize, F> {
-    array: [ParkingLot<F>; N],
+pub struct ShardedParkingLot<const N: usize> {
+    array: [ParkingLot; N],
 }
 
-impl<const N: usize, F> SharededParkingLot<N, F> {
-    pub const fn new(fairness: F) -> Self {
-        const INSTANCE: ParkingLot<F> = ParkingLot::<F>::new(fairness);
+impl<const N: usize> ShardedParkingLot<N> {
+    pub const fn new() -> Self {
+        const INSTANCE: ParkingLot = ParkingLot::new();
         Self {
             array: [INSTANCE; N],
         }
     }
 }
 
-impl<const N: usize> WithParkingLot for SharededParkingLot<N> {
+impl<const N: usize> WithParkingLot for ShardedParkingLot<N> {
     fn with_parking_lot<F>(&self, address: usize, f: impl FnOnce(&ParkingLot) -> F) -> F {
         let seed = match size_of::<usize>() {
             8 => 0x9E3779B97F4A7C15,

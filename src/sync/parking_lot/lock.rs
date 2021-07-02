@@ -49,7 +49,11 @@ impl<T> Lock<T> {
         }
     }
 
-    pub fn with<P: Parker, F>(&self, f: impl FnOnce(&mut T) -> F) -> F {
+    pub fn with<P, F, R>(&self, f: F) -> R
+    where
+        P: Parker,
+        F: FnOnce(&mut T) -> R,
+    {
         self.acquire::<P>();
         let result = f(unsafe { &mut *self.value.get() });
         self.release();

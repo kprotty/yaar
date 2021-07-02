@@ -16,15 +16,35 @@ use super::Parker;
 use core::{
     future::Future,
     marker::PhantomData,
+    ops::Add,
     pin::Pin,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     time::Duration,
 };
 
-pub unsafe fn block_on<P: Parker, T>(
+pub unsafe fn block_on<P: Parker, F: Future>(future: F) -> F::Output {
+    block_with::<P, F>(None, future).unwrap()
+}
+
+pub unsafe fn block_until<P: Parker, F: Future>(
+    deadline: P::Instant,
+    future: F,
+) -> Result<F::Output, ()> {
+    block_with::<P, F>(Some(&deadline), future)
+}
+
+pub unsafe fn block_for<P: Parker, F: Future>(timeout: Duration, future: F) -> Result<F::Output, ()>
+where
+    P::Instant: Add<Duration, Output = P::Instant>,
+{
+    let deadline = P::now() + timeout;
+    block_with::<P, F>(Some(&deadline), future)
+}
+
+unsafe fn block_with<P: Parker, F: Future>(
     deadline: Option<&P::Instant>,
-    mut future: impl Future<Output = T>,
-) -> Result<T, ()> {
+    mut future: F,
+) -> Result<F::Output, ()> {
     struct ParkWaker<P>(PhantomData<*mut P>);
 
     impl<P: Parker> ParkWaker<P> {

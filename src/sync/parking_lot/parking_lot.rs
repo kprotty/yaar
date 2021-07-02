@@ -12,100 +12,137 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-use super::{lock::WaitLock, queue::{WaitNode, WaitQueue, WaitTree}};
+use super::{
+    atomic_waker::AtomicWaker,
+    lock::Lock as WaitLock,
+    queue::{WaitNode, WaitQueue, WaitTree},
+};
 use crate::sync::parker::Parker;
 use core::{
-    pin::Pin,
     cell::Cell,
+    marker::PhantomData,
+    pin::Pin,
     ptr::NonNull,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct ParkToken(pub usize);
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Unparked {
     Stop,
     Skip,
     Unpark(ParkToken),
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct Parked {
-    token: ParkToken,
-    is_last: bool,
-    fair_ptr: *const (),
-    fair_callback: unsafe fn(*const (), ParkToken) -> bool,
+    sealed: (),
+    pub token: ParkToken,
+    pub is_last: bool,
+    pub random: usize,
 }
 
-impl Parked {
-    pub fn token(&self) -> ParkToken {
-        self.token
-    }
-
-    pub fn is_last(&self) -> bool {
-        self.is_last
-    }
-
-    pub fn be_fair(&self) -> bool {
-        (self.fair_callback)(self.fair_ptr, self.token)
-    }
-}
-
-pub trait ParkFairness {
-    fn be_fair<P: Parker>(
-        &self,
-        rand: usize,
-        token: usize,
-    ) -> bool;
-}
-
+#[derive(Default)]
 struct ParkNode {
     wait_node: WaitNode,
     token: Cell<ParkToken>,
+    atomic_waker: AtomicWaker,
+    is_waiting: AtomicBool,
     unpark_next: Cell<Option<NonNull<ParkNode>>>,
 }
 
-struct ParkInner<F> {
-    tree: WaitTree,
-    fairness: F,
+pub struct ParkingLot {
+    tree: WaitLock<WaitTree>,
 }
 
-impl<F: ParkFairness> ParkInner<F> {
-    fn parked(&self, token: ParkToken, is_last: bool) -> Parked {
-        Parked {
-            token,
-            is_last,
-            fair_ptr: self as *const Self as *const (),
-            fair_callback: |ptr, token| unsafe {
-                let inner = &*(ptr as *const Self);
-                let random = inner.tree.gen_random();
-                inner.fairness.be_fair(random, token)
-            },
-        }
-    }
-}
-
-pub struct ParkingLot<F> {
-    inner: WaitLock<ParkInner<F>>,
-}
-
-impl<F> ParkingLot<F> {
-    pub const fn new(fairness: F) -> Self {
+impl ParkingLot {
+    pub const fn new() -> Self {
         Self {
-            inner: WaitLock::new(ParkInner {
-                tree: WaitTree::new(),
-                fairness,
-            })
+            tree: WaitLock::new(WaitTree::new()),
         }
     }
 }
 
-impl<F: ParkFairness> ParkingLot<F> {
-    pub async unsafe fn park<P: Parker>(
+impl ParkingLot {
+    pub async unsafe fn park<P, Validate, BeforePark, TimedOut>(
         &self,
         address: usize,
-        validate: impl FnOnce() -> Option<ParkToken>,
-        before_park: impl FnOnce(),
-        timed_out: impl FnOnce(Parked),
-    ) {
+        validate: Validate,
+        before_park: BeforePark,
+        timed_out: TimedOut,
+    ) -> Result<ParkToken, ()>
+    where
+        P: Parker,
+        Validate: FnOnce() -> Option<ParkToken>,
+        BeforePark: FnOnce() -> (),
+        TimedOut: FnOnce(Parked) -> (),
+    {
+        let park_node = ParkNode::default();
+        let park_node = Pin::new_unchecked(&park_node);
+
+        match self.tree.with::<P, _, _>(|tree| {
+            let wait_queue = WaitQueue::from_addr(tree, address);
+            let token = validate()?;
+
+            wait_queue.insert(park_node.map_unchecked(|pn| &pn.wait_node));
+            park_node.is_waiting.store(true, Ordering::Relaxed);
+            park_node.token.set(token);
+            Some(())
+        }) {
+            None => return Err(()),
+            Some(_) => before_park(),
+        }
+
+        struct ParkWaiter<'pl, 'pn, P: Parker, T: FnOnce(Parked)> {
+            park_node: Pin<&'pn ParkNode>,
+            parking_lot: &'pl ParkingLot,
+            timed_out: Option<T>,
+            parker: PhantomData<P>,
+        }
+
+        impl<'pl, 'pn, P: Parker, T: FnOnce(Parked)> Drop for ParkWaiter<'pl, 'pn, P, T> {
+            #[inline]
+            fn drop(&mut self) {
+                if self.park_node.is_waiting.load(Ordering::Relaxed) {
+                    self.drop_slow();
+                }
+            }
+        }
+
+        impl<'pl, 'pn, P: Parker, T: FnOnce(Parked)> ParkWaiter<'pl, 'pn, P, T> {
+            #[cold]
+            fn drop_slow(&mut self) {
+                self.parking_lot.tree.with::<P, _, _>(|tree| unsafe {
+                    if !self.park_node.is_waiting.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    let wait_node = self.park_node.map_unchecked(|pn| &pn.wait_node);
+                    let wait_queue = WaitQueue::from_node(tree, wait_node);
+                    wait_queue.remove(wait_node);
+
+                    let timed_out = self.timed_out.take().expect("no timeout callback");
+                    timed_out(Parked {
+                        sealed: (),
+                        token: self.park_node.token.get(),
+                        is_last: wait_queue.is_empty(),
+                        random: tree.gen_random(self as *const _ as usize),
+                    })
+                })
+            }
+        }
+
+        let _waiter = ParkWaiter {
+            park_node,
+            parking_lot: self,
+            timed_out: Some(timed_out),
+            parker: PhantomData::<P>,
+        };
+
+        park_node.atomic_waker.wait().await;
+        Ok(park_node.token.get())
     }
 
     pub unsafe fn unpark<P: Parker>(
@@ -114,26 +151,32 @@ impl<F: ParkFairness> ParkingLot<F> {
         mut filter: impl FnMut(Parked) -> Unparked,
         before_unpark: impl FnOnce(),
     ) {
-        let mut unparked = self.inner.with::<P, _>(|inner| {
-            let queue = WaitQueue::from_addr(&inner.tree, address);
-            let mut nodes = queue.iter();
+        let mut unparked = self.tree.with::<P, _, _>(|tree| {
+            let wait_queue = WaitQueue::from_addr(tree, address);
+            let mut nodes = wait_queue.iter().peekable();
             let mut unparked = None;
 
             while let Some(node) = nodes.next() {
                 let park_node = crate::container_of!(node.as_ptr(), ParkNode, wait_node);
-                let parked = inner.parked(
-                    (*park_node).token.get(),
-                    queue.is_empty(),
-                );
+                let park_node = Pin::new_unchecked(&*park_node);
+
+                let parked = Parked {
+                    sealed: (),
+                    token: park_node.token.get(),
+                    is_last: nodes.peek().is_none(),
+                    random: tree.gen_random(node.as_ptr() as usize),
+                };
 
                 match filter(parked) {
                     Unparked::Stop => break,
                     Unparked::Skip => continue,
                     Unparked::Unpark(new_token) => {
-                        (*park_node).token.set(new_token);
-                        (*park_node).unpark_next.set(unparked);
+                        wait_queue.remove(park_node.map_unchecked(|pn| &pn.wait_node));
+                        park_node.is_waiting.store(false, Ordering::Relaxed);
+
+                        park_node.token.set(new_token);
+                        park_node.unpark_next.set(unparked);
                         unparked = Some(NonNull::from(&*park_node));
-                        queue.remove(Pin::new_unchecked(node.as_ref()));
                     }
                 }
             }
@@ -144,7 +187,7 @@ impl<F: ParkFairness> ParkingLot<F> {
 
         while let Some(park_node) = unparked {
             unparked = park_node.as_ref().unpark_next.get();
-            park_node.atomic_waker.wake();
+            park_node.as_ref().atomic_waker.wake();
         }
     }
 }
