@@ -17,14 +17,11 @@ use super::{
     lock::Lock as WaitLock,
     queue::{WaitNode, WaitQueue, WaitTree},
 };
-use crate::sync::parker::Parker;
-use core::{
-    cell::Cell,
-    marker::PhantomData,
-    pin::Pin,
-    ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
+use crate::sync::{
+    atomic::{AtomicBool, Ordering},
+    parker::Parker,
 };
+use core::{cell::Cell, marker::PhantomData, pin::Pin, ptr::NonNull};
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct ParkToken(pub usize);
@@ -82,17 +79,19 @@ impl ParkingLot {
         let park_node = ParkNode::default();
         let park_node = Pin::new_unchecked(&park_node);
 
-        match self.tree.with::<P, _, _>(|tree| {
+        if !self.tree.with::<P, _, _>(|tree| {
             let wait_queue = WaitQueue::from_addr(tree, address);
-            let token = validate()?;
+            let token = match validate() {
+                Some(token) => token,
+                None => return false,
+            };
 
             wait_queue.insert(park_node.map_unchecked(|pn| &pn.wait_node));
             park_node.is_waiting.store(true, Ordering::Relaxed);
             park_node.token.set(token);
-            Some(())
+            true
         }) {
-            None => return Err(()),
-            Some(_) => before_park(),
+            return Err(());
         }
 
         struct ParkWaiter<'pl, 'pn, P: Parker, T: FnOnce(Parked)> {
@@ -141,16 +140,50 @@ impl ParkingLot {
             parker: PhantomData::<P>,
         };
 
+        before_park();
         park_node.atomic_waker.wait().await;
         Ok(park_node.token.get())
     }
 
-    pub unsafe fn unpark<P: Parker>(
+    pub unsafe fn unpark_one<P, U>(&self, address: usize, on_unpark: U)
+    where
+        P: Parker,
+        U: FnOnce(Option<Parked>) -> ParkToken,
+    {
+        let mut on_unpark = Some(on_unpark);
+        let mut filter = |parked| match on_unpark.take() {
+            Some(on_unpark) => Unparked::Unpark(on_unpark(Some(parked))),
+            None => Unparked::Stop,
+        };
+        let before_unpark = || match on_unpark.take() {
+            None => {}
+            Some(on_unpark) => {
+                on_unpark(None);
+            }
+        };
+
+        self.unpark::<P, _, _>(address, filter, before_unpark)
+    }
+
+    pub unsafe fn unpark_all<P>(&self, address: usize, token: ParkToken)
+    where
+        P: Parker,
+    {
+        let filter = |_| Unparked::Unpark(token);
+        let before_unpark = || {};
+        self.unpark::<P, _, _>(address, filter, before_unpark);
+    }
+
+    pub unsafe fn unpark<P, Filter, BeforeUnpark>(
         &self,
         address: usize,
-        mut filter: impl FnMut(Parked) -> Unparked,
-        before_unpark: impl FnOnce(),
-    ) {
+        mut filter: Filter,
+        before_unpark: BeforeUnpark,
+    ) where
+        P: Parker,
+        Filter: FnMut(Parked) -> Unparked,
+        BeforeUnpark: FnOnce(),
+    {
         let mut unparked = self.tree.with::<P, _, _>(|tree| {
             let wait_queue = WaitQueue::from_addr(tree, address);
             let mut nodes = wait_queue.iter().peekable();

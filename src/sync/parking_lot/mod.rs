@@ -20,8 +20,8 @@ mod queue;
 use core::mem::size_of;
 pub use parking_lot::{ParkToken, Parked, ParkingLot, Unparked};
 
-pub trait WithParkingLot {
-    fn with_parking_lot<F>(&self, address: usize, f: impl FnOnce(&ParkingLot) -> F) -> F;
+pub trait AsParkingLot {
+    fn as_parking_lot(&self, address: usize) -> &ParkingLot;
 }
 
 pub struct ShardedParkingLot<const N: usize> {
@@ -37,8 +37,8 @@ impl<const N: usize> ShardedParkingLot<N> {
     }
 }
 
-impl<const N: usize> WithParkingLot for ShardedParkingLot<N> {
-    fn with_parking_lot<F>(&self, address: usize, f: impl FnOnce(&ParkingLot) -> F) -> F {
+impl<const N: usize> AsParkingLot for ShardedParkingLot<N> {
+    fn as_parking_lot(&self, address: usize) -> &ParkingLot {
         let seed = match size_of::<usize>() {
             8 => 0x9E3779B97F4A7C15,
             4 => 0x9E3779B9,
@@ -46,10 +46,8 @@ impl<const N: usize> WithParkingLot for ShardedParkingLot<N> {
             _ => unreachable!("Architecture not supported"),
         };
 
-        f({
-            let hash = address.wrapping_mul(seed);
-            let index = hash % N;
-            &self.array[index]
-        })
+        let hash = address.wrapping_mul(seed);
+        let index = hash % N;
+        &self.array[index]
     }
 }

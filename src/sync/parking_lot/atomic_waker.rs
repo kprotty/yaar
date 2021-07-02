@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
+use crate::sync::atomic::{fence, AtomicUsize, Ordering};
 use core::{
     cell::Cell,
     future::Future,
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
 };
 
@@ -41,6 +41,7 @@ impl AtomicWaker {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "riscv64"))]
     pub unsafe fn wake(&self) {
+        fence(Ordering::Release);
         if self.notify() {
             self.waker.take().expect("waiting without a waker").wake();
         }
@@ -83,7 +84,7 @@ impl<'a> Future for AtomicWakerFuture<'a> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.0.state.load(Ordering::Relaxed) {
+        let result = match self.0.state.load(Ordering::Relaxed) {
             WAKER_EMPTY => {
                 self.0.waker.set(Some(ctx.waker().clone()));
                 match self.0.state.compare_exchange(
@@ -135,6 +136,12 @@ impl<'a> Future for AtomicWakerFuture<'a> {
             WAKER_UPDATING => unreachable!("polled when currently being polled"),
             WAKER_NOTIFIED => Poll::Ready(()),
             _ => unreachable!("invalid atomic waker state"),
+        };
+
+        if result != Poll::Pending {
+            fence(Ordering::Acquire);
         }
+
+        result
     }
 }

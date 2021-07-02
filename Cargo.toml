@@ -10,3 +10,4 @@ repository = "https://github.com/kprotty/yaar"
 [features]
 default = []
 std = []
+os = []

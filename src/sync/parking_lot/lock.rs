@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-use crate::sync::parker::Parker;
+use crate::sync::{
+    atomic::{fence, AtomicUsize, Ordering},
+    parker::Parker,
+};
 use core::{
     cell::{Cell, UnsafeCell},
     hint::unreachable_unchecked,
     marker::PhantomPinned,
     pin::Pin,
     ptr::NonNull,
-    sync::atomic::{fence, AtomicUsize, Ordering},
 };
 
 const UNLOCKED: usize = 0;

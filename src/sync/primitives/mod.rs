@@ -12,25 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-mod block_on;
-
-pub(crate) use block_on::block_with;
-pub use block_on::{block_for, block_on, block_until};
-
-use core::{ops::{Add, Sub}, pin::Pin, time::Duration};
-
-pub unsafe trait Parker: Default + Sync {
-    type Instant: Ord
-        + Add<Duration, Output = Self::Instant>
-        + Sub<Self::Instant, Output = Duration>;
-
-    fn now() -> Self::Instant;
-
-    fn yield_now(iteration: usize) -> bool;
-
-    fn prepare(self: Pin<&Self>);
-
-    fn park(self: Pin<&Self>, deadline: Option<&Self::Instant>) -> bool;
-
-    fn unpark(self: Pin<&Self>);
-}
+mod mutex;
