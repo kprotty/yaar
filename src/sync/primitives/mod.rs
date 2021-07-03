@@ -14,4 +14,4 @@
 
 mod mutex;
 
-pub use mutex::RawMutex;
+pub use mutex::{RawMutex, Mutex, MutexGuard};

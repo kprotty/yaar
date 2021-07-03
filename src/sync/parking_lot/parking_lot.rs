@@ -69,7 +69,7 @@ impl ParkingLot {
         validate: Validate,
         before_park: BeforePark,
         timed_out: TimedOut,
-    ) -> Result<ParkToken, ()>
+    ) -> Option<ParkToken>
     where
         P: Parker,
         Validate: FnOnce() -> Option<ParkToken>,
@@ -91,7 +91,7 @@ impl ParkingLot {
             park_node.token.set(token);
             true
         }) {
-            return Err(());
+            return None;
         }
 
         struct ParkWaiter<'pl, 'pn, P: Parker, T: FnOnce(Parked)> {
@@ -142,7 +142,7 @@ impl ParkingLot {
 
         before_park();
         park_node.atomic_waker.wait().await;
-        Ok(park_node.token.get())
+        Some(park_node.token.get())
     }
 
     pub unsafe fn unpark_one<P, U>(&self, address: usize, on_unpark: U)

@@ -17,7 +17,15 @@ use crate::sync::{
     parker::{block_with, Parker},
     parking_lot::{AsParkingLot, ParkToken, Parked},
 };
-use core::{cell::Cell, convert::TryInto, marker::PhantomPinned, pin::Pin, time::Duration};
+use core::{
+    cell::{Cell, UnsafeCell},
+    convert::TryInto,
+    fmt,
+    marker::{PhantomData, PhantomPinned},
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    time::Duration,
+};
 
 const TOKEN_RETRY: ParkToken = ParkToken(0);
 const TOKEN_ACQUIRED: ParkToken = ParkToken(1);
@@ -36,8 +44,30 @@ pub struct RawMutex<A> {
     parking_lot_provider: A,
 }
 
+impl<A> fmt::Debug for RawMutex<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawMutex")
+            .field(
+                "state",
+                &match self.state.load(Ordering::Relaxed) {
+                    UNLOCKED => "<unlocked>",
+                    LOCKED => "<locked>",
+                    PARKED => "<parked>",
+                    _ => unreachable!(),
+                },
+            )
+            .finish()
+    }
+}
+
 unsafe impl<A: Send> Send for RawMutex<A> {}
 unsafe impl<A: Send> Sync for RawMutex<A> {}
+
+impl<A: Default> Default for RawMutex<A> {
+    fn default() -> Self {
+        Self::new(A::default())
+    }
+}
 
 impl<A> RawMutex<A> {
     pub const fn new(parking_lot_provider: A) -> Self {
@@ -45,6 +75,11 @@ impl<A> RawMutex<A> {
             state: AtomicU8::new(UNLOCKED),
             parking_lot_provider,
         }
+    }
+
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.state.load(Ordering::Relaxed) != UNLOCKED
     }
 
     #[inline]
@@ -188,7 +223,7 @@ impl<A: AsParkingLot> RawMutex<A> {
                 }
             };
 
-            if let Ok(TOKEN_ACQUIRED) = unsafe {
+            if let Some(TOKEN_ACQUIRED) = unsafe {
                 self.parking_lot_provider
                     .as_parking_lot(address)
                     .park::<P, _, _, _>(address, validate, before_park, timed_out)
@@ -255,5 +290,183 @@ impl<A: AsParkingLot> RawMutex<A> {
         self.parking_lot_provider
             .as_parking_lot(address)
             .unpark_one::<P, _>(address, on_unpark)
+    }
+}
+
+pub struct Mutex<A, P, T> {
+    raw: RawMutex<A>,
+    value: UnsafeCell<T>,
+    _parker: PhantomData<P>,
+}
+
+impl<A: AsParkingLot, P: Parker, T: fmt::Debug> fmt::Debug for Mutex<A, P, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut f = f.debug_struct("Mutex");
+        let f = match self.try_lock() {
+            Some(guard) => f.field("state", &&*guard),
+            None => f.field("state", &"<locked>"),
+        };
+        f.finish()
+    }
+}
+
+unsafe impl<A: Send, P, T: Send> Send for Mutex<A, P, T> {}
+unsafe impl<A: Send, P, T: Send> Sync for Mutex<A, P, T> {}
+
+impl<A: Default, P, T: Default> Default for Mutex<A, P, T> {
+    fn default() -> Self {
+        Self::new(A::default(), T::default())
+    }
+}
+
+impl<A, P, T> AsMut<T> for Mutex<A, P, T> {
+    fn as_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.value.get() }
+    }
+}
+
+impl<A, P, T> Mutex<A, P, T> {
+    pub const fn new(parking_lot_provider: A, value: T) -> Self {
+        Self {
+            raw: RawMutex::new(parking_lot_provider),
+            value: UnsafeCell::new(value),
+            _parker: PhantomData,
+        }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
+    }
+
+    pub fn as_raw(&self) -> &RawMutex<A> {
+        &self.raw
+    }
+
+    pub fn as_ptr(&self) -> *mut T {
+        self.value.get()
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.raw.is_locked()
+    }
+}
+
+impl<A: AsParkingLot, P: Parker, T> Mutex<A, P, T> {
+    fn guard(&self) -> MutexGuard<'_, A, P, T> {
+        MutexGuard {
+            raw: &self.raw,
+            value: self.value.get(),
+            _parker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, A, P, T>> {
+        if self.raw.try_lock() {
+            Some(self.guard())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn lock(&self) -> MutexGuard<'_, A, P, T> {
+        self.raw.lock::<P>();
+        self.guard()
+    }
+
+    pub fn try_lock_for(&self, duration: Duration) -> Option<MutexGuard<'_, A, P, T>> {
+        if self.raw.try_lock_for::<P>(duration) {
+            Some(self.guard())
+        } else {
+            None
+        }
+    }
+
+    pub fn try_lock_until(&self, deadline: P::Instant) -> Option<MutexGuard<'_, A, P, T>> {
+        if self.raw.try_lock_until::<P>(deadline) {
+            Some(self.guard())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub unsafe fn force_unlock(&self) {
+        self.raw.unlock::<P>()
+    }
+
+    #[inline]
+    pub unsafe fn force_unlock_fair(&self) {
+        self.raw.unlock_fair::<P>()
+    }
+}
+
+pub struct MutexGuard<'a, A: AsParkingLot, P: Parker, T> {
+    raw: &'a RawMutex<A>,
+    value: *mut T,
+    _parker: PhantomData<P>,
+}
+
+impl<'a, A: AsParkingLot, P: Parker, T> Drop for MutexGuard<'a, A, P, T> {
+    fn drop(&mut self) {
+        unsafe { self.raw.unlock::<P>() }
+    }
+}
+
+impl<'a, A: AsParkingLot, P: Parker, T> DerefMut for MutexGuard<'a, A, P, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.value }
+    }
+}
+
+impl<'a, A: AsParkingLot, P: Parker, T> Deref for MutexGuard<'a, A, P, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*self.value }
+    }
+}
+
+impl<'a, A: AsParkingLot, P: Parker, T: fmt::Debug> fmt::Debug for MutexGuard<'a, A, P, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<'a, A: AsParkingLot, P: Parker, T: fmt::Display> fmt::Display for MutexGuard<'a, A, P, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<'a, A: AsParkingLot, P: Parker, T> MutexGuard<'a, A, P, T> {
+    pub fn map<F, R>(self: Self, f: F) -> MutexGuard<'a, A, P, R>
+    where
+        F: FnOnce(&mut T) -> &mut R,
+    {
+        MutexGuard {
+            raw: self.raw,
+            value: f(unsafe { &mut *self.value }),
+            _parker: PhantomData,
+        }
+    }
+
+    pub fn try_map<F, R>(self: Self, f: F) -> Result<MutexGuard<'a, A, P, R>, Self>
+    where
+        F: FnOnce(&mut T) -> Option<&mut R>,
+    {
+        match f(unsafe { &mut *self.value }) {
+            Some(value) => Ok(MutexGuard {
+                raw: self.raw,
+                value: value,
+                _parker: PhantomData,
+            }),
+            None => Err(self),
+        }
+    }
+
+    pub fn unlock_fair(self: Self) {
+        unsafe { self.raw.unlock_fair::<P>() }
     }
 }
