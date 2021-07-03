@@ -17,10 +17,15 @@ mod block_on;
 pub(crate) use block_on::block_with;
 pub use block_on::{block_for, block_on, block_until};
 
-use core::{ops::{Add, Sub}, pin::Pin, time::Duration};
+use core::{
+    ops::{Add, Sub},
+    pin::Pin,
+    time::Duration,
+};
 
 pub unsafe trait Parker: Default + Sync {
     type Instant: Ord
+        + Clone
         + Add<Duration, Output = Self::Instant>
         + Sub<Self::Instant, Output = Duration>;
 

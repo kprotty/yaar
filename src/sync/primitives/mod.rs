@@ -13,3 +13,5 @@
 // limitations under the License
 
 mod mutex;
+
+pub use mutex::RawMutex;

@@ -21,7 +21,7 @@ use crate::sync::{
     atomic::{AtomicBool, Ordering},
     parker::Parker,
 };
-use core::{cell::Cell, marker::PhantomData, pin::Pin, ptr::NonNull};
+use core::{cell::Cell, marker::PhantomData, mem::drop, pin::Pin, ptr::NonNull};
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct ParkToken(pub usize);
@@ -150,16 +150,14 @@ impl ParkingLot {
         P: Parker,
         U: FnOnce(Option<Parked>) -> ParkToken,
     {
-        let mut on_unpark = Some(on_unpark);
-        let mut filter = |parked| match on_unpark.take() {
+        let on_unpark = Cell::new(Some(on_unpark));
+        let filter = |parked| match on_unpark.replace(None) {
             Some(on_unpark) => Unparked::Unpark(on_unpark(Some(parked))),
             None => Unparked::Stop,
         };
-        let before_unpark = || match on_unpark.take() {
+        let before_unpark = || match on_unpark.replace(None) {
+            Some(on_unpark) => drop(on_unpark(None)),
             None => {}
-            Some(on_unpark) => {
-                on_unpark(None);
-            }
         };
 
         self.unpark::<P, _, _>(address, filter, before_unpark)

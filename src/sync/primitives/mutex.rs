@@ -15,9 +15,9 @@
 use crate::sync::{
     atomic::{AtomicU8, Ordering},
     parker::{block_with, Parker},
-    parking_lot::{ParkToken, Parked, AsParkingLot},
+    parking_lot::{AsParkingLot, ParkToken, Parked},
 };
-use core::{cell::Cell, marker::PhantomPinned, pin::Pin, time::Duration, convert::TryInto};
+use core::{cell::Cell, convert::TryInto, marker::PhantomPinned, pin::Pin, time::Duration};
 
 const TOKEN_RETRY: ParkToken = ParkToken(0);
 const TOKEN_ACQUIRED: ParkToken = ParkToken(1);
@@ -87,9 +87,9 @@ impl<A: AsParkingLot> RawMutex<A> {
         D: FnOnce() -> Option<P::Instant>,
     {
         unsafe {
-            let deadline = deadline_provider().as_ref();
+            let deadline = deadline_provider();
             let future = self.lock_async::<P>();
-            block_with::<P, _>(deadline, future).is_ok()
+            block_with::<P, _>(deadline.as_ref(), future).is_ok()
         }
     }
 
@@ -108,7 +108,7 @@ impl<A: AsParkingLot> RawMutex<A> {
                     let now = P::now();
                     let started = park_waiter.started.replace(None).unwrap();
 
-                    let park_time = now - started;
+                    let park_time = now - started.clone();
                     park_time >= fair_timeout || {
                         park_waiter.started.set(Some(started));
                         false
@@ -157,7 +157,7 @@ impl<A: AsParkingLot> RawMutex<A> {
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => state = PARKED,
+                    Ok(_) => {}
                     Err(e) => {
                         state = e;
                         continue;
@@ -179,7 +179,7 @@ impl<A: AsParkingLot> RawMutex<A> {
             let before_park = || {};
             let timed_out = |parked: Parked| {
                 if lock_state == PARKED && parked.is_last {
-                    self.state.compare_exchange(
+                    let _ = self.state.compare_exchange(
                         PARKED,
                         LOCKED,
                         Ordering::Relaxed,
@@ -191,12 +191,7 @@ impl<A: AsParkingLot> RawMutex<A> {
             if let Ok(TOKEN_ACQUIRED) = unsafe {
                 self.parking_lot_provider
                     .as_parking_lot(address)
-                    .park::<P, _, _, _>(
-                        address, 
-                        validate, 
-                        before_park, 
-                        timed_out,
-                    )
+                    .park::<P, _, _, _>(address, validate, before_park, timed_out)
                     .await
             } {
                 return;
