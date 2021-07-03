@@ -14,10 +14,10 @@
 
 use super::Parker;
 use std::{
-    pin::Pin,
     cell::Cell,
-    thread::{self, Thread},
+    pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
+    thread::{self, Thread},
 };
 
 #[derive(Default)]
@@ -73,7 +73,7 @@ unsafe impl Parker for StdParker {
                 None => {
                     thread::park();
                     continue;
-                },
+                }
             };
 
             let now = Self::Instant::now();

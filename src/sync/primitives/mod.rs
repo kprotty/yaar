@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
+mod condvar;
 mod mutex;
 
-pub use mutex::{RawMutex, Mutex, MutexGuard};
+pub use condvar::Condvar;
+pub use mutex::{Mutex, MutexGuard, RawMutex};

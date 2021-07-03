@@ -24,30 +24,34 @@ pub trait AsParkingLot {
     fn as_parking_lot(&self, address: usize) -> &ParkingLot;
 }
 
-pub struct ShardedParkingLot<const N: usize> {
-    array: [ParkingLot; N],
-}
-
-impl<const N: usize> ShardedParkingLot<N> {
-    pub const fn new() -> Self {
-        const INSTANCE: ParkingLot = ParkingLot::new();
-        Self {
-            array: [INSTANCE; N],
-        }
+impl AsParkingLot for ParkingLot {
+    fn as_parking_lot(&self, _address: usize) -> &ParkingLot {
+        self
     }
 }
 
-impl<const N: usize> AsParkingLot for ShardedParkingLot<N> {
+impl<const N: usize> AsParkingLot for [ParkingLot; N] {
     fn as_parking_lot(&self, address: usize) -> &ParkingLot {
-        let seed = match size_of::<usize>() {
-            8 => 0x9E3779B97F4A7C15,
-            4 => 0x9E3779B9,
-            2 => 0x9E37,
-            _ => unreachable!("Architecture not supported"),
-        };
-
-        let hash = address.wrapping_mul(seed);
-        let index = hash % N;
-        &self.array[index]
+        hashed_parking_lot(self, address)
     }
+}
+
+impl<'a> AsParkingLot for &'a [ParkingLot] {
+    fn as_parking_lot(&self, address: usize) -> &ParkingLot {
+        hashed_parking_lot(self, address)
+    }
+}
+
+#[inline]
+fn hashed_parking_lot(slice: &[ParkingLot], address: usize) -> &ParkingLot {
+    let seed = match size_of::<usize>() {
+        8 => 0x9E3779B97F4A7C15,
+        4 => 0x9E3779B9,
+        2 => 0x9E37,
+        _ => unreachable!("Architecture not supported"),
+    };
+
+    let hash = address.wrapping_mul(seed);
+    let index = hash % slice.len();
+    &slice[index]
 }

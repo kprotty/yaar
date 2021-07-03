@@ -403,7 +403,7 @@ impl<A: AsParkingLot, P: Parker, T> Mutex<A, P, T> {
 }
 
 pub struct MutexGuard<'a, A: AsParkingLot, P: Parker, T> {
-    raw: &'a RawMutex<A>,
+    pub(crate) raw: &'a RawMutex<A>,
     value: *mut T,
     _parker: PhantomData<P>,
 }
