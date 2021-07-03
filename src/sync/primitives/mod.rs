@@ -17,3 +17,29 @@ mod mutex;
 
 pub use condvar::Condvar;
 pub use mutex::{Mutex, MutexGuard, RawMutex};
+
+#[cfg(feature = "os")]
+pub use os_primitives;
+
+#[cfg(feature = "os")]
+mod os_primitives {
+    use super::*;
+    use crate::sync::{
+        parker::OsParker,
+        parking_lot::OsParkingLot,
+    };
+
+    pub type OsRawMutex = RawMutex<OsParkingLot>;
+    pub type OsMutex<T> = Mutex<OsParkingLot, OsParker, T>;
+    pub type OsMutexGuard<'a, T> = MutexGuard<'a, OsParkingLot, OsParker, T>;
+
+    pub const fn make_os_mutex<T>(value: T) -> OsMutex<T> {
+        OsMutex::new(OsParkingLot{}, value)
+    }
+
+    pub type OsCondvar = Condvar<OsParkingLot, OsParker>;
+
+    pub const fn make_os_condvar() -> OsCondvar {
+        OsCondvar::new(OsParkingLot{})
+    }
+}

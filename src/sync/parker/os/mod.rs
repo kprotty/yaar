@@ -12,16 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-mod block_on;
+mod instant;
 
-pub(crate) use block_on::block_with;
-pub use block_on::{block_for, block_on, block_until};
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+use windows as os;
 
-use core::{
-    ops::{Add, Sub},
-    pin::Pin,
-    time::Duration,
-};
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as os;
+
+#[cfg(target_vendor = "apple")]
+mod darwin;
+#[cfg(target_vendor = "apple")]
+use darwin as os;
+
+#[cfg(all(unix, not(any(target_os = "linux", target_vendor = "apple"))))]
+mod posix;
+#[cfg(all(unix, not(any(target_os = "linux", target_vendor = "apple"))))]
+use posix as os;
+
+pub use os::OsParker;
+pub use instant::OsInstant;
 
 pub unsafe trait Parker: Default + Sync {
     type Instant: Ord
@@ -39,15 +53,3 @@ pub unsafe trait Parker: Default + Sync {
 
     fn unpark(self: Pin<&Self>);
 }
-
-#[cfg(feature = "std")]
-mod std_parker;
-
-#[cfg(feature = "std")]
-pub use std_parker::StdParker;
-
-#[cfg(feature = "os")]
-mod os;
-
-#[cfg(feature = "os")]
-pub use os::{OsParker, OsInstant};

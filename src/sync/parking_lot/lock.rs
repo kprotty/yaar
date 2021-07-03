@@ -43,6 +43,9 @@ pub struct Lock<T> {
     value: UnsafeCell<T>,
 }
 
+unsafe impl<T: Send> Send for Lock<T> {}
+unsafe impl<T: Send> Sync for Lock<T> {}
+
 impl<T> Lock<T> {
     pub const fn new(value: T) -> Self {
         Self {

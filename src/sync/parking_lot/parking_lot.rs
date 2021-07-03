@@ -54,6 +54,9 @@ pub struct ParkingLot {
     tree: WaitLock<WaitTree>,
 }
 
+unsafe impl Send for ParkingLot {}
+unsafe impl Sync for ParkingLot {}
+
 impl ParkingLot {
     pub const fn new() -> Self {
         Self {

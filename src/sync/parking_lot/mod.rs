@@ -55,3 +55,19 @@ fn hashed_parking_lot(slice: &[ParkingLot], address: usize) -> &ParkingLot {
     let index = hash % slice.len();
     &slice[index]
 }
+
+#[cfg(feature = "std")]
+pub type StdParkingLot = OsParkingLot;
+
+#[cfg(feature = "os")]
+pub struct OsParkingLot;
+
+#[cfg(feature = "os")]
+impl AsParkingLot for OsParkingLot {
+    fn as_parking_lot(&self, address: usize) -> &ParkingLot {
+        const NUM_BUCKETS: usize = 256;
+        const PARKING_LOT: ParkingLot = ParkingLot::new();
+        static BUCKETS: [ParkingLot; NUM_BUCKETS] = [PARKING_LOT; NUM_BUCKETS];
+        BUCKETS.as_parking_lot(address)
+    }
+}

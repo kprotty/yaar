@@ -8,6 +8,6 @@ readme = "README.md"
 repository = "https://github.com/kprotty/yaar"
 
 [features]
-default = ["std", "os"]
-std = []
+default = ["std"]
+std = ["os"]
 os = []
