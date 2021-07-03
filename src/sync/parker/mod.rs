@@ -35,7 +35,13 @@ pub unsafe trait Parker: Default + Sync {
 
     fn prepare(self: Pin<&Self>);
 
-    fn park(self: Pin<&Self>, deadline: Option<&Self::Instant>) -> bool;
+    fn park(self: Pin<&Self>, deadline: Option<Self::Instant>) -> bool;
 
     fn unpark(self: Pin<&Self>);
 }
+
+#[cfg(feature = "std")]
+mod std_parker;
+
+#[cfg(feature = "std")]
+pub use std_parker::StdParker;

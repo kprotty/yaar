@@ -29,7 +29,7 @@ pub unsafe fn block_until<P: Parker, F: Future>(
     deadline: P::Instant,
     future: F,
 ) -> Result<F::Output, ()> {
-    block_with::<P, F>(Some(&deadline), future)
+    block_with::<P, F>(Some(deadline), future)
 }
 
 pub unsafe fn block_for<P: Parker, F: Future>(
@@ -37,11 +37,11 @@ pub unsafe fn block_for<P: Parker, F: Future>(
     future: F,
 ) -> Result<F::Output, ()> {
     let deadline = P::now() + timeout;
-    block_with::<P, F>(Some(&deadline), future)
+    block_with::<P, F>(Some(deadline), future)
 }
 
 pub(crate) unsafe fn block_with<P: Parker, F: Future>(
-    deadline: Option<&P::Instant>,
+    deadline: Option<P::Instant>,
     mut future: F,
 ) -> Result<F::Output, ()> {
     struct ParkWaker<P>(PhantomData<*mut P>);
@@ -77,7 +77,7 @@ pub(crate) unsafe fn block_with<P: Parker, F: Future>(
             return Ok(value);
         }
 
-        let timed_out = !parker.park(deadline);
+        let timed_out = !parker.park(deadline.clone());
         if timed_out {
             assert!(deadline.is_some());
             return Err(());

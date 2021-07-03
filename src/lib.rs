@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-#![cfg_attr(not(all(test, feature = "std")), no_std)]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 
 #[macro_use]
 mod addr_of;

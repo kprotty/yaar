@@ -124,7 +124,7 @@ impl<A: AsParkingLot> RawMutex<A> {
         unsafe {
             let deadline = deadline_provider();
             let future = self.lock_async::<P>();
-            block_with::<P, _>(deadline.as_ref(), future).is_ok()
+            block_with::<P, _>(deadline, future).is_ok()
         }
     }
 
