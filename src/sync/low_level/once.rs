@@ -110,9 +110,7 @@ mod os {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod os {
     use super::super::{event::Futex, Spin};
-    use std::{
-        sync::atomic::{AtomicI32, Ordering},
-    };
+    use std::sync::atomic::{AtomicI32, Ordering};
 
     const UNINIT: i32 = 0;
     const CALLING: i32 = 1;
