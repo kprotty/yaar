@@ -80,13 +80,13 @@ enum SyncStatus {
 #[derive(Copy, Clone, Debug)]
 struct SyncState {
     status: SyncStatus,
-    notified: bool,
+    notified: usize,
     spawned: usize,
     idle: usize,
 }
 
 impl SyncState {
-    const COUNT_BITS: u32 = (usize::BITS - 4) / 2;
+    const COUNT_BITS: u32 = (usize::BITS - 2) / 3;
     const COUNT_MASK: usize = (1 << Self::COUNT_BITS) - 1;
 }
 
@@ -99,9 +99,9 @@ impl From<usize> for SyncState {
                 0b10 => SyncStatus::Signaled,
                 _ => unreachable!("invalid sync-status"),
             },
-            notified: value & 0b100 != 0,
-            spawned: (value >> 4) & Self::COUNT_MASK,
-            idle: (value >> (Self::COUNT_BITS + 4)) & Self::COUNT_MASK,
+            notified: (value >> (4 + Self::COUNT_BITS * 0)) & Self::COUNT_MASK,
+            spawned: (value >> (4 + Self::COUNT_BITS * 1)) & Self::COUNT_MASK,
+            idle: (value >> (4 + Self::COUNT_BITS * 2)) & Self::COUNT_MASK,
         }
     }
 }
@@ -111,9 +111,9 @@ impl Into<usize> for SyncState {
         assert!(self.idle <= Self::COUNT_MASK);
         assert!(self.spawned <= Self::COUNT_MASK);
 
-        (self.idle << (Self::COUNT_BITS + 4))
-            | (self.spawned << 4)
-            | (if self.notified { 0b100 } else { 0 })
+        (self.idle << (4 + Self::COUNT_BITS * 2))
+            | (self.spawned << (4 + Self::COUNT_BITS * 1))
+            | (self.notified << (4 + Self::COUNT_BITS * 0))
             | match self.status {
                 SyncStatus::Pending => 0b00,
                 SyncStatus::Waking => 0b01,
@@ -196,10 +196,12 @@ impl Pool {
             .sync
             .fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
                 let mut state: SyncState = state.into();
-                assert!(state.idle <= state.spawned);
                 if is_waking {
                     assert_eq!(state.status, SyncStatus::Waking);
                 }
+
+                assert!(state.idle <= state.spawned);
+                assert!(state.notified <= state.spawned);
 
                 let can_wake = is_waking || state.status == SyncStatus::Pending;
                 if can_wake && state.idle > 0 {
@@ -209,11 +211,11 @@ impl Pool {
                     state.spawned += 1;
                 } else if is_waking {
                     state.status = SyncStatus::Pending;
-                } else if state.notified {
+                } else if state.notified == state.spawned {
                     return None;
                 }
 
-                state.notified = true;
+                state.notified = (state.notified + 1).min(state.spawned);
                 Some(state.into())
             });
 
@@ -267,7 +269,9 @@ impl Pool {
                         assert!(state.idle < state.spawned);
                     }
 
-                    if state.notified {
+                    let is_notified = state.notified > 0 || state.status == SyncStatus::Signaled;
+                    if is_notified {
+                        state.notified = state.notified.checked_sub(1).unwrap_or(0);
                         if state.status == SyncStatus::Signaled {
                             state.status = SyncStatus::Waking;
                         }
@@ -283,12 +287,12 @@ impl Pool {
                         return None;
                     }
 
-                    state.notified = false;
                     Some(state.into())
                 });
 
             if let Ok(state) = result.map(SyncState::from) {
-                if state.notified {
+                let is_notified = state.notified > 0 || state.status == SyncStatus::Signaled;
+                if is_notified {
                     break Some(is_waking || state.status == SyncStatus::Signaled);
                 }
 
@@ -324,7 +328,7 @@ impl Pool {
 
         self.idle_queue.wait(self, index, || {
             let sync: SyncState = self.sync.load(Ordering::Relaxed).into();
-            !sync.notified
+            sync.notified == 0 && sync.status != SyncStatus::Signaled
         });
     }
 
