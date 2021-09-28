@@ -6,3 +6,7 @@
 target/
 Cargo.lock
 NUL
+
+# Profiling
+flamegraph.svg
+perf.*
