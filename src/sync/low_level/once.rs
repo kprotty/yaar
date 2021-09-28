@@ -111,9 +111,7 @@ mod os {
 mod os {
     use super::super::{event::Futex, Spin};
     use std::{
-        hint::spin_loop,
         sync::atomic::{AtomicI32, Ordering},
-        thread,
     };
 
     const UNINIT: i32 = 0;

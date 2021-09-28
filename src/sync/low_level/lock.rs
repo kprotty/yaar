@@ -104,9 +104,7 @@ mod os {
 mod os {
     use super::super::{event::Futex, Spin};
     use std::{
-        hint::spin_loop,
         sync::atomic::{AtomicI32, Ordering},
-        thread,
     };
 
     const UNLOCKED: i32 = 0;
@@ -210,14 +208,12 @@ mod os {
     not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
 ))]
 mod os {
-    use super::super::AutoResetEvent;
+    use super::super::{AutoResetEvent, Spin};
     use std::{
         cell::Cell,
-        hint::spin_loop,
         pin::Pin,
         ptr::NonNull,
         sync::atomic::{AtomicUsize, Ordering},
-        thread,
     };
 
     const UNLOCKED: usize = 0;
@@ -264,7 +260,7 @@ mod os {
                 event: AutoResetEvent::default(),
             };
 
-            let mut spin = 0;
+            let mut spin = Spin::default();
             let waiter = unsafe { Pin::new_unchecked(&waiter) };
             let mut state = self.state.load(Ordering::Relaxed);
 
@@ -283,13 +279,7 @@ mod os {
                 }
 
                 let head = NonNull::new((state & WAITING) as *mut Waiter);
-                if head.is_none() && spin <= 10 {
-                    spin += 1;
-                    if spin <= 3 {
-                        (0..(1 << spin)).for_each(|_| spin_loop());
-                    } else {
-                        thread::yield_now();
-                    }
+                if head.is_none() && spin.yield_now() {
                     state = self.state.load(Ordering::Relaxed);
                     continue;
                 }
@@ -314,7 +304,7 @@ mod os {
                 unsafe {
                     Pin::new_unchecked(&waiter.event).wait();
                     state = self.state.load(Ordering::Relaxed);
-                    spin = 0;
+                    spin = Spin::default();
                 }
             }
         }

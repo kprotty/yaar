@@ -26,7 +26,10 @@ mod mutex_cond {
         state: UnsafeCell<MutexCondState>,
     }
 
-    impl<MC: MutexCond> Default for MutexCondAutoResetEvent<MC> {
+    unsafe impl<MC: Send> Send for MutexCondAutoResetEvent<MC> {}
+    unsafe impl<MC: Sync> Sync for MutexCondAutoResetEvent<MC> {}
+
+    impl<MC: Default> Default for MutexCondAutoResetEvent<MC> {
         fn default() -> Self {
             Self {
                 mutex_cond: MC::default(),
