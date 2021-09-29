@@ -192,10 +192,8 @@ impl IoPoller {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum IoState {
     Empty = 0,
-    Polling = 1,
-    Waiting = 2,
-    Signaled = 3,
-    Notified = 4,
+    Waiting = 1,
+    Notified = 2,
 }
 
 impl Into<u8> for IoState {
@@ -208,10 +206,8 @@ impl From<u8> for IoState {
     fn from(value: u8) -> Self {
         match value {
             0 => Self::Empty,
-            1 => Self::Polling,
-            2 => Self::Waiting,
-            3 => Self::Signaled,
-            4 => Self::Notified,
+            1 => Self::Waiting,
+            2 => Self::Notified,
             _ => unreachable!("invalid IoState value"),
         }
     }
@@ -221,6 +217,7 @@ struct IoDriverInner {
     io_state: AtomicU8,
     io_waker: mio::Waker,
     io_registry: mio::Registry,
+    io_polling: AtomicBool,
     io_poller: UnsafeCell<IoPoller>,
     io_node_cache: Lock<IoNodeCache>,
 }
@@ -244,6 +241,7 @@ impl Default for IoDriverInner {
             io_state: AtomicU8::new(0),
             io_waker,
             io_registry,
+            io_polling: AtomicBool::new(false),
             io_poller: UnsafeCell::new(io_poller),
             io_node_cache: Lock::new(IoNodeCache::default()),
         }
@@ -257,8 +255,7 @@ impl IoDriverInner {
                 Ordering::Release,
                 Ordering::Relaxed,
                 |io_state| match IoState::from(io_state) {
-                    IoState::Waiting => Some(IoState::Signaled.into()),
-                    IoState::Empty => Some(IoState::Notified.into()),
+                    IoState::Waiting => Some(IoState::Notified.into()),
                     _ => None,
                 },
             )
@@ -273,89 +270,84 @@ impl IoDriverInner {
     }
 
     pub fn poll(&self, io_driver: &IoDriver, timeout: Option<Duration>) -> bool {
-        let poll_io_state = match timeout {
-            Some(Duration::ZERO) => IoState::Polling,
-            _ => IoState::Waiting,
-        };
+        self.try_with_poller(io_driver, |io_poller| {
+            let mut notified = false;
+            let mut node_list = IoNodeList::default();
+            let is_blocking = !matches!(timeout, Some(Duration::ZERO));
 
-        self.io_state
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |io_state| {
-                if !io_driver.has_io_pending() {
-                    return None;
+            let mut io_state = self.io_state.load(Ordering::Acquire).into();
+            assert_eq!(io_state, IoState::Empty);
+
+            if is_blocking {
+                let io_state = IoState::Waiting.into();
+                self.io_state.store(io_state, Ordering::Relaxed);
+            }
+
+            io_poller.poll(&mut node_list, &mut notified, timeout);
+
+            io_state = self.io_state.load(Ordering::Relaxed).into();
+            if io_state == IoState::Waiting {
+                match self.io_state.compare_exchange(
+                    IoState::Waiting.into(),
+                    IoState::Empty.into(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => io_state = IoState::Empty,
+                    Err(e) => io_state = IoState::from(e),
+                }
+            }
+
+            if io_state == IoState::Notified {
+                while !notified {
+                    io_poller.poll(&mut node_list, &mut notified, None);
                 }
 
-                match IoState::from(io_state) {
-                    IoState::Empty => Some(poll_io_state.into()),
-                    IoState::Notified => Some(IoState::Empty.into()),
-                    _ => None,
-                }
-            })
-            .map(IoState::from)
-            .map(|mut io_state| unsafe {
-                match io_state {
-                    IoState::Notified => return,
-                    IoState::Empty => {}
-                    _ => unreachable!(),
-                }
+                let new_io_state = IoState::Empty as u8;
+                self.io_state.store(new_io_state, Ordering::Release);
+            }
 
-                let mut notified = false;
-                let mut node_list = IoNodeList::default();
-                let mut io_poller = NonNull::new(self.io_poller.get()).unwrap();
-
-                io_poller
-                    .as_mut()
-                    .poll(&mut node_list, &mut notified, timeout);
-
-                io_state = self.io_state.load(Ordering::Relaxed).into();
-                if io_state == poll_io_state {
-                    match self.io_state.compare_exchange(
-                        poll_io_state.into(),
-                        IoState::Empty.into(),
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => io_state = IoState::Empty,
-                        Err(e) => {
-                            io_state = e.into();
-                            assert_eq!(io_state, IoState::Signaled);
-                            assert_eq!(poll_io_state, IoState::Waiting);
-                        }
+            node_list
+        })
+        .map(|node_list| {
+            for node in node_list {
+                let node = unsafe { node.as_ref() };
+                let interest = node.interest.replace(None);
+                
+                if interest.map(|i| i.is_writable()).unwrap_or(false) {
+                    if let Some(waker) = node.writer.waker.wake() {
+                        io_driver.mark_io_end();
+                        waker.wake();
                     }
                 }
 
-                match io_state {
-                    IoState::Signaled => {
-                        while !notified {
-                            io_poller.as_mut().poll(&mut node_list, &mut notified, None);
-                        }
-
-                        let new_io_state = IoState::Empty.into();
-                        self.io_state.store(new_io_state, Ordering::Release);
-                    }
-                    IoState::Empty => {}
-                    _ => unreachable!(),
-                }
-
-                for node in node_list {
-                    let node = node.as_ref();
-                    let interest = node.interest.replace(None);
-                    
-                    if interest.map(|i| i.is_writable()).unwrap_or(false) {
-                        if let Some(waker) = node.writer.waker.wake() {
-                            io_driver.mark_io_end();
-                            waker.wake();
-                        }
-                    }
-
-                    if interest.map(|i| i.is_readable()).unwrap_or(false) {
-                        if let Some(waker) = node.reader.waker.wake() {
-                            io_driver.mark_io_end();
-                            waker.wake();
-                        }
+                if interest.map(|i| i.is_readable()).unwrap_or(false) {
+                    if let Some(waker) = node.reader.waker.wake() {
+                        io_driver.mark_io_end();
+                        waker.wake();
                     }
                 }
-            })
-            .is_ok()
+            }
+        })
+        .is_some()
+    }
+
+    fn try_with_poller<T>(&self, io_driver: &IoDriver, f: impl FnOnce(&mut IoPoller) -> T) -> Option<T> {
+        if !io_driver.has_io_pending() {
+            return None;
+        }
+
+        if self.io_polling.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        if self.io_polling.swap(true, Ordering::Acquire) {
+            return None;
+        }
+
+        let result = f(unsafe { &mut *self.io_poller.get() });
+        self.io_polling.store(false, Ordering::Release);
+        Some(result)
     }
 }
 
