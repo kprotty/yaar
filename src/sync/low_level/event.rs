@@ -306,6 +306,18 @@ mod os {
         }
     }
 
+    impl Drop for PosixMutexCond {
+        fn drop(&mut self) -> Self {
+            unsafe {
+                let rc = libc::pthread_mutex_destroy(self.mutex.get());
+                assert!(rc == 0 || rc == libc::EINVAL);
+
+                let rc = libc::pthread_cond_destroy(self.cond.get());
+                assert!(rc == 0 || rc == libc::EINVAL);
+            }
+        }
+    }
+
     impl super::mutex_cond::MutexCond for PosixMutexCond {
         unsafe fn lock(self: Pin<&Self>) {
             let this = Pin::into_inner_unchecked(self);
