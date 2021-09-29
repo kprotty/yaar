@@ -3,8 +3,9 @@ use super::{
     pool::{Pool, PoolEvent},
     queue::{Buffer, Injector, List, Popped},
     task::Task,
+    super::sync::low_level::ThreadLocal,
 };
-use std::{cell::RefCell, mem, pin::Pin, ptr::NonNull, rc::Rc, sync::Arc, time::Duration};
+use std::{ffi::c_void, mem, pin::Pin, ptr::NonNull, sync::Arc, marker::PhantomPinned, time::Duration};
 
 #[derive(Default)]
 pub struct Worker {
@@ -13,28 +14,44 @@ pub struct Worker {
     pub idle_node: IdleNode,
 }
 
+struct WorkerRef {
+    pool: Arc<Pool>,
+    index: usize,
+    _pinned: PhantomPinned,
+}
+
 impl Pool {
-    fn with_thread_local<T>(f: impl FnOnce(&mut Option<Rc<(Arc<Self>, usize)>>) -> T) -> T {
-        thread_local!(static POOL_REF: RefCell<Option<Rc<(Arc<Pool>, usize)>>> = RefCell::new(None));
-        POOL_REF.with(|pool_ref| f(&mut *pool_ref.borrow_mut()))
+    fn tls_pool_ref() -> &'static ThreadLocal {
+        static TLS_POOL_REF: ThreadLocal = ThreadLocal::new();
+        &TLS_POOL_REF
     }
 
-    pub fn with_worker(self: &Arc<Self>, index: usize) {
-        let old_pool_ref = Self::with_thread_local(|pool_ref| {
-            let new_pool_ref = Rc::new((Arc::clone(self), index));
-            mem::replace(pool_ref, Some(new_pool_ref))
-        });
+    pub fn with_worker(self: Arc<Self>, index: usize) {
+        unsafe {
+            let worker_ref = WorkerRef{
+                pool: self,
+                index,
+                _pinned: PhantomPinned,
+            };
 
-        self.run(index);
+            let worker_ref = Pin::new_unchecked(&worker_ref);
+            let old_ptr = Self::tls_pool_ref().with(|ptr| {
+                mem::replace(ptr, &*worker_ref as *const WorkerRef as *const c_void)
+            });
 
-        Self::with_thread_local(|pool_ref| {
-            *pool_ref = old_pool_ref;
-        })
+            worker_ref.pool.run(index);
+            Self::tls_pool_ref().with(|ptr| { *ptr = old_ptr });
+        }
     }
 
     pub fn with_current<T>(f: impl FnOnce(&Arc<Self>, usize) -> T) -> Option<T> {
-        Self::with_thread_local(|pool_ref| pool_ref.as_ref().map(|p| Rc::clone(p)))
-            .map(|pool_ref| f(&pool_ref.0, pool_ref.1))
+        Self::tls_pool_ref().with(|ptr| {
+            NonNull::new(*ptr as *const WorkerRef as *mut WorkerRef)
+                .map(|worker_ref| unsafe {
+                    let worker_ref = worker_ref.as_ref();
+                    f(&worker_ref.pool, worker_ref.index)
+                })
+        })
     }
 
     pub fn run(self: &Arc<Self>, index: usize) {

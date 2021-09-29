@@ -228,11 +228,13 @@ impl Pool {
                 if sync.spawned >= self.workers.len() {
                     return;
                 }
+                
+                let worker_index = sync.spawned;
+                let pool = Arc::clone(self);
 
                 // Run the first worker using the caller's thread
-                let worker_index = sync.spawned;
                 if worker_index == 0 {
-                    return self.with_worker(worker_index);
+                    return pool.with_worker(worker_index);
                 }
 
                 // Create a ThreadBuilder to spawn a worker thread
@@ -241,7 +243,6 @@ impl Pool {
                     builder = builder.stack_size(stack_size.get());
                 }
 
-                let pool = Arc::clone(self);
                 let join_handle = builder
                     .spawn(move || pool.with_worker(worker_index))
                     .expect("Failed to spawn a worker thread");
