@@ -105,12 +105,12 @@ impl AtomicWaker {
         Some(waker)
     }
 
-    pub unsafe fn register(&self, waker_ref: &Waker) -> WakerUpdate {
+    pub unsafe fn register(&self, waker_ref: &Waker) -> Result<Option<Waker>, Option<Waker>> {
         let state: WakerState = self.state.load(Ordering::Acquire).into();
         match state {
             WakerState::Empty | WakerState::Ready => {}
             WakerState::Updating => unreachable!("multiple threads trying to update Waker"),
-            WakerState::Waking => return WakerUpdate::Notified,
+            WakerState::Waking => return Ok(None),
         }
 
         if let Err(new_state) = self.state.compare_exchange(
@@ -121,7 +121,7 @@ impl AtomicWaker {
         ) {
             let new_state: WakerState = new_state.into();
             assert_eq!(new_state, WakerState::Waking);
-            return WakerUpdate::Notified;
+            return Ok(None);
         }
 
         let will_wake = (&*self.waker.get())
@@ -129,11 +129,9 @@ impl AtomicWaker {
             .map(|waker| waker_ref.will_wake(waker))
             .unwrap_or(false);
 
+        let mut waker = None;
         if !will_wake {
-            match mem::replace(&mut *self.waker.get(), Some(waker_ref.clone())) {
-                Some(_dropped_waker) => assert_eq!(state, WakerState::Ready),
-                None => assert_eq!(state, WakerState::Empty),
-            }
+            waker = mem::replace(&mut *self.waker.get(), Some(waker_ref.clone()));
         }
 
         if let Err(new_state) = self.state.compare_exchange(
@@ -145,14 +143,10 @@ impl AtomicWaker {
             let new_state: WakerState = new_state.into();
             assert_eq!(new_state, WakerState::Waking);
             *self.waker.get() = None;
-            return WakerUpdate::Interrupted;
+            return Ok(waker);
         }
 
-        match state {
-            WakerState::Ready => WakerUpdate::Replaced,
-            WakerState::Empty => WakerUpdate::Empty,
-            _ => unreachable!(),
-        }
+        Err(waker)
     }
 
     pub unsafe fn reset(&self) {

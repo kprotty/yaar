@@ -155,7 +155,7 @@ impl Pool {
             injecting: AtomicUsize::new(0),
             idle_queue: IdleQueue::default(),
             stack_size: stack_size,
-            io_driver: Arc::new(IoDriver::default()),
+            io_driver: IoDriver::new(),
             workers: (0..num_threads)
                 .map(|_| Worker::default())
                 .collect::<Box<[Worker]>>()

@@ -344,8 +344,7 @@ impl<F: Future> TaskFuture<F> {
             },
         };
 
-        let waker_update = Self::with(task, |this| this.waker.register(waker_ref));
-        if matches!(waker_update, WakerUpdate::Empty | WakerUpdate::Replaced) {
+        if Self::with(task, |this| this.waker.register(waker_ref)).is_err() {
             return Poll::Pending;
         }
 

@@ -237,12 +237,14 @@ impl WaitQueue {
                     let waker = Waker::from_raw(raw_waker);
 
                     match node.waker.register(&waker) {
-                        WakerUpdate::Empty => {
+                        Ok(_) => {},
+                        Err(None) => {
                             unreachable!("waker with event when not already waiting")
                         }
-                        WakerUpdate::Replaced => event.wait(),
-                        WakerUpdate::Interrupted => {}
-                        WakerUpdate::Notified => {}
+                        Err(Some(waker)) => {
+                            std::mem::drop(waker);
+                            event.wait();
+                        },
                     }
                 }
             }
@@ -266,7 +268,7 @@ impl WaitQueue {
                     .expect("WaitFuture polled after completion");
 
                 let waker_update = unsafe { node.waker.register(ctx.waker()) };
-                if matches!(waker_update, WakerUpdate::Interrupted | WakerUpdate::Notified) {
+                if waker_update.is_ok() {
                     return Poll::Ready(WakeToken(node.token.get().0));
                 }
 

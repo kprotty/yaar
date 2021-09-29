@@ -361,18 +361,25 @@ pub struct IoDriver {
 unsafe impl Send for IoDriver {}
 unsafe impl Sync for IoDriver {}
 
-impl Default for IoDriver {
-    fn default() -> Self {
-        Self {
+impl IoDriver {
+    pub fn new() -> Arc<IoDriver> {
+        let io_driver = Arc::new(Self {
             once: Once::new(),
             pending: AtomicIsize::new(0),
             initialized: AtomicBool::new(false),
             inner: UnsafeCell::new(None),
-        }
-    }
-}
+        });
 
-impl IoDriver {
+        let iod = io_driver.clone();
+        std::thread::spawn(move || loop {
+            let pending = iod.pending.load(Ordering::SeqCst);
+            println!("pending: {}", pending);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+
+        io_driver
+    }
+
     fn mark_io_begin(&self) {
         self.pending.fetch_add(1, Ordering::SeqCst);
     }
@@ -498,13 +505,19 @@ impl<S: mio::event::Source> IoSource<S> {
         loop {
             if io_waker.blocking.get() {
                 match io_waker.waker.register(waker) {
-                    WakerUpdate::Empty => {
+                    Err(None) => {
                         self.io_driver.mark_io_begin();
                         return Poll::Pending;
                     },
-                    WakerUpdate::Replaced => return Poll::Pending,
-                    WakerUpdate::Interrupted => self.io_driver.mark_io_end(),
-                    WakerUpdate::Notified => {},
+                    Err(Some(waker)) => {
+                        mem::drop(waker);
+                        return Poll::Pending;
+                    },
+                    Ok(Some(waker)) => {
+                        self.io_driver.mark_io_end();
+                        mem::drop(waker);
+                    },
+                    Ok(None) => {}
                 }
 
                 io_waker.blocking.set(false);
