@@ -18,10 +18,24 @@ use std::{
     time::Duration,
 };
 
+struct IoWaker {
+    waker: AtomicWaker,
+    blocking: Cell<bool>,
+}
+
+impl IoWaker {
+    const fn new() -> Self {
+        Self {
+            waker: AtomicWaker::new(),
+            blocking: Cell::new(false),
+        }
+    }
+}
+
 struct IoNode {
     next: Cell<Option<NonNull<Self>>>,
-    reader: AtomicWaker,
-    writer: AtomicWaker,
+    reader: IoWaker,
+    writer: IoWaker,
     _pinned: PhantomPinned,
 }
 
@@ -39,8 +53,8 @@ impl IoNodeBlock {
     unsafe fn alloc(next: Option<Pin<Box<Self>>>) -> Pin<Box<Self>> {
         const EMPTY_NODE: IoNode = IoNode {
             next: Cell::new(None),
-            reader: AtomicWaker::new(),
-            writer: AtomicWaker::new(),
+            reader: IoWaker::new(),
+            writer: IoWaker::new(),
             _pinned: PhantomPinned,
         };
 
@@ -113,11 +127,11 @@ impl IoPoller {
             };
 
             if event.is_writable() || event.is_write_closed() || event.is_error() {
-                node.writer.wake();
+                node.writer.waker.wake();
             }
 
             if event.is_readable() || event.is_read_closed() || event.is_error() {
-                node.reader.wake();
+                node.reader.waker.wake();
             }
         }
     }
@@ -415,7 +429,7 @@ impl<S: mio::event::Source> IoSource<S> {
         .expect("IoSource::new() called outside the runtime")
     }
 
-    fn to_waker(&self, kind: IoKind) -> &AtomicWaker {
+    fn to_waker(&self, kind: IoKind) -> &IoWaker {
         unsafe {
             match kind {
                 IoKind::Read => &self.io_node.as_ref().reader,
@@ -433,10 +447,15 @@ impl<S: mio::event::Source> IoSource<S> {
     ) -> Poll<io::Result<T>> {
         let io_waker = self.to_waker(kind);
         loop {
-            match io_waker.update(Some(waker)) {
-                WakerUpdate::New => return Poll::Pending,
-                WakerUpdate::Replaced => return Poll::Pending,
-                WakerUpdate::Notified => {}
+            if io_waker.blocking.get() {
+                match io_waker.waker.update(Some(waker)) {
+                    WakerUpdate::New => return Poll::Pending,
+                    WakerUpdate::Replaced => return Poll::Pending,
+                    WakerUpdate::Notified => {
+                        io_waker.blocking.set(false);
+                        io_waker.waker.reset();
+                    }
+                }
             }
 
             if yield_now() {
@@ -448,7 +467,7 @@ impl<S: mio::event::Source> IoSource<S> {
                 match do_io() {
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        io_waker.reset();
+                        io_waker.blocking.set(true);
                         break;
                     }
                     result => return Poll::Ready(result),
@@ -459,7 +478,7 @@ impl<S: mio::event::Source> IoSource<S> {
 
     pub unsafe fn detach_io(&self, kind: IoKind) {
         let io_waker = self.to_waker(kind);
-        io_waker.update(None);
+        io_waker.waker.update(None);
     }
 
     pub unsafe fn wait_for<'a>(&'a self, kind: IoKind) -> impl Future<Output = ()> + 'a {
