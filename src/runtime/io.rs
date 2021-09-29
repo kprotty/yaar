@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicIsize, Ordering},
         Arc,
     },
     task::{Context, Poll, Waker},
@@ -336,19 +336,22 @@ impl IoDriverInner {
                     _ => unreachable!(),
                 }
 
-                let io_ready = || {
-                    io_driver.mark_io_end();
-                };
-
                 for node in node_list {
                     let node = node.as_ref();
                     let interest = node.interest.replace(None);
-
+                    
                     if interest.map(|i| i.is_writable()).unwrap_or(false) {
-                        node.writer.waker.wake_with(io_ready);
+                        if let Some(waker) = node.writer.waker.wake() {
+                            io_driver.mark_io_end();
+                            waker.wake();
+                        }
                     }
+
                     if interest.map(|i| i.is_readable()).unwrap_or(false) {
-                        node.reader.waker.wake_with(io_ready);
+                        if let Some(waker) = node.reader.waker.wake() {
+                            io_driver.mark_io_end();
+                            waker.wake();
+                        }
                     }
                 }
             })
@@ -358,7 +361,7 @@ impl IoDriverInner {
 
 pub struct IoDriver {
     once: Once,
-    pending: AtomicUsize,
+    pending: AtomicIsize,
     initialized: AtomicBool,
     inner: UnsafeCell<Option<IoDriverInner>>,
 }
@@ -370,7 +373,7 @@ impl Default for IoDriver {
     fn default() -> Self {
         Self {
             once: Once::new(),
-            pending: AtomicUsize::new(0),
+            pending: AtomicIsize::new(0),
             initialized: AtomicBool::new(false),
             inner: UnsafeCell::new(None),
         }
@@ -379,18 +382,15 @@ impl Default for IoDriver {
 
 impl IoDriver {
     fn mark_io_begin(&self) {
-        let pending = self.pending.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(pending, usize::MAX);
+        self.pending.fetch_add(1, Ordering::SeqCst);
     }
 
     fn mark_io_end(&self) {
-        let pending = self.pending.fetch_sub(1, Ordering::Relaxed);
-        assert_ne!(pending, 0);
+        self.pending.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn has_io_pending(&self) -> bool {
-        let pending = self.pending.load(Ordering::Relaxed);
-        pending > 0
+        self.pending.load(Ordering::SeqCst) > 0
     }
 
     pub fn notify(&self) -> bool {
@@ -509,13 +509,14 @@ impl<S: mio::event::Source> IoSource<S> {
                     WakerUpdate::Empty => {
                         self.io_driver.mark_io_begin();
                         return Poll::Pending;
-                    }
+                    },
                     WakerUpdate::Replaced => return Poll::Pending,
-                    WakerUpdate::Notified => {
-                        io_waker.blocking.set(false);
-                        io_waker.waker.reset();
-                    }
+                    WakerUpdate::Interrupted => self.io_driver.mark_io_end(),
+                    WakerUpdate::Notified => {},
                 }
+
+                io_waker.blocking.set(false);
+                io_waker.waker.reset();
             }
 
             if yield_now() {
@@ -544,10 +545,9 @@ impl<S: mio::event::Source> IoSource<S> {
             }
         };
 
-        match io_waker.waker.detach() {
-            WakerUpdate::Empty => {}
-            WakerUpdate::Replaced => self.io_driver.mark_io_end(),
-            WakerUpdate::Notified => {}
+        if let Some(waker) = io_waker.waker.detach() {
+            self.io_driver.mark_io_end();
+            mem::drop(waker);
         }
     }
 

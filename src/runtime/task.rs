@@ -291,7 +291,7 @@ impl<F: Future> TaskFuture<F> {
             };
 
             this.state.store(new_state.into(), Ordering::Release);
-            this.waker.wake();
+            this.waker.wake().map(|w| w.wake()).unwrap_or(())
         });
 
         pool.mark_task_end();
@@ -335,33 +335,31 @@ impl<F: Future> TaskFuture<F> {
     }
 
     unsafe fn on_join(task: NonNull<Task>, context: Option<(&Waker, *mut ())>) -> Poll<()> {
-        let waker_ref = context.map(|c| c.0);
-        let output_ptr = context
-            .and_then(|c| NonNull::new(c.1))
-            .map(|p| p.cast::<F::Output>());
+        let (waker_ref, output_ptr) = match context {
+            Some(context) => context,
+            None => return {
+                Self::with(task, |this| mem::drop(this.waker.detach()));
+                Self::on_drop(task);
+                Poll::Ready(())
+            },
+        };
 
-        let waker_update = Self::with(task, |this| match waker_ref {
-            Some(waker_ref) => this.waker.register(waker_ref),
-            None => this.waker.detach(),
-        });
-
-        if waker_ref.is_some() && waker_update != WakerUpdate::Notified {
+        let waker_update = Self::with(task, |this| this.waker.register(waker_ref));
+        if matches!(waker_update, WakerUpdate::Empty | WakerUpdate::Replaced) {
             return Poll::Pending;
         }
 
-        if let Some(output_ptr) = output_ptr {
-            Self::with(task, |this| {
-                let state: TaskState = this.state.load(Ordering::Acquire).into();
-                assert_eq!(state.status, TaskStatus::Ready);
-                assert_eq!(state.pool, None);
+        Self::with(task, |this| {
+            let state: TaskState = this.state.load(Ordering::Acquire).into();
+            assert_eq!(state.status, TaskStatus::Ready);
+            assert_eq!(state.pool, None);
 
-                match mem::replace(&mut *this.data.get(), TaskData::Joined) {
-                    TaskData::Polling(_) => unreachable!("TaskData joined while still polling"),
-                    TaskData::Ready(output) => ptr::write(output_ptr.as_ptr(), output),
-                    TaskData::Joined => unreachable!("TaskData already joined when joining"),
-                }
-            });
-        }
+            match mem::replace(&mut *this.data.get(), TaskData::Joined) {
+                TaskData::Polling(_) => unreachable!("TaskData joined while still polling"),
+                TaskData::Ready(output) => ptr::write(output_ptr as *mut _, output),
+                TaskData::Joined => unreachable!("TaskData already joined when joining"),
+            }
+        });
 
         Self::on_drop(task);
         Poll::Ready(())

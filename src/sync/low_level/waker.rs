@@ -9,6 +9,7 @@ use std::{
 pub enum WakerUpdate {
     Empty,
     Replaced,
+    Interrupted,
     Notified,
 }
 
@@ -49,27 +50,18 @@ impl AtomicWaker {
         }
     }
 
-    pub fn wake(&self) {
-        self.wake_with(|| {})
-    }
-
-    pub fn wake_with(&self, before_wake: impl FnOnce()) {
+    pub fn wake(&self) -> Option<Waker> {
         let state: WakerState = self
             .state
             .swap(WakerState::Waking as u8, Ordering::AcqRel)
             .into();
 
         if state == WakerState::Ready {
-            before_wake();
-            mem::replace(unsafe { &mut *self.waker.get() }, None)
-                .expect("waker state was Ready without a Waker")
-                .wake();
+            return Some(mem::replace(unsafe { &mut *self.waker.get() }, None)
+            .expect("waker state was Ready without a Waker"));
         }
-    }
 
-    pub unsafe fn reset(&self) {
-        let new_state = WakerState::Empty as u8;
-        self.state.store(new_state, Ordering::Relaxed);
+        None
     }
 
     pub fn is_notified(&self) -> bool {
@@ -77,13 +69,13 @@ impl AtomicWaker {
         state == WakerState::Waking
     }
 
-    pub fn detach(&self) -> WakerUpdate {
+    pub fn detach(&self) -> Option<Waker> {
         let state: WakerState = self.state.load(Ordering::Acquire).into();
         match state {
-            WakerState::Empty => return WakerUpdate::Empty,
+            WakerState::Empty => return None,
             WakerState::Ready => {}
             WakerState::Updating => unreachable!("multiple threads trying to update Waker"),
-            WakerState::Waking => return WakerUpdate::Notified,
+            WakerState::Waking => return None,
         }
 
         if let Err(new_state) = self.state.compare_exchange(
@@ -94,13 +86,12 @@ impl AtomicWaker {
         ) {
             let new_state: WakerState = new_state.into();
             assert_eq!(new_state, WakerState::Waking);
-            return WakerUpdate::Notified;
+            return None;
         }
 
         let waker = mem::replace(unsafe { &mut *self.waker.get() }, None)
             .expect("detach consumed an invalid waker");
 
-        let mut updated = WakerUpdate::Replaced;
         if let Err(new_state) = self.state.compare_exchange(
             WakerState::Updating as u8,
             WakerState::Empty as u8,
@@ -109,14 +100,12 @@ impl AtomicWaker {
         ) {
             let new_state: WakerState = new_state.into();
             assert_eq!(new_state, WakerState::Waking);
-            updated = WakerUpdate::Notified;
         }
 
-        mem::drop(waker);
-        updated
+        Some(waker)
     }
 
-    pub fn register(&self, waker_ref: &Waker) -> WakerUpdate {
+    pub unsafe fn register(&self, waker_ref: &Waker) -> WakerUpdate {
         let state: WakerState = self.state.load(Ordering::Acquire).into();
         match state {
             WakerState::Empty | WakerState::Ready => {}
@@ -135,13 +124,13 @@ impl AtomicWaker {
             return WakerUpdate::Notified;
         }
 
-        let will_wake = (unsafe { &*self.waker.get() })
+        let will_wake = (&*self.waker.get())
             .as_ref()
             .map(|waker| waker_ref.will_wake(waker))
             .unwrap_or(false);
 
         if !will_wake {
-            match mem::replace(unsafe { &mut *self.waker.get() }, Some(waker_ref.clone())) {
+            match mem::replace(&mut *self.waker.get(), Some(waker_ref.clone())) {
                 Some(_dropped_waker) => assert_eq!(state, WakerState::Ready),
                 None => assert_eq!(state, WakerState::Empty),
             }
@@ -155,7 +144,8 @@ impl AtomicWaker {
         ) {
             let new_state: WakerState = new_state.into();
             assert_eq!(new_state, WakerState::Waking);
-            return WakerUpdate::Notified;
+            *self.waker.get() = None;
+            return WakerUpdate::Interrupted;
         }
 
         match state {
@@ -163,5 +153,10 @@ impl AtomicWaker {
             WakerState::Empty => WakerUpdate::Empty,
             _ => unreachable!(),
         }
+    }
+
+    pub unsafe fn reset(&self) {
+        let new_state = WakerState::Empty as u8;
+        self.state.store(new_state, Ordering::Relaxed);
     }
 }

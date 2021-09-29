@@ -241,6 +241,7 @@ impl WaitQueue {
                             unreachable!("waker with event when not already waiting")
                         }
                         WakerUpdate::Replaced => event.wait(),
+                        WakerUpdate::Interrupted => {}
                         WakerUpdate::Notified => {}
                     }
                 }
@@ -264,7 +265,8 @@ impl WaitQueue {
                     .take()
                     .expect("WaitFuture polled after completion");
 
-                if node.waker.register(ctx.waker()) == WakerUpdate::Notified {
+                let waker_update = unsafe { node.waker.register(ctx.waker()) };
+                if matches!(waker_update, WakerUpdate::Interrupted | WakerUpdate::Notified) {
                     return Poll::Ready(WakeToken(node.token.get().0));
                 }
 
@@ -345,7 +347,7 @@ impl WaitQueue {
         while let Some(node) = nodes {
             unsafe {
                 nodes = node.as_ref().next.get();
-                node.as_ref().waker.wake();
+                node.as_ref().waker.wake().map(|w| w.wake()).unwrap_or(())
                 // ^ potentially dangling reference but
                 // rust stdlib does this too & theres no obvious fix
             }
