@@ -39,6 +39,17 @@ struct IoNode {
     _pinned: PhantomPinned,
 }
 
+impl IoNode {
+    const fn new() -> Self {
+        Self {
+            next: Cell::new(None),
+            reader: IoWaker::new(),
+            writer: IoWaker::new(),
+            _pinned: PhantomPinned,
+        }
+    }
+}
+
 struct IoNodeBlock {
     _next: Cell<Option<Pin<Box<Self>>>>,
     nodes: [IoNode; Self::BLOCK_COUNT],
@@ -51,12 +62,7 @@ impl IoNodeBlock {
 
 impl IoNodeBlock {
     unsafe fn alloc(next: Option<Pin<Box<Self>>>) -> Pin<Box<Self>> {
-        const EMPTY_NODE: IoNode = IoNode {
-            next: Cell::new(None),
-            reader: IoWaker::new(),
-            writer: IoWaker::new(),
-            _pinned: PhantomPinned,
-        };
+        const EMPTY_NODE: IoNode = IoNode::new();
 
         let block = Pin::into_inner_unchecked(Box::pin(Self {
             _next: Cell::new(next),
@@ -109,6 +115,15 @@ impl IoNodeCache {
 struct IoPoller {
     io_poll: mio::Poll,
     io_events: mio::Events,
+}
+
+impl Default for IoPoller {
+    fn default() -> Self {
+        Self {
+            io_poll: mio::Poll::new().expect("failed to create os poller"),
+            io_events: mio::Events::with_capacity(1024),
+        }
+    }
 }
 
 impl IoPoller {
@@ -169,11 +184,7 @@ unsafe impl Sync for IoDriverInner {}
 
 impl Default for IoDriverInner {
     fn default() -> Self {
-        let io_poller = IoPoller {
-            io_poll: mio::Poll::new().expect("failed to create os poller"),
-            io_events: mio::Events::with_capacity(1024),
-        };
-
+        let io_poller = IoPoller::default();
         let io_registry = io_poller
             .io_poll
             .registry()

@@ -49,7 +49,7 @@ impl AtomicWaker {
         }
     }
 
-    pub fn wake(&self) {
+    pub fn wake(&self) -> bool {
         let state: WakerState = self
             .state
             .swap(WakerState::Waking as u8, Ordering::AcqRel)
@@ -60,6 +60,8 @@ impl AtomicWaker {
                 .expect("waker state was Ready without a Waker")
                 .wake();
         }
+
+        state == WakerState::Ready
     }
 
     pub unsafe fn reset(&self) {

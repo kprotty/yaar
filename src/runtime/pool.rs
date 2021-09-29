@@ -228,7 +228,7 @@ impl Pool {
                 if sync.spawned >= self.workers.len() {
                     return;
                 }
-                
+
                 let worker_index = sync.spawned;
                 let pool = Arc::clone(self);
 
