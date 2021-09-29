@@ -340,7 +340,10 @@ impl<F: Future> TaskFuture<F> {
             .and_then(|c| NonNull::new(c.1))
             .map(|p| p.cast::<F::Output>());
 
-        let waker_update = Self::with(task, |this| this.waker.update(waker_ref));
+        let waker_update = Self::with(task, |this| match waker_ref {
+            Some(waker_ref) => this.waker.register(waker_ref),
+            None => this.waker.detach(),
+        });
 
         if waker_ref.is_some() && waker_update != WakerUpdate::Notified {
             return Poll::Pending;

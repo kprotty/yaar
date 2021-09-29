@@ -236,8 +236,8 @@ impl WaitQueue {
                     let raw_waker = RawWaker::new(ptr, &EVENT_VTABLE);
                     let waker = Waker::from_raw(raw_waker);
 
-                    match node.waker.update(Some(&waker)) {
-                        WakerUpdate::New => {
+                    match node.waker.register(&waker) {
+                        WakerUpdate::Empty => {
                             unreachable!("waker with event when not already waiting")
                         }
                         WakerUpdate::Replaced => event.wait(),
@@ -264,7 +264,7 @@ impl WaitQueue {
                     .take()
                     .expect("WaitFuture polled after completion");
 
-                if node.waker.update(Some(ctx.waker())) == WakerUpdate::Notified {
+                if node.waker.register(ctx.waker()) == WakerUpdate::Notified {
                     return Poll::Ready(WakeToken(node.token.get().0));
                 }
 

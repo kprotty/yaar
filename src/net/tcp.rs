@@ -8,7 +8,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
 pub struct TcpStream {
@@ -383,15 +383,13 @@ impl TcpListener {
         &'a mut self,
     ) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + 'a {
         struct Accept<'a> {
-            listener: Option<&'a TcpListener>,
+            listener: Option<&'a mut TcpListener>,
         }
 
         impl<'a> Drop for Accept<'a> {
             fn drop(&mut self) {
-                if let Some(listener) = self.listener {
-                    unsafe {
-                        listener.source.detach_io(IoKind::Read);
-                    }
+                if let Some(listener) = self.listener.take() {
+                    listener.source.detach_io(IoKind::Read);
                 }
             }
         }
@@ -400,16 +398,19 @@ impl TcpListener {
             type Output = io::Result<(TcpStream, SocketAddr)>;
 
             fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-                let listener = self.listener.expect("Accept polled after completion");
-                let polled = unsafe { listener.poll_accept_inner(ctx.waker()) };
+                let listener = self
+                    .listener
+                    .take()
+                    .expect("Accept polled after completion");
 
-                match polled {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(result) => {
-                        self.listener = None;
-                        Poll::Ready(result)
-                    }
+                let mut listener = Pin::new(listener);
+                let polled = listener.as_mut().poll_accept(ctx);
+
+                if matches!(polled, Poll::Pending) {
+                    self.listener = Some(listener.get_mut());
                 }
+
+                polled
             }
         }
 
@@ -422,17 +423,15 @@ impl TcpListener {
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
     ) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
-        unsafe { self.poll_accept_inner(ctx.waker()) }
-    }
-
-    unsafe fn poll_accept_inner(&self, waker: &Waker) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
-        self.fairness
-            .borrow_mut()
-            .poll_io(&self.source, IoKind::Read, waker, || {
-                self.source
-                    .as_ref()
-                    .accept()
-                    .map(|(stream, addr)| (TcpStream::new(stream), addr))
-            })
+        unsafe {
+            self.fairness
+                .borrow_mut()
+                .poll_io(&self.source, IoKind::Read, ctx.waker(), || {
+                    self.source
+                        .as_ref()
+                        .accept()
+                        .map(|(stream, addr)| (TcpStream::new(stream), addr))
+                })
+        }
     }
 }
