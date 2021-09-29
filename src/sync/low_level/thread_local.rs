@@ -1,5 +1,10 @@
 use super::Once;
-use std::{ffi::c_void, mem::MaybeUninit, cell::{Cell, UnsafeCell}, ptr};
+use std::{
+    cell::{Cell, UnsafeCell},
+    ffi::c_void,
+    mem::MaybeUninit,
+    ptr,
+};
 
 pub struct ThreadLocal {
     once: Once,
@@ -83,7 +88,7 @@ mod os {
                     let index = TlsAlloc();
                     assert_ne!(index, u32::MAX);
                     index
-                }
+                },
             }
         }
     }
@@ -99,9 +104,7 @@ mod os {
 
     impl ThreadLocalKey {
         pub fn get(&self) -> *const c_void {
-            unsafe {
-                TlsGetValue(self.index)
-            }
+            unsafe { TlsGetValue(self.index) }
         }
 
         pub fn set(&self, ptr: *const c_void) {
@@ -115,7 +118,7 @@ mod os {
 
 #[cfg(unix)]
 mod os {
-    use std::{ffi::c_void, mem::MaybeUninit, cell::UnsafeCell};
+    use std::{cell::UnsafeCell, ffi::c_void, mem::MaybeUninit};
 
     pub struct ThreadLocalKey {
         key: UnsafeCell<libc::pthread_key_t>,
@@ -132,7 +135,7 @@ mod os {
                     let rc = libc::pthread_key_create(key.as_mut_ptr(), None);
                     assert_eq!(rc, 0);
                     key.assume_init()
-                })
+                }),
             }
         }
     }

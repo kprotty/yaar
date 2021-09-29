@@ -1,11 +1,13 @@
 use super::{
+    super::sync::low_level::ThreadLocal,
     idle::IdleNode,
     pool::{Pool, PoolEvent},
     queue::{Buffer, Injector, List, Popped},
     task::Task,
-    super::sync::low_level::ThreadLocal,
 };
-use std::{ffi::c_void, mem, pin::Pin, ptr::NonNull, sync::Arc, marker::PhantomPinned, time::Duration};
+use std::{
+    ffi::c_void, marker::PhantomPinned, mem, pin::Pin, ptr::NonNull, sync::Arc, time::Duration,
+};
 
 #[derive(Default)]
 pub struct Worker {
@@ -28,29 +30,27 @@ impl Pool {
 
     pub fn with_worker(self: Arc<Self>, index: usize) {
         unsafe {
-            let worker_ref = WorkerRef{
+            let worker_ref = WorkerRef {
                 pool: self,
                 index,
                 _pinned: PhantomPinned,
             };
 
             let worker_ref = Pin::new_unchecked(&worker_ref);
-            let old_ptr = Self::tls_pool_ref().with(|ptr| {
-                mem::replace(ptr, &*worker_ref as *const WorkerRef as *const c_void)
-            });
+            let old_ptr = Self::tls_pool_ref()
+                .with(|ptr| mem::replace(ptr, &*worker_ref as *const WorkerRef as *const c_void));
 
             worker_ref.pool.run(index);
-            Self::tls_pool_ref().with(|ptr| { *ptr = old_ptr });
+            Self::tls_pool_ref().with(|ptr| *ptr = old_ptr);
         }
     }
 
     pub fn with_current<T>(f: impl FnOnce(&Arc<Self>, usize) -> T) -> Option<T> {
         Self::tls_pool_ref().with(|ptr| {
-            NonNull::new(*ptr as *const WorkerRef as *mut WorkerRef)
-                .map(|worker_ref| unsafe {
-                    let worker_ref = worker_ref.as_ref();
-                    f(&worker_ref.pool, worker_ref.index)
-                })
+            NonNull::new(*ptr as *const WorkerRef as *mut WorkerRef).map(|worker_ref| unsafe {
+                let worker_ref = worker_ref.as_ref();
+                f(&worker_ref.pool, worker_ref.index)
+            })
         })
     }
 
