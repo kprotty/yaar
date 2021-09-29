@@ -39,7 +39,7 @@ mod os {
                 ) -> i32 {
                     let this = unsafe { &mut *(param as *mut Self) };
                     (this.0.take().unwrap())();
-                    0
+                    1 // TRUE
                 }
             }
 
@@ -53,7 +53,7 @@ mod os {
                 )
             };
 
-            assert_eq!(0, result)
+            assert_ne!(0, result)
         }
     }
 }
