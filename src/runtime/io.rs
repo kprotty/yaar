@@ -196,6 +196,7 @@ impl IoWaker {
 
                 if state.stored {
                     state.slot = !state.slot;
+                    state.stored = false;
                 }
 
                 Some(state.into())
@@ -208,7 +209,9 @@ impl IoWaker {
 
                 let slot_ptr = self.wakers[state.slot as usize].get();
                 let waker = mem::replace(&mut *slot_ptr, None);
-                mem::drop(waker.expect("IoWaker wake & stored when empty"));
+                let waker = waker.expect("IoWaker wake & stored when empty");
+
+                waker.wake();
                 true
             })
             .unwrap_or(false)
@@ -411,12 +414,15 @@ impl IoReactor {
 
             let mut notified = false;
             let mut resumed = poller.poll(&mut notified, timeout);
-            assert!(!notified);
 
-            if is_waiting && !Self::try_transition_to(&self.waiting, false, Ordering::AcqRel) {
-                while !notified {
-                    resumed += poller.poll(&mut notified, timeout);
+            if is_waiting {
+                if !Self::try_transition_to(&self.waiting, false, Ordering::AcqRel) {
+                    while !notified {
+                        resumed += poller.poll(&mut notified, None);
+                    }
                 }
+            } else {
+                assert!(!notified);
             }
 
             if resumed > 0 {
