@@ -42,13 +42,6 @@ unsafe impl Send for AtomicWaker {}
 unsafe impl Sync for AtomicWaker {}
 
 impl AtomicWaker {
-    pub const fn new() -> Self {
-        Self {
-            state: AtomicU8::new(WakerState::Empty as u8),
-            waker: UnsafeCell::new(None),
-        }
-    }
-
     pub fn wake(&self) -> bool {
         let state: WakerState = self
             .state
@@ -62,11 +55,6 @@ impl AtomicWaker {
         }
 
         state == WakerState::Ready
-    }
-
-    pub unsafe fn reset(&self) {
-        let new_state = WakerState::Empty as u8;
-        self.state.store(new_state, Ordering::Relaxed);
     }
 
     pub fn is_notified(&self) -> bool {

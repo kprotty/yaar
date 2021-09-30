@@ -1,4 +1,7 @@
-use super::super::runtime::io::{IoFairness, IoKind, IoSource};
+use super::super::runtime::{
+    io::{IoFairness, IoKind, IoSource},
+    pool::Pool,
+};
 use std::{
     cell::RefCell,
     fmt,
@@ -10,6 +13,14 @@ use std::{
     sync::Arc,
     task::{Context, Poll, Waker},
 };
+
+fn to_io_source<S: mio::event::Source>(source: S) -> IoSource<S> {
+    Pool::with_current(|pool, _index| {
+        let driver = Arc::clone(&pool.io_driver);
+        IoSource::new(source, driver)
+    })
+    .expect("tried to use I/O primitive outside of the runtime")
+}
 
 pub struct TcpStream {
     source: IoSource<mio::net::TcpStream>,
@@ -61,12 +72,9 @@ impl tokio::io::AsyncWrite for TcpStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         unsafe {
-            self.source.poll_io(
-                IoKind::Write,
-                ctx.waker(),
-                || false,
-                || self.source.as_ref().write(buf),
-            )
+            self.source.poll_io(IoKind::Write, ctx.waker(), || {
+                self.source.as_ref().write(buf)
+            })
         }
     }
 
@@ -76,12 +84,9 @@ impl tokio::io::AsyncWrite for TcpStream {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         unsafe {
-            self.source.poll_io(
-                IoKind::Write,
-                ctx.waker(),
-                || false,
-                || self.source.as_ref().write_vectored(bufs),
-            )
+            self.source.poll_io(IoKind::Write, ctx.waker(), || {
+                self.source.as_ref().write_vectored(bufs)
+            })
         }
     }
 
@@ -103,7 +108,7 @@ impl tokio::io::AsyncWrite for TcpStream {
 impl TcpStream {
     fn new(stream: mio::net::TcpStream) -> Self {
         Self {
-            source: IoSource::new(stream),
+            source: to_io_source(stream),
             reader: RefCell::new(IoFairness::default()),
         }
     }
@@ -314,12 +319,9 @@ impl tokio::io::AsyncWrite for TcpWriter {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         unsafe {
-            self.stream.source.poll_io(
-                IoKind::Write,
-                ctx.waker(),
-                || false,
-                || self.stream.source.as_ref().write(buf),
-            )
+            self.stream.source.poll_io(IoKind::Write, ctx.waker(), || {
+                self.stream.source.as_ref().write(buf)
+            })
         }
     }
 
@@ -329,12 +331,9 @@ impl tokio::io::AsyncWrite for TcpWriter {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         unsafe {
-            self.stream.source.poll_io(
-                IoKind::Write,
-                ctx.waker(),
-                || false,
-                || self.stream.source.as_ref().write_vectored(bufs),
-            )
+            self.stream.source.poll_io(IoKind::Write, ctx.waker(), || {
+                self.stream.source.as_ref().write_vectored(bufs)
+            })
         }
     }
 
@@ -374,7 +373,7 @@ impl TcpListener {
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
         let source = mio::net::TcpListener::bind(addr)?;
         Ok(Self {
-            source: IoSource::new(source),
+            source: to_io_source(source),
             fairness: RefCell::new(IoFairness::default()),
         })
     }
