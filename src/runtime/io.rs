@@ -331,31 +331,27 @@ impl IoPoller {
             return 0;
         }
 
-        self.events
-            .iter()
-            .map(|event| {
+        let mut resumed = 0;
+        for event in &self.events {
+            unsafe {
                 let node = match NonNull::new(event.token().0 as *mut IoNode) {
-                    Some(node_ptr) => unsafe { Pin::new_unchecked(&*node_ptr.as_ptr()) },
+                    Some(node_ptr) => Pin::new_unchecked(&*node_ptr.as_ptr()),
                     None => {
                         *notified = true;
-                        return 0;
+                        continue;
                     }
                 };
 
-                let mut notified = [false, false];
-                notified[IoKind::Read as usize] =
-                    event.is_readable() || event.is_read_closed() || event.is_error();
-                notified[IoKind::Write as usize] =
-                    event.is_writable() || event.is_write_closed() || event.is_error();
-
-                notified
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, &notified)| notified)
-                    .map(|(index, _)| unsafe { node.wakers[index].wake() as usize })
-                    .sum()
-            })
-            .sum()
+                if event.is_writable() || event.is_write_closed() || event.is_error() {
+                    resumed += node.wakers[IoKind::Write as usize].wake() as usize;
+                }
+                if event.is_readable() || event.is_read_closed() || event.is_error() {
+                    resumed += node.wakers[IoKind::Read as usize].wake() as usize;
+                }
+            }
+        }
+        
+        resumed
     }
 }
 
