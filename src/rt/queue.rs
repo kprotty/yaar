@@ -8,17 +8,12 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-pub(crate) struct Popped {
-    pub(crate) task: NonNull<Task>,
-    pub(crate) pushed: usize,
+pub struct List {
+    pub head: NonNull<Task>,
+    pub tail: NonNull<Task>,
 }
 
-pub(crate) struct List {
-    pub(crate) head: NonNull<Task>,
-    pub(crate) tail: NonNull<Task>,
-}
-
-pub(crate) struct Injector {
+pub struct Injector {
     stub: Task,
     head: AtomicPtr<Task>,
     tail: AtomicPtr<Task>,
@@ -132,7 +127,7 @@ impl Injector {
     }
 }
 
-pub(crate) struct Buffer {
+pub struct Buffer {
     head: AtomicUsize,
     tail: AtomicUsize,
     array: [AtomicPtr<Task>; Self::CAPACITY],
@@ -207,7 +202,7 @@ impl Buffer {
         })
     }
 
-    pub fn pop(&self) -> Option<Popped> {
+    pub fn pop(&self) -> Option<NonNull<Task>> {
         let mut head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
 
@@ -226,17 +221,12 @@ impl Buffer {
                 Ordering::Relaxed,
             ) {
                 Err(new_head) => head = new_head,
-                Ok(_) => {
-                    return Some(Popped {
-                        task: self.read(head),
-                        pushed: 0,
-                    })
-                }
+                Ok(_) => return Some(self.read(head)),
             };
         }
     }
 
-    pub fn steal(&self, buffer: &Self) -> Option<Popped> {
+    pub fn steal(&self, buffer: &Self) -> Option<NonNull<Task>> {
         loop {
             let buffer_head = buffer.head.load(Ordering::Acquire);
             let buffer_tail = buffer.tail.load(Ordering::Acquire);
@@ -280,14 +270,11 @@ impl Buffer {
                 self.tail.store(new_tail, Ordering::Release);
             }
 
-            return Some(Popped {
-                task: self.read(new_tail),
-                pushed: new_tail.wrapping_sub(tail),
-            });
+            return Some(self.read(new_tail));
         }
     }
 
-    pub fn consume(&self, injector: Pin<&Injector>) -> Option<Popped> {
+    pub fn consume(&self, injector: Pin<&Injector>) -> Option<NonNull<Task>> {
         injector.consume().and_then(|mut consumer| {
             consumer.next().map(|consumed| {
                 let head = self.head.load(Ordering::Relaxed);
@@ -308,10 +295,7 @@ impl Buffer {
                     self.tail.store(new_tail, Ordering::Release);
                 }
 
-                Popped {
-                    task: consumed,
-                    pushed: new_tail.wrapping_sub(tail),
-                }
+                consumed
             })
         })
     }
