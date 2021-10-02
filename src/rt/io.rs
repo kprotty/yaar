@@ -5,13 +5,12 @@ use std::{
     marker::PhantomPinned,
     mem,
     pin::Pin,
-    ptr::NonNull,
+    ptr::{self, NonNull},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, Once,
+        atomic::{AtomicPtr, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     task::{Context, Poll, Waker},
-    time::Duration,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -291,6 +290,8 @@ struct IoNodeCache {
     blocks: Option<Pin<Box<IoNodeBlock>>>,
 }
 
+unsafe impl Send for IoNodeCache {}
+
 impl IoNodeCache {
     fn alloc(&mut self) -> NonNull<IoNode> {
         let node = self.free_list.unwrap_or_else(|| {
@@ -311,7 +312,6 @@ impl IoNodeCache {
 }
 
 struct IoPoller {
-    notified: bool,
     selector: mio::Poll,
     events: mio::event::Events,
 }
@@ -319,61 +319,48 @@ struct IoPoller {
 impl Default for IoPoller {
     fn default() -> Self {
         Self {
-            notified: false,
             selector: mio::Poll::new().expect("failed to create I/O selector"),
-            events: mio::event::Events::with_capacity(256),
+            events: mio::event::Events::with_capacity(1024),
         }
     }
 }
 
 impl IoPoller {
-    fn poll(&mut self, notified: &mut bool, timeout: Option<Duration>) -> usize {
-        if !matches!(timeout, Some(Duration::ZERO)) {
-            if mem::replace(&mut self.notified, false) {
-                *notified = true;
-                return 0;
+    fn poll(&mut self) {
+        loop {
+            match self.selector.poll(&mut self.events, None) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => unreachable!("I/O selector failed to poll: {:?}", e),
+                Ok(_) => {}
             }
-        }
 
-        if let Err(_) = self.selector.poll(&mut self.events, timeout) {
-            return 0;
-        }
+            for event in &self.events {
+                unsafe {
+                    let node = match NonNull::new(event.token().0 as *mut IoNode) {
+                        Some(node_ptr) => Pin::new_unchecked(&*node_ptr.as_ptr()),
+                        None => return,
+                    };
 
-        let mut resumed = 0;
-        for event in &self.events {
-            unsafe {
-                let node = match NonNull::new(event.token().0 as *mut IoNode) {
-                    Some(node_ptr) => Pin::new_unchecked(&*node_ptr.as_ptr()),
-                    None => {
-                        self.notified = true;
-                        continue;
+                    if event.is_writable() || event.is_write_closed() || event.is_error() {
+                        node.wakers[IoKind::Write as usize].wake();
                     }
-                };
-
-                if event.is_writable() || event.is_write_closed() || event.is_error() {
-                    resumed += node.wakers[IoKind::Write as usize].wake() as usize;
-                }
-                if event.is_readable() || event.is_read_closed() || event.is_error() {
-                    resumed += node.wakers[IoKind::Read as usize].wake() as usize;
+                    if event.is_readable() || event.is_read_closed() || event.is_error() {
+                        node.wakers[IoKind::Read as usize].wake();
+                    }
                 }
             }
         }
-
-        resumed
     }
 }
 
-struct IoReactor {
-    pending: AtomicUsize,
-    notified: AtomicBool,
-    polling: AtomicBool,
-    poller: UnsafeCell<IoPoller>,
+pub struct IoDriver {
+    poller: AtomicPtr<IoPoller>,
     waker: mio::Waker,
     registry: mio::Registry,
     node_cache: Mutex<IoNodeCache>,
 }
 
-impl Default for IoReactor {
+impl Default for IoDriver {
     fn default() -> Self {
         let poller = IoPoller::default();
 
@@ -387,10 +374,7 @@ impl Default for IoReactor {
             .expect("failed to create I/O notification Waker");
 
         Self {
-            pending: AtomicUsize::new(0),
-            notified: AtomicBool::new(false),
-            polling: AtomicBool::new(false),
-            poller: UnsafeCell::new(poller),
+            poller: AtomicPtr::new(Box::into_raw(Box::new(poller))),
             waker,
             registry,
             node_cache: Mutex::new(IoNodeCache::default()),
@@ -398,119 +382,24 @@ impl Default for IoReactor {
     }
 }
 
-impl IoReactor {
-    fn notify(&self) {
-        if self.pending.load(Ordering::Acquire) == 0 {
-            return;
-        }
-
-        if Self::try_set(&self.notified) {
-            println!("notified");
-            self.waker
-                .wake()
-                .expect("failed to signal I/O notification Waker");
-        }
-    }
-
-    fn poll(&self, timeout: Option<Duration>) -> Option<bool> {
-        self.try_with_poller(|poller| {
-            let mut notified = false;
-            let resumed = poller.poll(&mut notified, timeout);
-
-            if notified {
-                assert!(self.notified.load(Ordering::Relaxed));
-                self.notified.store(false, Ordering::Release);
-            }
-
-            if resumed > 0 {
-                self.pending.fetch_sub(resumed, Ordering::Relaxed);
-            }
-
-            notified
-        })
-    }
-
-    fn try_with_poller<T>(&self, f: impl FnOnce(&mut IoPoller) -> T) -> Option<T> {
-        if self.pending.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-
-        if !Self::try_set(&self.polling) {
-            return None;
-        }
-
-        let result = f(unsafe { &mut *self.poller.get() });
-        self.polling.store(false, Ordering::Release);
-        Some(result)
-    }
-
-    #[inline]
-    fn try_set(is_set: &AtomicBool) -> bool {
-        if is_set.load(Ordering::Relaxed) {
-            return false;
-        }
-
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            is_set.swap(true, Ordering::Acquire) == false
-        }
-
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        {
-            is_set
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-        }
-    }
-}
-
-pub struct IoDriver {
-    once: Once,
-    reactor_init: AtomicBool,
-    reactor: UnsafeCell<Option<IoReactor>>,
-}
-
-unsafe impl Send for IoDriver {}
-unsafe impl Sync for IoDriver {}
-
-impl Default for IoDriver {
-    fn default() -> Self {
-        Self {
-            once: Once::new(),
-            reactor_init: AtomicBool::new(false),
-            reactor: UnsafeCell::new(None),
-        }
+impl Drop for IoDriver {
+    fn drop(&mut self) {
+        mem::drop(self.take_poller());
     }
 }
 
 impl IoDriver {
-    pub fn notify(&self) {
-        self.try_get_reactor()
-            .map(|reactor| reactor.notify())
-            .unwrap_or(())
+    fn take_poller(&self) -> Option<Box<IoPoller>> {
+        let poller = self.poller.swap(ptr::null_mut(), Ordering::Acquire);
+        NonNull::new(poller).map(|p| unsafe { Box::from_raw(p.as_ptr()) })
     }
 
-    pub fn poll(&self, timeout: Option<Duration>) -> Option<bool> {
-        self.try_get_reactor()
-            .and_then(|reactor| reactor.poll(timeout))
+    pub fn poll(&self) {
+        self.take_poller().map(|mut poller| poller.poll());
     }
 
-    fn get_reactor(&self) -> &IoReactor {
-        unsafe {
-            self.once.call_once(|| {
-                *self.reactor.get() = Some(IoReactor::default());
-                self.reactor_init.store(true, Ordering::Release);
-            });
-            self.try_get_reactor().unwrap()
-        }
-    }
-
-    fn try_get_reactor(&self) -> Option<&IoReactor> {
-        if self.reactor_init.load(Ordering::Acquire) {
-            Some(unsafe { (&*self.reactor.get()).as_ref().unwrap() })
-        } else {
-            None
-        }
+    pub fn shutdown(&self) {
+        self.waker.wake().expect("failed to shutdown I/O driver");
     }
 }
 
@@ -522,10 +411,9 @@ pub struct IoSource<S: mio::event::Source> {
 
 impl<S: mio::event::Source> IoSource<S> {
     pub fn new(mut source: S, driver: Arc<IoDriver>) -> Self {
-        let reactor = driver.get_reactor();
-        let node = reactor.node_cache.lock().unwrap().alloc();
+        let node = driver.node_cache.lock().unwrap().alloc();
 
-        reactor
+        driver
             .registry
             .register(
                 &mut source,
@@ -548,11 +436,8 @@ impl<S: mio::event::Source> IoSource<S> {
         mut do_io: impl FnMut() -> io::Result<T>,
     ) -> Poll<io::Result<T>> {
         loop {
-            let io_token = match self.node.as_ref().wakers[kind as usize].poll(
-                waker_ref,
-                || self.begin_wait(),
-                || self.cancel_wait(),
-            ) {
+            let io_waker = &self.node.as_ref().wakers[kind as usize];
+            let io_token = match io_waker.poll(waker_ref, || {}, || {}) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(epoch) => epoch,
             };
@@ -572,9 +457,7 @@ impl<S: mio::event::Source> IoSource<S> {
 
     #[cold]
     pub unsafe fn detach_io(&self, kind: IoKind) {
-        if self.node.as_ref().wakers[kind as usize].detach() {
-            self.cancel_wait();
-        }
+        self.node.as_ref().wakers[kind as usize].detach();
     }
 
     pub unsafe fn wait_for<'a>(&'a self, kind: IoKind) -> impl Future<Output = ()> + 'a {
@@ -615,22 +498,6 @@ impl<S: mio::event::Source> IoSource<S> {
             kind,
         }
     }
-
-    #[cold]
-    fn begin_wait(&self) {
-        self.driver
-            .get_reactor()
-            .pending
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[cold]
-    fn cancel_wait(&self) {
-        self.driver
-            .get_reactor()
-            .pending
-            .fetch_sub(1, Ordering::Relaxed);
-    }
 }
 
 impl<S: mio::event::Source> AsRef<S> for IoSource<S> {
@@ -642,29 +509,17 @@ impl<S: mio::event::Source> AsRef<S> for IoSource<S> {
 impl<S: mio::event::Source> Drop for IoSource<S> {
     fn drop(&mut self) {
         unsafe {
-            let resumed = self
-                .node
-                .as_ref()
-                .wakers
-                .iter()
-                .map(|waker| waker.detach() as usize)
-                .sum();
-
-            let reactor = self
-                .driver
-                .try_get_reactor()
-                .expect("IoSource created without a Reactor");
-
-            if resumed > 0 {
-                reactor.pending.fetch_sub(resumed, Ordering::Relaxed);
+            let node = Pin::new_unchecked(self.node.as_ref());
+            for waker in node.wakers.iter() {
+                waker.detach();
             }
 
-            reactor
+            self.driver
                 .registry
                 .deregister(&mut self.source)
                 .expect("failed to deregister IoSource");
 
-            reactor
+            self.driver
                 .node_cache
                 .lock()
                 .unwrap()

@@ -1,13 +1,12 @@
 use super::{
     builder::Builder,
-    idle::IdleQueue,
+    idle::Semaphore,
     io::IoDriver,
     queue::{Buffer, Injector, List},
     task::Task,
 };
 use std::{
     cell::RefCell,
-    convert::TryInto,
     mem,
     num::NonZeroUsize,
     pin::Pin,
@@ -18,7 +17,6 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
 };
 
 #[allow(unused)]
@@ -123,7 +121,7 @@ impl From<usize> for Sync {
             idle: (value >> (4 + (Self::COUNT_BITS * 1))) & Self::COUNT_MASK,
             spawned: (value >> (4 + (Self::COUNT_BITS * 0))) & Self::COUNT_MASK,
             notified: value & (1 << 2) != 0,
-            state: State::from(value & 0b11)
+            state: State::from(value & 0b11),
         }
     }
 }
@@ -139,7 +137,7 @@ pub struct Pool {
     sync: AtomicUsize,
     pending: AtomicUsize,
     injecting: AtomicUsize,
-    idle_queue: IdleQueue,
+    idle_semaphore: Semaphore,
     stack_size: Option<NonZeroUsize>,
     pub io_driver: Arc<IoDriver>,
     workers: Pin<Box<[Worker]>>,
@@ -147,7 +145,7 @@ pub struct Pool {
 
 impl Pool {
     pub fn from_builder(builder: &Builder) -> Arc<Pool> {
-        let num_threads = builder
+        let max_threads = builder
             .max_threads
             .unwrap_or_else(|| num_cpus::get())
             .min(Sync::COUNT_MASK)
@@ -155,18 +153,25 @@ impl Pool {
 
         let stack_size = builder.stack_size.and_then(NonZeroUsize::new);
 
-        Arc::new(Self {
+        let pool = Arc::new(Self {
             sync: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
             injecting: AtomicUsize::new(0),
-            idle_queue: IdleQueue::default(),
-            stack_size: stack_size,
+            idle_semaphore: Semaphore::default(),
+            stack_size,
             io_driver: Arc::new(IoDriver::default()),
-            workers: (0..num_threads)
+            workers: (0..(max_threads + 1))
                 .map(|_| Worker::default())
                 .collect::<Box<[Worker]>>()
                 .into(),
-        })
+        });
+
+        let io_pool = Arc::clone(&pool);
+        thread::spawn(move || {
+            io_pool.run_worker(max_threads, |p, _i| p.io_driver.poll());
+        });
+
+        pool
     }
 
     pub(crate) fn emit(&self, event: PoolEvent) {
@@ -184,7 +189,8 @@ impl Pool {
         assert_ne!(pending, 0);
 
         if pending == 1 {
-            self.idle_shutdown();
+            self.io_driver.shutdown();
+            self.workers.iter().for_each(|_| self.idle_semaphore.post());
         }
     }
 
@@ -220,11 +226,12 @@ impl Pool {
 
     #[cold]
     fn notify(self: &Arc<Self>, is_waking: bool) {
+        let max_threads = self.workers.len() - 1;
         self.sync
             .fetch_update(Ordering::Release, Ordering::Relaxed, |sync| {
                 let mut sync: Sync = sync.into();
                 assert!(sync.idle <= sync.spawned);
-                
+
                 let can_wake = is_waking || sync.state == State::Pending;
                 if is_waking {
                     assert_eq!(sync.state, State::Waking);
@@ -232,7 +239,7 @@ impl Pool {
 
                 if can_wake && sync.idle > 0 {
                     sync.state = State::Signaled;
-                } else if can_wake && sync.spawned < self.workers.len() {
+                } else if can_wake && sync.spawned < max_threads {
                     sync.state = State::Signaled;
                     sync.spawned += 1;
                 } else if is_waking {
@@ -247,27 +254,27 @@ impl Pool {
             .map(|sync| {
                 let sync: Sync = sync.into();
                 assert!(sync.idle <= sync.spawned);
-                
+
                 let can_wake = is_waking || sync.state == State::Pending;
                 if !can_wake {
                     return;
                 }
 
                 if sync.idle > 0 {
-                    return self.idle_notify(sync.idle == 1);
+                    return self.idle_semaphore.post();
                 }
 
-                if sync.spawned == self.workers.len() {
+                if sync.spawned == max_threads {
                     return;
                 }
-                
-                assert!(sync.spawned < self.workers.len());
+
+                assert!(sync.spawned < max_threads);
                 let worker_index = sync.spawned;
                 let pool = Arc::clone(self);
 
-                // Run the first worker using the caller's thread
+                // Run the first two workers using the caller's thread
                 if worker_index == 0 {
-                    return pool.run_worker(worker_index);
+                    return pool.run_worker(worker_index, |p, i| p.run(i));
                 }
 
                 // Create a ThreadBuilder to spawn a worker thread
@@ -277,10 +284,10 @@ impl Pool {
                 }
 
                 builder
-                    .spawn(move || pool.run_worker(worker_index))
+                    .spawn(move || pool.run_worker(worker_index, |p, i| p.run(i)))
                     .expect("Failed to spawn a worker thread");
             })
-            .unwrap_or(())        
+            .unwrap_or(())
     }
 
     #[cold]
@@ -325,7 +332,7 @@ impl Pool {
 
                     return Some(is_waking || sync.state == State::Signaled);
                 }
-                
+
                 is_idle = true;
                 is_waking = false;
 
@@ -344,7 +351,7 @@ impl Pool {
                 return None;
             }
 
-            self.idle_wait(index);
+            self.idle_semaphore.wait();
             continue;
         }
     }
@@ -360,7 +367,7 @@ impl Pool {
             .map(|pool_ref| f(&pool_ref.0, pool_ref.1))
     }
 
-    fn run_worker(self: Arc<Self>, index: usize) {
+    fn run_worker(self: Arc<Self>, index: usize, f: impl FnOnce(&Arc<Self>, usize)) {
         // Create a local pair of Pool + worker index
         // Then set it as the thread local.
         // Restore the old thread local value at the end to allow for nested calls.
@@ -373,7 +380,7 @@ impl Pool {
 
         // Run the worker (Pool + worker index) pair
         // Then restore the thread local to its original value.
-        pool_ref.0.run(pool_ref.1);
+        f(&pool_ref.0, pool_ref.1);
         Self::tls_pool_ref().with(|rc| rc.replace(old_pool_ref));
 
         pool_ref.0.emit(PoolEvent::WorkerShutdown {
@@ -397,7 +404,7 @@ impl Pool {
                     self.notify(is_waking);
                     is_waking = false;
                 }
-    
+
                 tick = tick.wrapping_add(1);
                 unsafe {
                     let vtable = task.as_ref().vtable;
@@ -414,31 +421,21 @@ impl Pool {
         be_fair: bool,
         xorshift: &mut usize,
     ) -> Option<(NonNull<Task>, bool)> {
-        if be_fair {    
+        if be_fair {
             if let Some(task) = self.pop_consume(index, index) {
                 return Some((task, true));
             }
         }
 
         if let Some(task) = self.pop_local(index) {
-            return Some((task, false));       
+            return Some((task, false));
         }
 
         if let Some(task) = self.pop_consume(index, index) {
             return Some((task, true));
         }
 
-        if let Some(_) = self.io_driver.poll(Some(Duration::ZERO)) {
-            if let Some(task) = self.pop_local(index) {
-                return Some((task, false));       
-            }
-    
-            if let Some(task) = self.pop_consume(index, index) {
-                return Some((task, true));
-            }
-        }
-
-        self.pop_shared(index, xorshift).map(|task| (task, false))
+        self.pop_shared(index, xorshift).map(|task| (task, true))
     }
 
     fn pop_local(self: &Arc<Self>, index: usize) -> Option<NonNull<Task>> {
@@ -523,33 +520,5 @@ impl Pool {
 
                 task
             })
-    }
-
-    #[cold]
-    fn idle_wait(self: &Arc<Self>, _index: usize) {
-        if self.idle_queue.try_wait() {
-            return;
-        }
-
-        if self.io_driver.poll(None).is_some() {
-            return;
-        }
-
-        self.idle_queue.wait();
-    }
-
-    #[cold]
-    fn idle_notify(&self, notify_io: bool) {
-        if !self.idle_queue.post(1) {
-            if notify_io {
-                self.io_driver.notify();
-            }
-        }
-    }
-
-    #[cold]
-    fn idle_shutdown(&self) {
-        self.io_driver.notify();
-        self.idle_queue.post(self.workers.len().try_into().unwrap());
     }
 }

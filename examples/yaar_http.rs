@@ -10,21 +10,22 @@ async fn hello_world(_: Request<Body>) -> Result<Response<Body>, Infallible> {
 }
 
 pub fn main() -> Result<(), hyper::Error> {
-    yaar::runtime::Builder::new().max_threads(2).block_on(async {
-        let addr = "127.0.0.1:3000".parse().unwrap();
-        let listener = yaar::net::TcpListener::bind(addr).expect("failed to bind TcpListener");
+    yaar::runtime::Builder::new()
+        .block_on(async {
+            let addr = "127.0.0.1:3000".parse().unwrap();
+            let listener = yaar::net::TcpListener::bind(addr).expect("failed to bind TcpListener");
 
-        let make_svc =
-            make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(hello_world)) });
+            let make_svc =
+                make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(hello_world)) });
 
-        let server = Builder::new(compat::HyperListener(listener), Http::new())
-            .executor(compat::HyperExecutor)
-            .serve(make_svc);
+            let server = Builder::new(compat::HyperListener(listener), Http::new())
+                .executor(compat::HyperExecutor)
+                .serve(make_svc);
 
-        println!("Listening on http://{}", addr);
-        server.await?;
-        Ok(())
-    })
+            println!("Listening on http://{}", addr);
+            server.await?;
+            Ok(())
+        })
 }
 
 mod compat {
