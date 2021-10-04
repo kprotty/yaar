@@ -175,7 +175,7 @@ impl Pool {
                     return Some(popped);
                 }
             }
-            
+
             if self.try_search(index, is_searching) {
                 if let Some(popped) = self.pop_shared(index, xorshift) {
                     return Some(popped);
@@ -203,7 +203,7 @@ impl Pool {
 
     #[cold]
     fn pop_shared(self: &Arc<Self>, index: usize, xorshift: &mut usize) -> Option<Popped> {
-        let mut attempts = 4;
+        let mut attempts = 32;
         loop {
             match self.try_pop_shared(index, xorshift) {
                 Ok(popped) => return Some(popped),
