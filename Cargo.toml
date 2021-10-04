@@ -1,21 +1,19 @@
 [package]
 name = "yaar"
-version = "0.1.0"
+license = "MIT"
+version = "0.2.0"
 edition = "2018"
 authors = ["kprotty"]
 
+[features]
+default = []
+full = ["rt", "net", "sync"]
+
+rt = ["num_cpus"]
+net = ["mio", "tokio"]
+sync = []
+
 [dependencies]
-libc = "0.2"
-num_cpus = "1"
-mio = { version = "0.7", features = ["net", "os-poll"] }
-tokio = { version = "1" }
-
-[dev-dependencies]
-hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
-
-[[example]]
-name = "yaar_http"
-
-[[example]]
-name = "tokio_http"
+mio = { version = "0.7", features = ["net", "os-poll"], optional = true }
+num_cpus = { version = "1", optional = true }
+tokio = { version = "1", optional = true }
