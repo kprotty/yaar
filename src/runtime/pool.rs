@@ -206,7 +206,9 @@ impl Pool {
 
                 if sync.idle > 0 {
                     if !self.idle_queue.signal(&**self) {
-                        self.io_driver.notify();
+                        if sync.idle == 1 {
+                            self.io_driver.notify();
+                        }
                     }
                     return;
                 }
