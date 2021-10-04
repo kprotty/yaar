@@ -5,14 +5,17 @@
     unreachable_pub
 )]
 
-#[cfg(feature = "net")]
-mod io;
 #[cfg(feature = "rt")]
-mod runtime;
+pub mod runtime;
+
+#[cfg(feature = "rt")]
+pub mod task;
+
+#[cfg(feature = "io")]
+pub mod io;
 
 #[cfg(feature = "net")]
 pub mod net;
+
 #[cfg(feature = "sync")]
 pub mod sync;
-#[cfg(feature = "rt")]
-pub mod task;

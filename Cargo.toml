@@ -10,7 +10,8 @@ default = []
 full = ["rt", "net", "sync"]
 
 rt = ["num_cpus"]
-net = ["mio", "tokio"]
+net = ["mio", "io"]
+io = ["tokio"]
 sync = []
 
 [dependencies]
