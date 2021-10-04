@@ -258,19 +258,17 @@ impl Pool {
             return true;
         }
 
-        let sync: Sync = self.sync.load(Ordering::Relaxed).into();
-        if 2 * sync.searching >= sync.spawned {
-            return false;
-        }
-
-        let _ = self
+        let _sync: Sync = self
             .sync
             .fetch_update(Ordering::Acquire, Ordering::Relaxed, |sync| {
                 let mut sync: Sync = sync.into();
                 assert_ne!(sync.searching, sync.spawned);
                 sync.searching += 1;
                 Some(sync.into())
-            });
+            })
+            .unwrap()
+            .into();
+
         *is_searching = true;
         true
     }
@@ -307,7 +305,7 @@ impl Pool {
         (|| {
             if mem::replace(is_searching, false) && sync.searching == 1 {
                 if has_pending_tasks() {
-                    let _ = self
+                    let _sync: Sync = self
                         .sync
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sync| {
                             let mut sync: Sync = sync.into();
@@ -317,7 +315,10 @@ impl Pool {
                             sync.searching += 1;
                             sync.idle -= 1;
                             Some(sync.into())
-                        });
+                        })
+                        .unwrap()
+                        .into();
+
                     *is_searching = true;
                     return;
                 }
@@ -328,7 +329,7 @@ impl Pool {
                     return;
                 }
 
-                if let Ok(_) =
+                if let Ok(_sync) =
                     self.sync
                         .fetch_update(Ordering::Acquire, Ordering::Relaxed, |sync| {
                             let mut sync: Sync = sync.into();

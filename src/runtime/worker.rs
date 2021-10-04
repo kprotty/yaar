@@ -63,24 +63,26 @@ impl Pool {
             worker_index: index,
         });
 
-        while let Some(popped) = {
-            let be_fair = tick % 64 == 0;
-            self.pop(index, be_fair, &mut xorshift, &mut is_searching)
-        } {
-            if self.discovered(index, &mut is_searching) || popped.pushed > 0 {
-                self.notify();
-            }
-
-            let task = popped.task;
-            self.emit(PoolEvent::TaskScheduled {
-                worker_index: index,
-                task,
-            });
-
-            tick = tick.wrapping_add(1);
-            unsafe {
-                let vtable = task.as_ref().vtable;
-                (vtable.poll_fn)(task, self, index)
+        if self.wait(index, &mut is_searching, || self.has_shared()) {
+            while let Some(popped) = {
+                let be_fair = tick % 64 == 0;
+                self.pop(index, be_fair, &mut xorshift, &mut is_searching)
+            } {
+                if self.discovered(index, &mut is_searching) || popped.pushed > 0 {
+                    self.notify();
+                }
+    
+                let task = popped.task;
+                self.emit(PoolEvent::TaskScheduled {
+                    worker_index: index,
+                    task,
+                });
+    
+                tick = tick.wrapping_add(1);
+                unsafe {
+                    let vtable = task.as_ref().vtable;
+                    (vtable.poll_fn)(task, self, index)
+                }
             }
         }
 
@@ -182,6 +184,10 @@ impl Pool {
 
             if !self.wait(index, is_searching, || self.has_shared()) {
                 return None;
+            }
+
+            if let Some(popped) = self.pop_local(index) {
+                return Some(popped);
             }
         }
     }
