@@ -63,6 +63,17 @@ impl Injector {
             .store(list.head.as_ptr(), Ordering::Release);
     }
 
+    pub fn consumable(&self) -> bool {
+        let tail = NonNull::new(self.tail.load(Ordering::Acquire));
+        if tail.is_none() {
+            return false;
+        }
+
+        let is_consuming = Self::IS_CONSUMING.as_ptr();
+        let head = self.head.load(Ordering::Acquire);
+        head != is_consuming
+    }
+
     fn consume<'a>(self: Pin<&'a Self>) -> Option<impl Iterator<Item = NonNull<Task>> + 'a> {
         let tail = NonNull::new(self.tail.load(Ordering::Acquire));
         if tail.is_none() {
@@ -234,6 +245,12 @@ impl Buffer {
                 }
             };
         }
+    }
+
+    pub fn stealable(&self) -> bool {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        head != tail
     }
 
     pub fn steal(&self, buffer: &Self) -> Option<Popped> {

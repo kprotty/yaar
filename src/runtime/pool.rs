@@ -70,55 +70,44 @@ pub(crate) enum PoolEvent {
     },
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum SyncStatus {
-    Pending,
-    Waking,
-    Signaled,
-}
-
 #[derive(Copy, Clone, Debug)]
-struct SyncState {
-    status: SyncStatus,
-    notified: usize,
-    spawned: usize,
+struct Sync {
+    notified: bool,
     idle: usize,
+    spawned: usize,
+    searching: usize,
 }
 
-impl SyncState {
-    const COUNT_BITS: u32 = (usize::BITS - 2) / 3;
-    const COUNT_MASK: usize = (1 << Self::COUNT_BITS) - 1;
+impl Sync {
+    const BITS: u32 = (usize::BITS - 1) / 3;
+    const MASK: usize = (1 << Self::BITS) - 1;
+
+    const IDLE_SHIFT: u32 = (Self::BITS * 0) + 1;
+    const SPAWN_SHIFT: u32 = (Self::BITS * 1) + 1;
+    const SEARCH_SHIFT: u32 = (Self::BITS * 2) + 1;
 }
 
-impl From<usize> for SyncState {
-    fn from(value: usize) -> Self {
-        Self {
-            status: match value & 0b11 {
-                0b00 => SyncStatus::Pending,
-                0b01 => SyncStatus::Waking,
-                0b10 => SyncStatus::Signaled,
-                _ => unreachable!("invalid sync-status"),
-            },
-            notified: (value >> (4 + Self::COUNT_BITS * 0)) & Self::COUNT_MASK,
-            spawned: (value >> (4 + Self::COUNT_BITS * 1)) & Self::COUNT_MASK,
-            idle: (value >> (4 + Self::COUNT_BITS * 2)) & Self::COUNT_MASK,
-        }
+impl Into<usize> for Sync {
+    fn into(self) -> usize {
+        assert!(self.spawned <= Self::MASK);
+        assert!(self.idle <= self.spawned);
+        assert!(self.searching <= self.spawned);
+
+        (self.notified as usize)
+            | (self.idle << Self::IDLE_SHIFT)
+            | (self.spawned << Self::SPAWN_SHIFT)
+            | (self.searching << Self::SEARCH_SHIFT)
     }
 }
 
-impl Into<usize> for SyncState {
-    fn into(self) -> usize {
-        assert!(self.idle <= Self::COUNT_MASK);
-        assert!(self.spawned <= Self::COUNT_MASK);
-
-        (self.idle << (4 + Self::COUNT_BITS * 2))
-            | (self.spawned << (4 + Self::COUNT_BITS * 1))
-            | (self.notified << (4 + Self::COUNT_BITS * 0))
-            | match self.status {
-                SyncStatus::Pending => 0b00,
-                SyncStatus::Waking => 0b01,
-                SyncStatus::Signaled => 0b10,
-            }
+impl From<usize> for Sync {
+    fn from(value: usize) -> Self {
+        Self {
+            notified: value & 1 != 0,
+            idle: (value >> Self::IDLE_SHIFT) & Self::MASK,
+            spawned: (value >> Self::SPAWN_SHIFT) & Self::MASK,
+            searching: (value >> Self::SEARCH_SHIFT) & Self::MASK,
+        }
     }
 }
 
@@ -144,7 +133,7 @@ impl Pool {
         let num_threads = builder
             .max_threads
             .unwrap_or_else(|| num_cpus::get())
-            .min(SyncState::COUNT_MASK)
+            .min(Sync::MASK)
             .max(1);
 
         let stack_size = builder.stack_size.and_then(NonZeroUsize::new);
@@ -186,49 +175,43 @@ impl Pool {
         assert_ne!(pending, 0);
 
         if pending == 1 {
-            self.workers_shutdown();
+            self.io_driver.notify();
+            self.idle_queue.shutdown(self);
         }
     }
 
     #[cold]
-    pub fn notify(self: &Arc<Self>, is_waking: bool) {
-        let result = self
-            .sync
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
-                let mut state: SyncState = state.into();
-                if is_waking {
-                    assert_eq!(state.status, SyncStatus::Waking);
-                }
-
-                assert!(state.idle <= state.spawned);
-                assert!(state.notified <= state.spawned);
-
-                let can_wake = is_waking || state.status == SyncStatus::Pending;
-                if can_wake && state.idle > 0 {
-                    state.status = SyncStatus::Signaled;
-                } else if can_wake && state.spawned < self.workers.len() {
-                    state.status = SyncStatus::Signaled;
-                    state.spawned += 1;
-                } else if is_waking {
-                    state.status = SyncStatus::Pending;
-                } else if state.notified == state.spawned {
+    pub fn notify(self: &Arc<Self>) {
+        self.sync
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |sync| {
+                let mut sync: Sync = sync.into();
+                if sync.searching > 0 {
                     return None;
                 }
 
-                state.notified = (state.notified + 1).min(state.spawned);
-                Some(state.into())
-            });
-
-        if let Ok(sync) = result.map(SyncState::from) {
-            if is_waking || sync.status == SyncStatus::Pending {
-                if sync.idle > 0 {
-                    return self.workers_notify();
+                if sync.idle == 0 {
+                    if sync.spawned < self.workers.len() {
+                        sync.spawned += 1;
+                    } else {
+                        return None;
+                    }
                 }
 
-                if sync.spawned >= self.workers.len() {
+                sync.searching = 1;
+                sync.notified = true;
+                Some(sync.into())
+            })
+            .map(|sync| {
+                let sync: Sync = sync.into();
+
+                if sync.idle > 0 {
+                    if !self.idle_queue.signal(&**self) {
+                        self.io_driver.notify();
+                    }
                     return;
                 }
 
+                assert!(sync.spawned < self.workers.len());
                 let worker_index = sync.spawned;
                 let pool = Arc::clone(self);
 
@@ -243,106 +226,142 @@ impl Pool {
                     builder = builder.stack_size(stack_size.get());
                 }
 
-                let join_handle = builder
+                builder
                     .spawn(move || pool.with_worker(worker_index))
                     .expect("Failed to spawn a worker thread");
+            })
+            .unwrap_or(())
+    }
 
-                mem::drop(join_handle);
-                return;
-            }
+    pub fn discovered(&self, _index: usize, is_searching: &mut bool) -> bool {
+        if !*is_searching {
+            return false;
         }
+
+        let sync: Sync = self
+            .sync
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sync| {
+                let mut sync: Sync = sync.into();
+                assert_ne!(sync.searching, 0);
+                sync.searching -= 1;
+                Some(sync.into())
+            })
+            .unwrap()
+            .into();
+
+        *is_searching = false;
+        sync.searching == 1
+    }
+
+    pub fn try_search(&self, _index: usize, is_searching: &mut bool) -> bool {
+        if *is_searching {
+            return true;
+        }
+
+        let sync: Sync = self.sync.load(Ordering::Relaxed).into();
+        if 2 * sync.searching >= sync.spawned {
+            return false;
+        }
+
+        let _ = self
+            .sync
+            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |sync| {
+                let mut sync: Sync = sync.into();
+                assert_ne!(sync.searching, sync.spawned);
+                sync.searching += 1;
+                Some(sync.into())
+            });
+        *is_searching = true;
+        true
     }
 
     #[cold]
-    pub fn wait(self: &Arc<Self>, index: usize, mut is_waking: bool) -> Option<bool> {
-        let mut is_idle = false;
-        let result = loop {
-            let result = self
-                .sync
-                .fetch_update(Ordering::Acquire, Ordering::Relaxed, |state| {
-                    let mut state: SyncState = state.into();
-                    if is_waking {
-                        assert_eq!(state.status, SyncStatus::Waking);
-                    }
+    pub fn wait(
+        self: &Arc<Self>,
+        index: usize,
+        is_searching: &mut bool,
+        has_pending_tasks: impl FnOnce() -> bool,
+    ) -> bool {
+        let sync: Sync = self
+            .sync
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |sync| {
+                let mut sync: Sync = sync.into();
 
-                    assert!(state.idle <= state.spawned);
-                    if !is_idle {
-                        assert!(state.idle < state.spawned);
-                    }
+                assert!(sync.idle < sync.spawned);
+                sync.idle += 1;
 
-                    let is_notified = state.notified > 0 || state.status == SyncStatus::Signaled;
-                    if is_notified {
-                        state.notified = state.notified.checked_sub(1).unwrap_or(0);
-                        if state.status == SyncStatus::Signaled {
-                            state.status = SyncStatus::Waking;
-                        }
-                        if is_idle {
-                            state.idle -= 1;
-                        }
-                    } else if !is_idle {
-                        state.idle += 1;
-                        if is_waking {
-                            state.status = SyncStatus::Pending;
-                        }
-                    } else {
-                        return None;
-                    }
-
-                    Some(state.into())
-                });
-
-            if let Ok(state) = result.map(SyncState::from) {
-                let is_notified = state.notified > 0 || state.status == SyncStatus::Signaled;
-                if is_notified {
-                    break Some(is_waking || state.status == SyncStatus::Signaled);
+                if *is_searching {
+                    assert!(sync.searching > 0);
+                    sync.searching -= 1;
                 }
 
-                assert!(!is_idle);
-                is_idle = true;
-                is_waking = false;
+                Some(sync.into())
+            })
+            .unwrap()
+            .into();
 
-                self.emit(PoolEvent::WorkerIdling {
-                    worker_index: index,
+        self.emit(PoolEvent::WorkerIdling {
+            worker_index: index,
+        });
+
+        (|| {
+            if mem::replace(is_searching, false) && sync.searching == 1 {
+                if has_pending_tasks() {
+                    let _ = self
+                        .sync
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sync| {
+                            let mut sync: Sync = sync.into();
+                            assert_ne!(sync.searching, sync.spawned);
+                            assert_ne!(sync.idle, 0);
+
+                            sync.searching += 1;
+                            sync.idle -= 1;
+                            Some(sync.into())
+                        });
+                    *is_searching = true;
+                    return;
+                }
+            }
+
+            loop {
+                if self.pending.load(Ordering::Relaxed) == 0 {
+                    return;
+                }
+
+                if let Ok(_) =
+                    self.sync
+                        .fetch_update(Ordering::Acquire, Ordering::Relaxed, |sync| {
+                            let mut sync: Sync = sync.into();
+                            if !sync.notified {
+                                return None;
+                            }
+
+                            assert_ne!(sync.searching, 0);
+                            assert_ne!(sync.idle, 0);
+                            sync.notified = false;
+                            sync.idle -= 1;
+                            Some(sync.into())
+                        })
+                {
+                    *is_searching = true;
+                    return;
+                }
+
+                if self.io_driver.poll(None) {
+                    continue;
+                }
+
+                self.idle_queue.wait(&**self, index, || {
+                    let sync: Sync = self.sync.load(Ordering::Relaxed).into();
+                    !sync.notified
                 });
             }
+        })();
 
-            match self.pending.load(Ordering::SeqCst) {
-                0 => break None,
-                _ => self.workers_wait(index),
-            }
-        };
-
-        if is_idle {
-            self.emit(PoolEvent::WorkerScheduled {
-                worker_index: index,
-            });
-        }
-
-        result
-    }
-
-    #[cold]
-    fn workers_wait(&self, index: usize) {
-        if self.io_driver.poll(None) {
-            return;
-        }
-
-        self.idle_queue.wait(self, index, || {
-            let sync: SyncState = self.sync.load(Ordering::Relaxed).into();
-            sync.notified == 0 && sync.status != SyncStatus::Signaled
+        self.emit(PoolEvent::WorkerScheduled {
+            worker_index: index,
         });
-    }
 
-    #[cold]
-    fn workers_notify(&self) {
-        if !self.idle_queue.signal(self) {
-            let _ = self.io_driver.notify();
-        }
-    }
-
-    #[cold]
-    fn workers_shutdown(&self) {
-        let _ = self.io_driver.notify();
-        self.idle_queue.shutdown(self);
+        self.pending.load(Ordering::Relaxed) > 0
     }
 }
