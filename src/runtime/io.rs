@@ -326,12 +326,13 @@ impl Default for IoPoller {
 }
 
 impl IoPoller {
-    fn poll(&mut self, notified: &mut bool, timeout: Option<Duration>) -> usize {
-        if let Err(_) = self.selector.poll(&mut self.events, timeout) {
-            return 0;
-        }
+    fn poll(&mut self, timeout: Option<Duration>) {
+        let _ = self.selector.poll(&mut self.events, timeout);
+    }
 
+    fn process(&mut self, notified: &mut bool) -> usize {
         let mut resumed = 0;
+
         for event in &self.events {
             unsafe {
                 let node = match NonNull::new(event.token().0 as *mut IoNode) {
@@ -350,15 +351,40 @@ impl IoPoller {
                 }
             }
         }
-        
+
         resumed
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum IoReactorState {
+    Empty = 0,
+    Polling = 1,
+    Waiting = 2,
+    Notified = 3,
+}
+
+impl Into<usize> for IoReactorState {
+    fn into(self) -> usize {
+        self as usize
+    }
+}
+
+impl From<usize> for IoReactorState {
+    fn from(value: usize) -> Self {
+        match value {
+            0 => Self::Empty,
+            1 => Self::Polling,
+            2 => Self::Waiting,
+            3 => Self::Notified,
+            _ => unreachable!("invalid reactor state"),
+        }
+    }
+}
+
 struct IoReactor {
+    state: AtomicUsize,
     pending: AtomicUsize,
-    waiting: AtomicBool,
-    polling: AtomicBool,
     poller: UnsafeCell<IoPoller>,
     waker: mio::Waker,
     registry: mio::Registry,
@@ -379,9 +405,8 @@ impl Default for IoReactor {
             .expect("failed to create I/O notification Waker");
 
         Self {
+            state: AtomicUsize::new(IoReactorState::Empty.into()),
             pending: AtomicUsize::new(0),
-            waiting: AtomicBool::new(false),
-            polling: AtomicBool::new(false),
             poller: UnsafeCell::new(poller),
             waker,
             registry,
@@ -392,73 +417,87 @@ impl Default for IoReactor {
 
 impl IoReactor {
     fn notify(&self) -> bool {
-        Self::try_transition_to(&self.waiting, false, Ordering::Release) && {
-            self.waker
-                .wake()
-                .expect("failed to signal I/O notification Waker");
-            true
+        if self.pending.load(Ordering::Acquire) == 0 {
+            return false;
         }
+
+        let state: IoReactorState = self.state.load(Ordering::Relaxed).into();
+        if state != IoReactorState::Waiting {
+            return false;
+        }
+
+        if let Err(_) = self.state.compare_exchange(
+            IoReactorState::Waiting.into(),
+            IoReactorState::Notified.into(),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            return false;
+        }
+
+        self.waker
+            .wake()
+            .expect("failed to signal I/O notification Waker");
+        true
     }
 
     fn poll(&self, timeout: Option<Duration>) -> bool {
-        self.try_with_poller(|poller| {
-            let is_waiting = !matches!(timeout, Some(Duration::ZERO));
-            if is_waiting {
-                self.waiting.store(true, Ordering::Relaxed);
-                std::sync::atomic::fence(Ordering::Acquire);
+        if self.pending.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+
+        let poll_state = match timeout {
+            Some(Duration::ZERO) => IoReactorState::Polling,
+            _ => IoReactorState::Waiting,
+        };
+
+        let state: IoReactorState = self.state.load(Ordering::Relaxed).into();
+        if state != IoReactorState::Empty {
+            return false;
+        }
+
+        if let Err(_) = self.state.compare_exchange(
+            IoReactorState::Empty.into(),
+            poll_state.into(),
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            return false;
+        }
+
+        {
+            let io_poller = unsafe { &mut *self.poller.get() };
+            io_poller.poll(timeout);
+
+            let mut was_notified = false;
+            if poll_state != IoReactorState::Polling {
+                was_notified = self
+                    .state
+                    .compare_exchange(
+                        poll_state.into(),
+                        IoReactorState::Polling.into(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err();
             }
 
             let mut notified = false;
-            let mut resumed = poller.poll(&mut notified, timeout);
+            let mut resumed = io_poller.process(&mut notified);
 
-            if is_waiting {
-                if !Self::try_transition_to(&self.waiting, false, Ordering::AcqRel) {
-                    while !notified {
-                        resumed += poller.poll(&mut notified, None);
-                    }
-                }
-            } else {
-                assert!(!notified);
+            while was_notified && !notified {
+                io_poller.poll(None);
+                resumed += io_poller.process(&mut notified);
             }
 
             if resumed > 0 {
                 self.pending.fetch_sub(resumed, Ordering::Relaxed);
             }
-        })
-        .is_some()
-    }
-
-    fn try_with_poller<T>(&self, f: impl FnOnce(&mut IoPoller) -> T) -> Option<T> {
-        if self.pending.load(Ordering::Acquire) == 0 {
-            return None;
         }
 
-        if !Self::try_transition_to(&self.polling, true, Ordering::Acquire) {
-            return None;
-        }
-
-        let result = f(unsafe { &mut *self.poller.get() });
-        self.polling.store(false, Ordering::Release);
-        Some(result)
-    }
-
-    #[inline]
-    fn try_transition_to(active: &AtomicBool, new_state: bool, order: Ordering) -> bool {
-        if active.load(Ordering::Relaxed) == new_state {
-            return false;
-        }
-
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            active.swap(new_state, order) != new_state
-        }
-
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        {
-            active
-                .compare_exchange(!new_state, new_state, order, Ordering::Relaxed)
-                .is_ok()
-        }
+        let new_state: usize = IoReactorState::Empty.into();
+        self.state.store(new_state, Ordering::Release);
+        true
     }
 }
 
