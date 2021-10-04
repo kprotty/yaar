@@ -258,16 +258,18 @@ impl Pool {
             return true;
         }
 
-        let _sync: Sync = self
-            .sync
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |sync| {
-                let mut sync: Sync = sync.into();
-                assert_ne!(sync.searching, sync.spawned);
-                sync.searching += 1;
-                Some(sync.into())
-            })
-            .unwrap()
-            .into();
+        if let Err(_) = self.sync.fetch_update(Ordering::Acquire, Ordering::Relaxed, |sync| {
+            let mut sync: Sync = sync.into();
+            if 2 * sync.searching >= self.workers.len() {
+                return None;
+            }
+            
+            assert_ne!(sync.searching, sync.spawned);
+            sync.searching += 1;
+            Some(sync.into())
+        }) {
+            return false;
+        }
 
         *is_searching = true;
         true
