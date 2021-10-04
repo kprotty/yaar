@@ -2,7 +2,7 @@ use super::{
     super::sync::low_level::ThreadLocal,
     idle::IdleNode,
     pool::{Pool, PoolEvent},
-    queue::{Buffer, Injector, List, Popped},
+    queue::{Buffer, Injector, List, Popped, Error},
     task::Task,
 };
 use std::{
@@ -138,17 +138,11 @@ impl Pool {
             return Some(popped);
         }
 
-        if self.io_driver.poll(Some(Duration::ZERO)) {
-            if let Some(popped) = self.pop_local(index) {
-                return Some(popped);
-            }
-        }
-
         self.pop_search(index, xorshift, is_searching)
     }
 
     fn pop_injector(self: &Arc<Self>, index: usize) -> Option<Popped> {
-        self.pop_consume(index, index)
+        self.pop_consume(index, index).ok()
     }
 
     fn pop_local(self: &Arc<Self>, index: usize) -> Option<Popped> {
@@ -176,6 +170,12 @@ impl Pool {
         is_searching: &mut bool,
     ) -> Option<Popped> {
         loop {
+            if self.io_driver.poll(Some(Duration::ZERO)) {
+                if let Some(popped) = self.pop_local(index) {
+                    return Some(popped);
+                }
+            }
+            
             if self.try_search(index, is_searching) {
                 if let Some(popped) = self.pop_shared(index, xorshift) {
                     return Some(popped);
@@ -203,6 +203,23 @@ impl Pool {
 
     #[cold]
     fn pop_shared(self: &Arc<Self>, index: usize, xorshift: &mut usize) -> Option<Popped> {
+        let mut attempts = 4;
+        loop {
+            match self.try_pop_shared(index, xorshift) {
+                Ok(popped) => return Some(popped),
+                Err(Error::Empty) => return None,
+                Err(Error::Contended) => {},
+            }
+
+            attempts -= 1;
+            match attempts {
+                0 => return None,
+                _ => std::hint::spin_loop(),
+            }
+        }
+    }
+
+    fn try_pop_shared(self: &Arc<Self>, index: usize, xorshift: &mut usize) -> Result<Popped, Error> {
         let shifts = match usize::BITS {
             32 => (13, 17, 5),
             64 => (13, 7, 17),
@@ -216,23 +233,35 @@ impl Pool {
         *xorshift = rng;
 
         let num_workers = self.workers().len();
-        (0..num_workers)
+        let worker_indices = (0..num_workers)
             .cycle()
             .skip(rng % num_workers)
-            .take(num_workers)
-            .map(|steal_index| {
-                self.pop_consume(index, steal_index)
-                    .or_else(|| match steal_index {
-                        _ if steal_index == index => None,
-                        _ => self.pop_steal(index, steal_index),
-                    })
-            })
-            .filter_map(|popped| popped)
-            .next()
+            .take(num_workers);
+
+        let mut was_contended = false;
+        for steal_index in worker_indices {
+            match self.pop_consume(index, steal_index) {
+                Ok(popped) => return Ok(popped),
+                Err(Error::Empty) => {},
+                Err(Error::Contended) => was_contended = true,
+            }
+
+            if index != steal_index {
+                if let Some(popped) = self.pop_steal(index, steal_index) {
+                    return Ok(popped);
+                }
+            }
+        }
+
+        if was_contended {
+            Err(Error::Contended)
+        } else {
+            Err(Error::Empty)
+        }
     }
 
     #[cold]
-    fn pop_consume(self: &Arc<Self>, index: usize, target_index: usize) -> Option<Popped> {
+    fn pop_consume(self: &Arc<Self>, index: usize, target_index: usize) -> Result<Popped, Error> {
         self.workers()[index]
             .buffer
             .consume(unsafe { Pin::new_unchecked(&self.workers()[target_index].injector) })

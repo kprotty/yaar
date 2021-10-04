@@ -8,6 +8,12 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Error {
+    Empty,
+    Contended,
+}
+
 pub(crate) struct Popped {
     pub(crate) task: NonNull<Task>,
     pub(crate) pushed: usize,
@@ -74,16 +80,16 @@ impl Injector {
         head != is_consuming
     }
 
-    fn consume<'a>(self: Pin<&'a Self>) -> Option<impl Iterator<Item = NonNull<Task>> + 'a> {
+    fn consume<'a>(self: Pin<&'a Self>) -> Result<impl Iterator<Item = NonNull<Task>> + 'a, Error> {
         let tail = NonNull::new(self.tail.load(Ordering::Acquire));
         if tail.is_none() {
-            return None;
+            return Err(Error::Empty);
         }
 
         let is_consuming = Self::IS_CONSUMING.as_ptr();
         let head = self.head.swap(is_consuming, Ordering::Acquire);
         if head == is_consuming {
-            return None;
+            return Err(Error::Contended);
         }
 
         struct Consumer<'a> {
@@ -136,7 +142,7 @@ impl Injector {
             }
         }
 
-        Some(Consumer {
+        Ok(Consumer {
             injector: self,
             head: NonNull::new(head).unwrap_or(NonNull::from(&self.stub)),
         })
@@ -304,9 +310,9 @@ impl Buffer {
         }
     }
 
-    pub fn consume(&self, injector: Pin<&Injector>) -> Option<Popped> {
+    pub fn consume(&self, injector: Pin<&Injector>) -> Result<Popped, Error> {
         injector.consume().and_then(|mut consumer| {
-            consumer.next().map(|consumed| {
+            consumer.next().ok_or(Error::Empty).map(|consumed| {
                 let head = self.head.load(Ordering::Relaxed);
                 let tail = self.tail.load(Ordering::Relaxed);
 
