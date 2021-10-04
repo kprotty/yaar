@@ -134,10 +134,6 @@ impl Pool {
             }
         }
 
-        if let Some(popped) = self.pop_local(index) {
-            return Some(popped);
-        }
-
         self.pop_search(index, xorshift, is_searching)
     }
 
@@ -170,6 +166,10 @@ impl Pool {
         is_searching: &mut bool,
     ) -> Option<Popped> {
         loop {
+            if let Some(popped) = self.pop_local(index) {
+                return Some(popped);
+            }
+
             if self.io_driver.poll(Some(Duration::ZERO)) {
                 if let Some(popped) = self.pop_local(index) {
                     return Some(popped);
@@ -184,10 +184,6 @@ impl Pool {
 
             if !self.wait(index, is_searching, || self.has_shared()) {
                 return None;
-            }
-
-            if let Some(popped) = self.pop_local(index) {
-                return Some(popped);
             }
         }
     }
