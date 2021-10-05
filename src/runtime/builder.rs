@@ -3,8 +3,8 @@ use std::{num::NonZeroUsize, sync::Arc};
 
 #[derive(Default, Debug, Copy, Clone)]
 pub struct Builder {
-    max_threads: Option<NonZeroUsize>,
-    stack_size: Option<NonZeroUsize>,
+    pub(super) max_threads: Option<NonZeroUsize>,
+    pub(super) stack_size: Option<NonZeroUsize>,
 }
 
 impl Builder {

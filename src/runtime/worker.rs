@@ -1,4 +1,12 @@
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use super::task::Task;
+use std::{cell::RefCell, rc::Rc, sync::Arc, pin::Pin};
+
+pub(super) enum WorkerTask<'a> {
+    Spawned(Pin<&'a Task>),
+    Yielded(Pin<&'a Task>),
+    Scheduled(Pin<&'a Task>),
+    Injected(Pin<&'a Task>),
+}
 
 pub(crate) struct WorkerRef {
     pub(super) pool: Arc<Pool>,
@@ -23,4 +31,27 @@ impl WorkerRef {
     }
 
     fn run_worker(&self) {}
+
+    pub(super) unsafe fn schedule<'a>(&self, worker_task: WorkerTask<'a>) {
+        Self::push(&self.pool, self.index, worker_task)
+    }
+
+    pub(super) unsafe fn push<'a>(pool: &Arc<Pool>, worker_index: usize, worker_task: WorkerTask<'a>) {
+        let (task, be_fair) = match &worker_task {
+            WorkerTask::Yielded(task), => (task, true),
+            WorkerTask::Injected(task) => (task, true),
+            WorkerTask::Spawned(task) => (task, false),
+            WorkerTask::Scheduled(task) => (task, false),
+        };
+
+        let injector = Pin::new_unchecked(&pool.workers[worker_index].injector);
+        let node = Pin::map_unchecked(task, |task| &task.node);
+        if be_fair {
+            injector.push(node);
+        } else {
+            pool.workers[worker_index].buffer.push(node, injector);
+        }
+
+        pool.notify()
+    }
 }
