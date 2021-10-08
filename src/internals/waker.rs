@@ -43,7 +43,7 @@ impl AtomicWaker {
     ///
     /// Must be called by the single consumer thread.
     /// Failure to do so could result in a data-race from reading/writing the `waker` field.
-    pub unsafe fn poll(&self, waker: &Waker) -> Poll<()> {
+    pub fn poll(&self, waker: &Waker) -> Poll<()> {
         let state: WakerState = self.state.load(Ordering::Relaxed).into();
         match state {
             WakerState::Empty | WakerState::Ready => {}

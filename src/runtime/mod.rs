@@ -1,8 +1,7 @@
 mod builder;
-mod container_of;
 mod pool;
+mod queue;
 mod task;
-mod waker;
 mod worker;
 
 pub use builder::Builder;

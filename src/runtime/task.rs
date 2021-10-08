@@ -1,4 +1,8 @@
-use super::{super::task::JoinHandle, container_of::container_of, queue::Node, waker::Waker};
+use crate::{
+    internals::{container_of::container_of, waker::AtomicWaker},
+    runtime::{pool::Pool, queue::Node, worker::WorkerRef},
+    task::JoinHandle,
+};
 use std::{
     any::Any,
     cell::UnsafeCell,
@@ -14,8 +18,20 @@ pub(super) struct Task {
     pub(super) vtable: &'static TaskVTable,
 }
 
+impl Task {
+    /// Upgrades a reference to a Node into a reference to a Task.
+    ///
+    /// # Safety
+    ///
+    /// This assumes the Node reference is valid field of a properly pinned Task
+    pub(super) unsafe fn from_node<'a>(node: Pin<&'a Node>) -> Pin<&'a Self> {
+        let self_ptr = container_of!(Self, node, (&*node as *const Node));
+        Pin::new_unchecked(&*self_ptr.as_ptr())
+    }
+}
+
 struct TaskVTable {
-    clone_fn: fn(task: Pin<&Task>),
+    clone_fn: fn(task: NonNull<Task>),
     drop_fn: fn(task: Pin<&Task>),
     wake_fn: fn(task: Pin<&Task>, wake_by_ref: bool),
     pub(super) poll_fn: fn(task: Pin<&Task>, worker_ref: &WorkerRef),
@@ -99,6 +115,18 @@ impl<F: Future> TaskState<F> {
     };
 
     pub(crate) fn spawn(worker_ref: &WorkerRef, future: F) -> JoinHandle<F::Output> {
+        // SAFETY:
+        // - Pin::into_inner_unchecked(TaskFuture):
+        //   we promise to treat memory as pinned and not move it until the last reference is dropped.
+        //
+        // - Pin::new_unchecked(Task):
+        //   we promise to treat the memory as pinned until the TaskFuture is dropped.
+        //
+        // - JoinHandle::new(Task):
+        //   we promise to keep the task reference alive until the JoinHandle is either consumed, dropped or polled to completion.
+        //
+        // - WorkerRef::schedule(Task):
+        //   same guarantee from the Pin::new_unchecked above
         unsafe {
             let pinned = Pin::into_inner_unchecked(Arc::pin(Self {
                 task: Task {
@@ -122,12 +150,20 @@ impl<F: Future> TaskState<F> {
         }
     }
 
+    /// Upgrades a reference to a Task into a reference to this TaskFuture.
+    ///
+    /// # Safety
+    ///
+    /// This assumes the Task reference is valid field of the TaskFuture
     unsafe fn from_task<'a>(task: Pin<&'a Task>) -> Pin<&'a Self> {
         let self_ptr = container_of!(Self, task, (&*task as *const Task));
         Pin::new_unchecked(&*self_ptr.as_ptr())
     }
 
     fn on_clone(task: Pin<&Task>) {
+        // SAFETY:
+        // Only called by the TaskVTable for this TaskFuture, making from_task() sound.
+        // Also, TaskFutures are only created via Arc::pin() so getting their Arc is sound.
         unsafe {
             let self_ptr = NonNull::from(&*Self::from_task(task));
             let self_arc = Arc::from_raw(self_ptr.as_ptr());
@@ -137,14 +173,22 @@ impl<F: Future> TaskState<F> {
     }
 
     fn on_drop(task: Pin<&Task>) {
+        // SAFETY:
+        // Only called by the TaskVTable & related functions for this TaskFuture, making from_task() sound.
+        // Also, TaskFutures are only created via Arc::pin() so getting their Arc is sound.
         unsafe {
-            let self_ptr = NonNull::from(&*Self::from_task(task));
+            let self_ptr = NonNull::from(&*Self::from_task(task)); // consumes the &Task, no dangling refs
             let self_arc = Arc::from_raw(self_ptr.as_ptr());
-            mem::drop(self_arc);
+            mem::drop(self_arc) // decrement the TaskFuture ref count
         }
     }
 
     fn on_wake(task: Pin<&Task>, wake_by_ref: bool) {
+        // SAFETY:
+        // - Only called by the TaskVTable for this TaskFuture, making from_task() sound.
+        // - on_drop() can be safely called for !wake_by_ref given that
+        //   a schedule(task) occurs only if the Future is still active
+        //   (ref_count > 2 given the Waker calling).
         unsafe {
             let result = Self::from_task(task.as_ref()).state.fetch_update(
                 Ordering::AcqRel,
@@ -188,6 +232,10 @@ impl<F: Future> TaskState<F> {
     }
 
     fn on_poll(task: Pin<&Task>, worker_ref: &WorkerRef) {
+        // SAFETY:
+        // - schedule(Task) required unsafe to ensure that:
+        //   - the Task stays alive until its scheduled & polled here
+        //   - the Task is polled only by one thread at a time (&mut *data.get())
         unsafe {
             let this = Self::from_task(task.as_ref());
 
@@ -274,19 +322,67 @@ impl<F: Future> TaskState<F> {
                 TaskData::Polling(future) => mem::drop(future),
             }
 
+            // Release barrier ensures TaskData write is visible to on_consume
             let new_state: usize = TaskState::COMPLETED.into();
             this.state.store(new_state, Ordering::Release);
             this.waker.wake();
 
             worker_ref.pool.mark_task_complete();
-            mem::drop(this);
+            mem::drop(this); // on_drop() may free this so don't keep dangling reference
             Self::on_drop(task)
         }
     }
 
-    fn on_join(task: Pin<&Task>, waker: &Waker, output: NonNull<()>) -> Poll<()> {}
+    fn on_join(task: Pin<&Task>, waker: &Waker, output: NonNull<()>) -> Poll<()> {
+        // SAFETY:
+        // Only called by JoinHandle::poll() which verifies that
+        // - from_task() is valid here from JoinHandle::new()
+        // - The caller ensures that they're the sole thread calling on_consume/on_join/on_detach
+        unsafe {
+            match Self::from_task(task).waker.poll(waker) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(_) => Poll::Ready(Self::on_consume(output)),
+            }
+        }
+    }
 
-    fn on_detach(task: Pin<&Task>) {}
+    fn on_detach(task: Pin<&Task>) {
+        // SAFETY:
+        // Only called by JoinHandle::drop() which verifies that
+        // - from_task() is valid here from JoinHandle::new()
+        // - The caller ensures that they're the sole thread calling on_consume/on_join/on_detach
+        unsafe {
+            Self::from_task(task.as_ref()).waker.detach();
+            Self::on_drop(task)
+        }
+    }
 
-    fn on_consume(task: Pin<&Task>, output: NonNull<()>) {}
+    fn on_consume(task: Pin<&Task>, output: NonNull<()>) {
+        // SAFETY:
+        // Only called by JoinHandle::poll() or JoinHandle::consume() which verifies that
+        // - from_task() is valid here from JoinHandle::new()
+        // - The caller ensures that output is a NonNull<F::Output> which points to a valid F::Output.
+        // - The caller ensures that they're the sole thread calling on_consume/on_join/on_detach
+        unsafe {
+            let this = Self::from_task(task.as_ref());
+            let output_ptr = output.cast::<F::Output>().as_ptr();
+
+            let state: TaskState = this.state.load(Ordering::Acquire).into();
+            assert_eq!(
+                state,
+                TaskState::COMPLETED,
+                "JoinHandle::consume() when future is not completed"
+            );
+
+            match mem::replace(&mut *this.data.get(), TaskData::Consumed) {
+                TaskData::Consumed => unreachable!("Future already consumed when consuming"),
+                TaskData::Polling(_) => unreachable!("Future being consumed while polling"),
+                TaskData::Ready(Err(panic_payload)) => std::panic::resume_unwind(panic_payload),
+                TaskData::Ready(Ok(output)) => ptr::write(output_ptr, output),
+            }
+
+            mem::drop(this); // on_drop() may free this, so don't keep dangling refs around
+            Self::on_drop(task)
+        }
+    }
 }

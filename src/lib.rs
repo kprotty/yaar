@@ -5,6 +5,9 @@
     unreachable_pub
 )]
 
+#[cfg(any(feature = "rt", feature = "sync"))]
+mod internals;
+
 #[cfg(feature = "rt")]
 pub mod runtime;
 

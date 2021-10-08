@@ -4,6 +4,7 @@ use std::{
     marker::PhantomData,
     mem::MaybeUninit,
     pin::Pin,
+    ptr::NonNull,
     task::{Context, Poll, Waker},
 };
 
@@ -24,11 +25,12 @@ impl<T> Future for JoinHandle<T> {
 
         let mut output = MaybeUninit::<T>::uninit();
         let output_ptr = NonNull::new(output.as_mut_ptr()).unwrap();
+        let polled = (task.vtable.join_fn)(task, ctx.waker(), output_ptr.cast());
 
-        match (task.vtable.join_fn)(task, ctx.waker(), output_ptr.cast()) {
+        match polled {
             Poll::Ready(()) => Poll::Ready(unsafe { output.assume_init() }),
             Poll::Pending => {
-                self.task = Some(task);
+                self.task = Some(NonNull::from(&*task));
                 Poll::Pending
             }
         }
@@ -44,9 +46,9 @@ impl<T> Drop for JoinHandle<T> {
 }
 
 impl<T> JoinHandle<T> {
-    pub(crate) unsafe fn new(task: NonNull<Task>) -> Self {
+    pub(crate) unsafe fn new(task: Pin<&'a Task>) -> Self {
         Self {
-            task: Some(task),
+            task: Some(NonNull::from(&*task)),
             _phantom: PhantomData,
         }
     }
@@ -65,6 +67,7 @@ impl<T> JoinHandle<T> {
         let mut output = MaybeUninit::<T>::uninit();
         let output_ptr = NonNull::new(output.as_mut_ptr()).unwrap();
         (task.vtable.consume_fn)(task, output_ptr.cast());
+
         unsafe { output.assume_init() }
     }
 }

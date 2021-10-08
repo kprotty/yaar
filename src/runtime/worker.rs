@@ -1,5 +1,14 @@
-use super::task::Task;
-use std::{cell::RefCell, rc::Rc, sync::Arc, pin::Pin};
+use super::{
+    pool::Pool,
+    queue::{Buffer, Injector, List},
+};
+use std::{cell::RefCell, pin::Pin, rc::Rc, sync::Arc};
+
+#[derive(Default)]
+pub(super) struct Worker {
+    buffer: Buffer,
+    injector: Injector,
+}
 
 pub(super) enum WorkerTask<'a> {
     Spawned(Pin<&'a Task>),
@@ -24,8 +33,7 @@ impl WorkerRef {
     }
 
     pub(super) fn run(self) {
-        let rc = Rc::new(self);
-        let old_rc = Self::with_tls(|tls| mem::replace(tls, Some(rc.clone())));
+        let old_rc = Self::with_tls(|tls| mem::replace(tls, Some(Rc::new(self))));
         rc.run_worker();
         Self::with_tls(|tls| *tls = old_rc);
     }
@@ -36,9 +44,13 @@ impl WorkerRef {
         Self::push(&self.pool, self.index, worker_task)
     }
 
-    pub(super) unsafe fn push<'a>(pool: &Arc<Pool>, worker_index: usize, worker_task: WorkerTask<'a>) {
+    pub(super) unsafe fn push<'a>(
+        pool: &Arc<Pool>,
+        worker_index: usize,
+        worker_task: WorkerTask<'a>,
+    ) {
         let (task, be_fair) = match &worker_task {
-            WorkerTask::Yielded(task), => (task, true),
+            WorkerTask::Yielded(task) => (task, true),
             WorkerTask::Injected(task) => (task, true),
             WorkerTask::Spawned(task) => (task, false),
             WorkerTask::Scheduled(task) => (task, false),
@@ -46,8 +58,9 @@ impl WorkerRef {
 
         let injector = Pin::new_unchecked(&pool.workers[worker_index].injector);
         let node = Pin::map_unchecked(task, |task| &task.node);
+
         if be_fair {
-            injector.push(node);
+            injector.push(List::from(node));
         } else {
             pool.workers[worker_index].buffer.push(node, injector);
         }
