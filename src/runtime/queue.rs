@@ -1,9 +1,9 @@
 use super::task::Task;
 use std::{
+    hint::spin_loop as spin_loop_hint,
     mem,
     pin::Pin,
     ptr::{self, NonNull},
-    hint::spin_loop as spin_loop_hint,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
@@ -54,12 +54,12 @@ impl Queue {
         unsafe { self.map_unchecked(|queue| &queue.injector) };
     }
 
-    pub unsafe fn fill(self: Pin<&Self>, mut list: List) {
+    pub fn fill(self: Pin<&Self>, mut list: List) {
         self.buffer.fill(&mut list);
         self.injector().push(list);
     }
 
-    pub unsafe fn inject(self: Pin<&Self>, list: List) {
+    pub fn inject(self: Pin<&Self>, list: List) {
         self.injector().push(list);
     }
 
@@ -96,7 +96,7 @@ struct Injector {
 }
 
 impl Injector {
-    pub unsafe fn push(self: Pin<&Self>, list: List) {
+    pub fn push(self: Pin<&Self>, list: List) {
         list.head.map(|head| {
             let tail = list.tail.expect("List with head and not tail");
             assert_eq!(tail.as_ref().next.load(Ordering::Relaxed), ptr::null_mut());
@@ -124,8 +124,9 @@ impl Injector {
                     if ptr::eq(head.as_ptr(), stub.as_ptr()) {
                         head = NonNull::new(head.as_ref().next.load(Ordering::Acquire))?;
                     }
-                    
-                    if let Some(new_head) = NonNull::new(head.as_ref().next.load(Ordering::Acquire)) {
+
+                    if let Some(new_head) = NonNull::new(head.as_ref().next.load(Ordering::Acquire))
+                    {
                         self.head = Some(new_head);
                         return Some(head);
                     }
@@ -145,7 +146,7 @@ impl Injector {
                             Err(_) => self.head = Some(head),
                         }
                     }
-                    
+
                     spin_loop_hint();
                     self.head = NonNull::new(head.as_ref().next.load(Ordering::Acquire))?;
                     Some(head)
@@ -155,7 +156,11 @@ impl Injector {
 
         impl<'a> Drop for Consumer<'a> {
             fn drop(&mut self) {
-                let new_head = self.head.map(|head| head.as_ptr()).unwrap_or(ptr::null_mut());
+                let new_head = self
+                    .head
+                    .map(|head| head.as_ptr())
+                    .unwrap_or(ptr::null_mut());
+                    
                 let stub = NonNull::from(&self.injector.stub).as_ptr();
                 assert_ne!(new_head, stub);
 
@@ -218,7 +223,7 @@ impl Buffer {
     pub unsafe fn push(&self, task: NonNull<Task>, injector: Pin<&Injector>) {
         let tail = self.tail.load(Ordering::Relaxed);
         let mut head = self.head.load(Ordering::Relaxed);
-        
+
         loop {
             let size = tail.wrapping_sub(head);
             assert!(size <= self.array.len());
@@ -228,7 +233,7 @@ impl Buffer {
                 self.tail.store(tail.wrapping_add(1), Ordering::Release);
                 return;
             }
-            
+
             let migrate = size / 2;
             if let Err(new_head) = self.head.compare_exchange_weak(
                 head,
@@ -255,7 +260,7 @@ impl Buffer {
     pub fn pop(&self) -> Option<NonNull<Task>> {
         let tail = self.tail.load(Ordering::Relaxed);
         let mut head = self.head.load(Ordering::Relaxed);
-        
+
         loop {
             let size = tail.wrapping_sub(head);
             assert!(size <= self.array.len());
@@ -340,14 +345,12 @@ impl Buffer {
 
         let size = tail.wrapping_sub(head);
         assert!(size <= self.array.len());
-        
+
         let available = self.array.len() - size;
-        let new_tail = tasks
-            .take(available)
-            .fold(tail, |new_tail, task| {
-                self.write(new_tail, task);
-                new_tail.wrapping_add(1)
-            });
+        let new_tail = tasks.take(available).fold(tail, |new_tail, task| {
+            self.write(new_tail, task);
+            new_tail.wrapping_add(1)
+        });
 
         if tail != new_tail {
             self.tail.store(new_tail, Ordering::Release);
