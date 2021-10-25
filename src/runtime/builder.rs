@@ -1,38 +1,51 @@
-use super::{pool::Pool, task::TaskFuture, worker::WorkerRef};
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{future::Future, num::NonZeroUsize};
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default)]
 pub struct Builder {
-    pub(super) max_threads: Option<NonZeroUsize>,
+    pub(super) workers: Option<NonZeroUsize>,
+    pub(super) blocking: Option<NonZeroUsize>,
     pub(super) stack_size: Option<NonZeroUsize>,
+    pub(super) name_gen: Option<Box<dyn Fn() -> String + Send + Sync + 'static>>,
 }
 
 impl Builder {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            max_threads: None,
+            workers: None,
+            blocking: None,
             stack_size: None,
+            name_gen: None,
         }
     }
 
-    pub fn max_threads(mut self, max_threads: usize) -> Self {
-        self.max_threads = NonZeroUsize::new(max_threads);
+    pub fn worker_threads(&mut self, thread_count: usize) -> &mut Self {
+        self.workers = NonZeroUsize::new(thread_count);
         self
     }
 
-    pub fn stack_size(mut self, stack_size: usize) -> Self {
-        self.stack_size = NonZeroUsize::new(stack_size);
+    pub fn max_blocking_threads(&mut self, thread_count: usize) -> &mut Self {
+        self.blocking = NonZeroUsize::new(thread_count);
         self
     }
 
-    pub fn block_on(&self, future: F) -> F::Output
+    pub fn thread_stack_size(&mut self, bytes: usize) -> &mut Self {
+        self.stack_size = NonZeroUsize::new(bytes);
+        self
+    }
+
+    pub fn thread_name_gen(
+        &mut self,
+        name_gen: impl Fn() -> String + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.name_gen = Some(Box::new(name_gen));
+        self
+    }
+
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output
     where
-        F: Future + Send,
+        F: Send,
         F::Output: Send,
     {
-        let pool = Arc::new(Pool::from(self));
-        let worker_ref = WorkerRef { pool, index: 0 };
-        let join_handle = TaskFuture::spawn(&worker_ref, future);
-        join_handle.consume()
+        unimplemented!("TODO")
     }
 }

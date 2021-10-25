@@ -1,7 +1,6 @@
 mod builder;
-mod pool;
+mod executor;
 mod queue;
 mod task;
-mod worker;
 
 pub use builder::Builder;
