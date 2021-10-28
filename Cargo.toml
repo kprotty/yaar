@@ -5,7 +5,18 @@ version = "0.2.0"
 edition = "2021"
 authors = ["kprotty"]
 
+[features]
+default = []
+full = ["rt"]
+
+io = ["tokio"]
+fs = ["io", "libc"]
+net = ["io", "libc"]
+sync = ["libc"]
+time = ["libc"]
+rt = ["libc", "num_cpus"]
+
 [dependencies]
-tokio = { version = "1" }
-num_cpus = { version = "1" }
-mio = { version = "0.7", features = ["net", "os-poll"] }
+libc = { version = "0.2", optional = true }
+num_cpus = { version = "1", optional = true }
+tokio = { version = "1", features = ["io-util"], optional = true }
