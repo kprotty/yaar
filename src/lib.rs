@@ -1,3 +1,13 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![warn(
+    // missing_debug_implementations,
+    // missing_docs,
+    rust_2018_idioms,
+    // unreachable_pub
+)]
+
+mod internal;
+
 #[cfg(feature = "rt")]
 pub mod runtime;
 

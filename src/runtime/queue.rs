@@ -110,7 +110,7 @@ impl Injector {
     pub fn push(self: Pin<&Self>, list: List) {
         list.head.map(|head| unsafe {
             let tail = list.tail.expect("List with head and not tail");
-            assert_eq!(tail.as_ref().next.load(Ordering::Relaxed), ptr::null_mut());
+            debug_assert_eq!(tail.as_ref().next.load(Ordering::Relaxed), ptr::null_mut());
 
             let old_tail = self.tail.swap(tail.as_ptr(), Ordering::AcqRel);
             let prev = NonNull::new(old_tail).unwrap_or(NonNull::from(&self.stub));
@@ -161,7 +161,7 @@ impl Injector {
                     new_head = ptr::null_mut();
                 }
 
-                assert_eq!(self.injector.head.load(Ordering::Relaxed), stub);
+                debug_assert_eq!(self.injector.head.load(Ordering::Relaxed), stub);
                 self.injector.head.store(new_head, Ordering::Release);
             }
         }
