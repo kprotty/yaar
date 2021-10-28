@@ -13,13 +13,25 @@ pub struct List {
     tail: Option<NonNull<Task>>,
 }
 
-impl List {
-    pub unsafe fn push(&mut self, task: NonNull<Task>) {
-        task.as_ref().next.store(ptr::null_mut(), Ordering::Relaxed);
-        match mem::replace(&mut self.tail, Some(task)) {
-            Some(tail) => tail.as_ref().next.store(task.as_ptr(), Ordering::Relaxed),
-            None => self.head = Some(task),
+impl<'a> From<Pin<&'a Task>> for List {
+    fn from(task: Pin<&'a Task>) -> Self {
+        task.next.store(ptr::null_mut(), Ordering::Relaxed);
+        List {
+            head: Some(NonNull::from(&*task)),
+            tail: Some(NonNull::from(&*task))
         }
+    }
+}
+
+impl List {
+    pub fn push(&mut self, list: impl Into<List>) {
+        let list = list.into();
+        list.head.map(|list_head| unsafe {
+            match mem::replace(&mut self.tail, list.tail) {
+                Some(tail) => tail.as_ref().next.store(list_head.as_ptr(), Ordering::Relaxed),
+                None => self.head = Some(list_head),
+            }
+        })
     }
 }
 
@@ -27,13 +39,12 @@ impl Iterator for List {
     type Item = NonNull<Task>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.head.map(|task| unsafe {
-            self.head = NonNull::new(task.as_ref().next.load(Ordering::Relaxed));
-            if self.head.is_none() {
-                self.tail = None;
-            }
-            task
-        })
+        let task = self.head?;
+        self.head = NonNull::new(unsafe { task.as_ref().next.load(Ordering::Relaxed) });
+        if self.head.is_none() {
+            self.tail = None;
+        }
+        task
     }
 }
 
@@ -63,7 +74,7 @@ impl Queue {
         self.injector().push(list);
     }
 
-    pub unsafe fn push(self: Pin<&Self>, task: NonNull<Task>) {
+    pub fn push(self: Pin<&Self>, task: Pin<&Task>) {
         self.buffer.push(task, self.as_ref().injector());
     }
 
@@ -97,7 +108,7 @@ struct Injector {
 
 impl Injector {
     pub fn push(self: Pin<&Self>, list: List) {
-        list.head.map(|head| {
+        list.head.map(|head| unsafe {
             let tail = list.tail.expect("List with head and not tail");
             assert_eq!(tail.as_ref().next.load(Ordering::Relaxed), ptr::null_mut());
 
@@ -110,7 +121,7 @@ impl Injector {
     pub fn consume(self: Pin<&Self>) -> Result<impl Iterator<Item = NonNull<Task>> + '_, Error> {
         struct Consumer<'a> {
             injector: Pin<&'a Self>,
-            head: Option<NonNull<Task>>,
+            head: NonNull<Task>,
         }
 
         impl<'a> Iterator for Consumer<'a> {
@@ -119,73 +130,57 @@ impl Injector {
             fn next(&mut self) -> Option<Self::Item> {
                 unsafe {
                     let stub = NonNull::from(&self.injector.stub);
-
-                    let mut head = self.head.unwrap_or(stub);
-                    if ptr::eq(head.as_ptr(), stub.as_ptr()) {
-                        head = NonNull::new(head.as_ref().next.load(Ordering::Acquire))?;
+                    if self.head == stub {
+                        self.head = NonNull::new(self.head.as_ref().next.load(Ordering::Acquire))?;
                     }
 
-                    if let Some(new_head) = NonNull::new(head.as_ref().next.load(Ordering::Acquire))
-                    {
-                        self.head = Some(new_head);
-                        return Some(head);
-                    }
-
-                    let tail = self.injector.tail.load(Ordering::Relaxed);
-                    if ptr::eq(head.as_ptr(), tail) {
-                        self.head = None;
-                        stub.as_ref().next.store(ptr::null_mut(), Ordering::Relaxed);
-
-                        match self.injector.tail.compare_exchange(
-                            tail,
-                            ptr::null_mut(),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) => return Some(head),
-                            Err(_) => self.head = Some(head),
+                    let next = NonNull::new(self.head.as_ref().next.load(Ordering::Acquire)).or_else(|| {
+                        let tail = self.injector.tail.load(Ordering::Relaxed);
+                        if self.head != NonNull::new(tail) {
+                            return None;
                         }
-                    }
+                        
+                        let stub = Pin::new_unchecked(stub.as_ref());
+                        self.injector.push(List::from(stub));
+                        
+                        spin_loop_hint();
+                        NonNull::new(self.head.as_ref().next.load(Ordering::Acquire))
+                    })?;
 
-                    spin_loop_hint();
-                    self.head = NonNull::new(head.as_ref().next.load(Ordering::Acquire))?;
-                    Some(head)
+                    mem::replace(&mut self.head, next)
                 }
             }
         }
 
         impl<'a> Drop for Consumer<'a> {
             fn drop(&mut self) {
-                let new_head = self
-                    .head
-                    .map(|head| head.as_ptr())
-                    .unwrap_or(ptr::null_mut());
-                    
                 let stub = NonNull::from(&self.injector.stub).as_ptr();
-                assert_ne!(new_head, stub);
+
+                let mut new_head = self.head.as_ptr();
+                if new_head == stub {
+                    new_head = ptr::null_mut();
+                }
 
                 assert_eq!(self.injector.head.load(Ordering::Relaxed), stub);
                 self.injector.head.store(new_head, Ordering::Release);
             }
         }
 
-        if self.tail.load(Ordering::Relaxed).is_null() {
+        let stub = NonNull::from(&self.injector.stub);
+
+        let tail = NonNull::new(self.tail.load(Ordering::Relaxed)).unwrap_or(stub);
+        if tail == stub {
             return Err(Error::Empty);
         }
 
-        let stub = NonNull::from(&self.stub).as_ptr();
-        if ptr::eq(self.head.load(Ordering::Relaxed), stub) {
-            return Err(Error::Contended);
-        }
-
-        let head = self.head.swap(stub, Ordering::Acquire);
-        if ptr::eq(head, stub) {
+        let head = NonNull::new(self.head.swap(stub.as_ptr(), Ordering::Acquire));
+        if head == Some(stub) {
             return Err(Error::Contended);
         }
 
         Ok(Consumer {
             injector: self,
-            head: NonNull::new(head),
+            head: head.unwrap_or(stub),
         })
     }
 }
@@ -220,7 +215,8 @@ impl Buffer {
         NonNull::new(slot.load(Ordering::Relaxed)).unwrap()
     }
 
-    pub unsafe fn push(&self, task: NonNull<Task>, injector: Pin<&Injector>) {
+    pub fn push(&self, task: Pin<&Task>, injector: Pin<&Injector>) {
+        let task = NonNull::from(&*task);
         let tail = self.tail.load(Ordering::Relaxed);
         let mut head = self.head.load(Ordering::Relaxed);
 
@@ -235,6 +231,10 @@ impl Buffer {
             }
 
             let migrate = size / 2;
+            if migrate == 0 {
+                return injector.push(List::from(task));
+            }
+
             if let Err(new_head) = self.head.compare_exchange_weak(
                 head,
                 head.wrapping_add(migrate),
@@ -248,7 +248,8 @@ impl Buffer {
             let mut overflowed = List::default();
             for offset in 0..migrate {
                 let index = head.wrapping_add(offset);
-                overflowed.push(self.read(index));
+                let migrated = self.read(index);
+                overflowed.push(Pin::new_unchecked(migrated.as_ref()));
             }
 
             overflowed.push(task);
