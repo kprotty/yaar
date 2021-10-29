@@ -36,8 +36,10 @@ impl Thread {
             prng: RandomSource::default(),
         }));
 
-        Self::with_tls(|tls| mem::replace(tls, Some(thread.clone())))
-            .expect("Cannot run multiple runtimes in the same thread");
+        match Self::with_tls(|tls| mem::replace(tls, Some(thread.clone()))) {
+            Some(_) => unreachable!("Cannot run multiple runtimes in the same thread"),
+            None => {},
+        }
 
         while let Some(task) = Self::poll(&*thread, executor) {
             task.run(executor, {

@@ -147,8 +147,16 @@ impl ThreadPool {
             }
 
             pool.idle += 1;
+            if let Some(callback) = self.config.on_thread_park.as_ref() {
+                (callback)();
+            }
+
             timed_out = self.cond.wait_until(&mut pool, force_deadline).timed_out();
+
             pool.idle -= 1;
+            if let Some(callback) = self.config.on_thread_unpark.as_ref() {
+                (callback)();
+            }
         }
     }
 

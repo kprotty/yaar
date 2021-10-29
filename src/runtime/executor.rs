@@ -25,8 +25,13 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new(worker_threads: NonZeroUsize, config: ThreadPoolConfig) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(worker_threads: NonZeroUsize, mut config: ThreadPoolConfig) -> Arc<Self> {
+        config.max_threads = config
+            .max_threads
+            .or_else(|| NonZeroUsize::new(512))
+            .and_then(|max_threads| NonZeroUsize::new(max_threads.get() + worker_threads.get()));
+
+        let executor = Arc::new(Self {
             idle: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
             iter_gen: RandomIterGen::from(worker_threads),
@@ -35,7 +40,13 @@ impl Executor {
             workers: (0..worker_threads.get())
                 .map(|_| Worker::default())
                 .collect(),
-        })
+        });
+
+        for worker_index in (0..worker_threads.get()).rev() {
+            executor.push_idle_worker(worker_index);
+        }
+
+        executor
     }
 
     pub fn schedule(self: &Arc<Self>, task: Task, worker_index: Option<usize>) {

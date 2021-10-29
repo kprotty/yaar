@@ -55,16 +55,17 @@ impl RandomSource {
         self.xorshift ^= self.xorshift >> shifts.1;
         self.xorshift ^= self.xorshift << shifts.2;
 
-        let mut rng = self.xorshift;
         let range = gen.range.get();
         let prime = gen.co_prime.get();
+        let mut rng = self.xorshift % range;
 
         (0..range).map(move |_| {
             rng += prime;
             if rng >= range {
                 rng -= prime;
             }
-            debug_assert!(rng < range);
+
+            assert!(rng < range);
             rng
         })
     }
