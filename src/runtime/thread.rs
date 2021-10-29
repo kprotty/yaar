@@ -1,5 +1,7 @@
-use super::{executor::Executor, pool::Notified, queue::Task};
-use std::{cell::RefCell, collections::VecDeque, mem, rc::Rc, sync::Arc};
+use super::{executor::Executor, rand::RandomSource, pool::Notified, queue::{PopError, Task}};
+use std::{
+    cell::RefCell, collections::VecDeque, hint::spin_loop as spin_loop_hint, mem, rc::Rc, sync::Arc,
+};
 
 pub struct Thread {
     pub(super) executor: Arc<Executor>,
@@ -7,6 +9,7 @@ pub struct Thread {
     pub(super) poll_ready: RefCell<VecDeque<Task>>,
     pub(super) is_polling: bool,
     is_searching: bool,
+    prng: RandomSource,
 }
 
 impl Thread {
@@ -26,6 +29,7 @@ impl Thread {
             poll_ready: RefCell::new(VecDeque::new()),
             is_polling: false,
             is_searching: notified.searching,
+            prng: RandomSource::default(),
         }));
 
         Self::with_tls(|tls| mem::replace(tls, Some(thread.clone())))
@@ -76,6 +80,24 @@ impl Thread {
     }
 
     fn search(&mut self, worker_index: usize) -> Option<Task> {
-        unimplemented!("TODO")
+        let mut attempts = 32usize;
+        loop {
+            let mut was_contended = false;
+            for steal_index in self.prng.iter(self.executor.iter_gen) {
+                match self.executor.workers[steal_index].run_queue.pop() {
+                    Ok(task) => return Some(task),
+                    Err(PopError::Empty) => continue,
+                    Err(PopError::Contended) => was_contended = true,
+                }
+            }
+
+            if was_contended && attempts != 0 {
+                attempts -= 1;
+                spin_loop_hint();
+                continue;
+            }
+
+            return None;
+        }
     }
 }

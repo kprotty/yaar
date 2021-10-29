@@ -291,7 +291,7 @@ where
         let worker_index = thread
             .worker_index
             .expect("spawn() called from blocking thread");
-            
+
         spawn_with(future, &thread.executor, worker_index, false)
     })
     .expect("spawn() called outside the runtime")

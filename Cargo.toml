@@ -6,6 +6,7 @@ edition = "2021"
 authors = ["kprotty"]
 
 [dependencies]
+gcd = "2"
 num_cpus = "1"
 try-lock = "0.2"
 parking_lot = "0.11"

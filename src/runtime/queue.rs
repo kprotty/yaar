@@ -9,7 +9,7 @@ use std::{
 use try_lock::TryLock;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
-pub enum Error {
+pub enum PopError {
     Empty,
     Contended,
 }
@@ -43,14 +43,14 @@ impl Queue {
         self.pending.load(Ordering::Acquire)
     }
 
-    pub fn pop(&self) -> Result<Task, Error> {
+    pub fn pop(&self) -> Result<Task, PopError> {
         if !self.pending.load(Ordering::Relaxed) {
-            return Err(Error::Empty);
+            return Err(PopError::Empty);
         }
 
         let mut consumer = match self.consumer.try_lock() {
             Some(guard) => guard,
-            _ => return Err(Error::Contended),
+            _ => return Err(PopError::Contended),
         };
 
         if let Some(node) = consumer.pop_front() {
@@ -58,7 +58,7 @@ impl Queue {
         }
 
         if !self.pending.load(Ordering::Relaxed) {
-            return Err(Error::Empty);
+            return Err(PopError::Empty);
         }
 
         match self.producer.try_lock() {
@@ -66,9 +66,9 @@ impl Queue {
                 mem::swap(&mut *consumer, &mut *producer);
                 self.pending.store(consumer.len() > 0, Ordering::Relaxed);
             }
-            _ => return Err(Error::Contended),
+            _ => return Err(PopError::Contended),
         }
 
-        consumer.pop_front().ok_or(Error::Empty)
+        consumer.pop_front().ok_or(PopError::Empty)
     }
 }

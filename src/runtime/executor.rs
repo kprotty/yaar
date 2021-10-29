@@ -1,6 +1,7 @@
 use super::{
     pool::{Notified, ThreadPool},
     queue::{Queue, Task},
+    rand::RandomIterGen,
 };
 use std::{
     sync::atomic::{fence, AtomicUsize, Ordering},
@@ -9,15 +10,16 @@ use std::{
 
 pub struct Worker {
     idle_next: AtomicUsize,
-    pub(super) run_queue: Queue,
+    pub run_queue: Queue,
 }
 
 pub struct Executor {
     idle: AtomicUsize,
     searching: AtomicUsize,
-    pub(super) injector: Queue,
-    pub(super) thread_pool: ThreadPool,
-    pub(super) workers: Box<[Worker]>,
+    pub iter_gen: RandomIterGen,
+    pub injector: Queue,
+    pub thread_pool: ThreadPool,
+    pub workers: Box<[Worker]>,
 }
 
 impl Executor {
