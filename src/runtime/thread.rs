@@ -38,7 +38,7 @@ impl Thread {
 
         match Self::with_tls(|tls| mem::replace(tls, Some(thread.clone()))) {
             Some(_) => unreachable!("Cannot run multiple runtimes in the same thread"),
-            None => {},
+            None => {}
         }
 
         while let Some(task) = Self::poll(&*thread, executor) {
@@ -61,6 +61,10 @@ impl Thread {
             let mut this = thread.borrow_mut();
             if let Some(worker_index) = this.worker_index {
                 if let Some(task) = this.pop(worker_index) {
+                    return Some(task);
+                }
+
+                if let Ok(task) = executor.injector.pop() {
                     return Some(task);
                 }
 
