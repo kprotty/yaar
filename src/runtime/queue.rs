@@ -1,12 +1,10 @@
-use super::task::TaskPoll;
+use super::task::TaskRunnable;
 use parking_lot::Mutex;
 use std::{
-    any::Any,
     collections::VecDeque,
     mem,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
-    task::Waker,
 };
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -15,7 +13,7 @@ pub enum Error {
     Contended,
 }
 
-pub type Task = Arc<dyn TaskPoll>;
+pub type Task = Arc<dyn TaskRunnable>;
 
 pub struct Queue {
     pending: AtomicBool,
