@@ -34,10 +34,18 @@ pub struct RandomSource {
 
 impl Default for RandomSource {
     fn default() -> Self {
+        #[cfg(target_pointer_width = "64")]
+        const HASH: usize = 0x9E3779B97F4A7C15;
+
+        #[cfg(target_pointer_width = "32")]
+        const HASH: usize = 0x9E3779B9;
+
         static SEED: AtomicUsize = AtomicUsize::new(0);
+        let seed = SEED.fetch_add(1, Ordering::Relaxed).wrapping_mul(HASH);
+
         Self {
-            xorshift: NonZeroUsize::new(SEED.fetch_add(1, Ordering::Relaxed))
-                .map(|s| s.get())
+            xorshift: NonZeroUsize::new(seed)
+                .map(|seed| seed.get())
                 .unwrap_or(0xdeadbeef),
         }
     }
@@ -62,7 +70,7 @@ impl RandomSource {
         (0..range).map(move |_| {
             rng += prime;
             if rng >= range {
-                rng -= prime;
+                rng -= range;
             }
 
             assert!(rng < range);
