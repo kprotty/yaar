@@ -6,9 +6,10 @@ use std::{
     future::Future,
     mem, panic,
     pin::Pin,
+    sync::Arc,
+    cell::RefCell,
     sync::{
         atomic::{AtomicU8, Ordering},
-        Arc,
     },
     task::{ready, Context, Poll, Wake, Waker},
 };
@@ -144,7 +145,7 @@ where
             if thread.is_polling {
                 thread.poll_ready.push_back(task);
             } else {
-                thread.executor.schedule(task, thread.worker_index);
+                thread.executor.schedule(task, Some(thread));
             }
         });
 
@@ -175,7 +176,7 @@ where
 }
 
 pub trait TaskRunnable: Send + Sync {
-    fn run(self: Arc<Self>, executor: &Arc<Executor>, worker_index: usize);
+    fn run(self: Arc<Self>, executor: &Arc<Executor>, thread: &RefCell<Thread>);
 }
 
 impl<F> TaskRunnable for Task<F>
@@ -183,7 +184,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send,
 {
-    fn run(self: Arc<Self>, executor: &Arc<Executor>, worker_index: usize) {
+    fn run(self: Arc<Self>, executor: &Arc<Executor>, thread: &RefCell<Thread>) {
         let shutdown = self.transition_to_running();
 
         let mut data = self.data.lock();
@@ -207,7 +208,7 @@ where
                 if self.transition_to_idle() {
                     return;
                 } else {
-                    return executor.schedule(self, Some(worker_index));
+                    return executor.schedule(self, Some(&*thread.borrow()));
                 }
             }
         };
@@ -277,12 +278,12 @@ impl<T> Future for JoinHandle<T> {
     }
 }
 
-pub(crate) fn block_on<F>(future: F, executor: &Arc<Executor>, worker_index: usize) -> F::Output
+pub(crate) fn block_on<F>(future: F, executor: &Arc<Executor>) -> F::Output
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    spawn_with(future, executor, worker_index, true).consume()
+    spawn_with(future, executor, None, true).consume()
 }
 
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
@@ -291,11 +292,7 @@ where
     F::Output: Send + 'static,
 {
     Thread::with_current(|thread| {
-        let worker_index = thread
-            .worker_index
-            .expect("spawn() called from blocking thread");
-
-        spawn_with(future, &thread.executor, worker_index, false)
+        spawn_with(future, &thread.executor, Some(thread), false)
     })
     .expect("spawn() called outside the runtime")
 }
@@ -303,7 +300,7 @@ where
 fn spawn_with<F>(
     future: F,
     executor: &Arc<Executor>,
-    worker_index: usize,
+    thread: Option<&Thread>,
     shutdown: bool,
 ) -> JoinHandle<F::Output>
 where
@@ -311,7 +308,7 @@ where
     F::Output: Send + 'static,
 {
     let task = Arc::new(Task::new(future, executor.clone(), shutdown));
-    executor.schedule(task.clone(), Some(worker_index));
+    executor.schedule(task.clone(), thread);
     JoinHandle {
         joinable: Some(task),
     }

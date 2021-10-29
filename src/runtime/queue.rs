@@ -1,12 +1,8 @@
 use super::task::TaskRunnable;
+use std::sync::Arc;
 use parking_lot::Mutex;
-use std::{
-    collections::VecDeque,
-    mem,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
-};
-use try_lock::TryLock;
+
+pub type Task = Arc<dyn TaskRunnable>;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum PopError {
@@ -14,61 +10,81 @@ pub enum PopError {
     Contended,
 }
 
-pub type Task = Arc<dyn TaskRunnable>;
+#[derive(Default)]
+pub struct Injector {
+    inner: crossbeam::deque::Injector<Task>,
+}
+
+impl Injector {
+    pub fn pending(&self) -> bool {
+        !self.inner.is_empty()
+    }
+
+    pub fn inject(&self, task: Task) {
+        self.inner.push(task);
+    }
+}
+
+pub struct Producer {
+    worker: crossbeam::deque::Worker<Task>,
+}
+
+impl Default for Producer {
+    fn default() -> Self {
+        Self {
+            worker: crossbeam::deque::Worker::new_lifo(),
+        }
+    }
+}
+
+impl Producer {
+    pub fn push(&self, task: Task) {
+        self.worker.push(task);
+    }
+
+    pub fn pop(&self) -> Option<Task> {
+        self.worker.pop()
+    }
+
+    pub fn steal(&self, queue: &Queue) -> Result<Task, PopError> {
+        Self::stole(queue.stealer.steal_batch_and_pop(&self.worker))
+    }
+
+    pub fn consume(&self, injector: &Injector) -> Result<Task, PopError> {
+        Self::stole(injector.inner.steal_batch_and_pop(&self.worker))
+    }
+
+    fn stole(result: crossbeam::deque::Steal<Task>) -> Result<Task, PopError> {
+        match result {
+            crossbeam::deque::Steal::Success(task) => Ok(task),
+            crossbeam::deque::Steal::Empty => Err(PopError::Empty),
+            crossbeam::deque::Steal::Retry => Err(PopError::Contended),
+        }
+    }
+}
 
 pub struct Queue {
-    pending: AtomicBool,
-    producer: Mutex<VecDeque<Task>>,
-    consumer: TryLock<VecDeque<Task>>,
+    producer: Mutex<Option<Producer>>,
+    stealer: crossbeam::deque::Stealer<Task>,
 }
 
 impl Default for Queue {
     fn default() -> Self {
+        let producer = Producer::default();
+        let stealer = producer.worker.stealer();
         Self {
-            pending: AtomicBool::new(false),
-            producer: Mutex::new(VecDeque::new()),
-            consumer: TryLock::new(VecDeque::new()),
+            producer: Mutex::new(Some(producer)),
+            stealer,
         }
     }
 }
 
 impl Queue {
-    pub fn push(&self, node: Task) {
-        let mut producer = self.producer.lock();
-        producer.push_back(node);
-        self.pending.store(true, Ordering::Relaxed);
-    }
-
     pub fn pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire)
+        !self.stealer.is_empty()
     }
 
-    pub fn pop(&self) -> Result<Task, PopError> {
-        if !self.pending.load(Ordering::Relaxed) {
-            return Err(PopError::Empty);
-        }
-
-        let mut consumer = match self.consumer.try_lock() {
-            Some(guard) => guard,
-            _ => return Err(PopError::Contended),
-        };
-
-        if let Some(node) = consumer.pop_front() {
-            return Ok(node);
-        }
-
-        if !self.pending.load(Ordering::Relaxed) {
-            return Err(PopError::Empty);
-        }
-
-        match self.producer.try_lock() {
-            Some(mut producer) => {
-                mem::swap(&mut *consumer, &mut *producer);
-                self.pending.store(consumer.len() > 0, Ordering::Relaxed);
-            }
-            _ => return Err(PopError::Contended),
-        }
-
-        consumer.pop_front().ok_or(PopError::Empty)
+    pub fn swap_producer(&self, old: Option<Producer>) -> Option<Producer> {
+        std::mem::replace(&mut *self.producer.lock(), old)
     }
 }

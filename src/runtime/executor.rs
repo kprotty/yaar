@@ -1,6 +1,7 @@
 use super::{
     pool::{Notified, ThreadPool, ThreadPoolConfig},
-    queue::{Queue, Task},
+    queue::{Queue, Injector, Task},
+    thread::Thread,
     rand::RandomIterGen,
 };
 use std::{
@@ -19,7 +20,7 @@ pub struct Executor {
     idle: AtomicUsize,
     searching: AtomicUsize,
     pub iter_gen: RandomIterGen,
-    pub injector: Queue,
+    pub injector: Injector,
     pub thread_pool: ThreadPool,
     pub workers: Box<[Worker]>,
 }
@@ -35,7 +36,7 @@ impl Executor {
             idle: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
             iter_gen: RandomIterGen::from(worker_threads),
-            injector: Queue::default(),
+            injector: Injector::default(),
             thread_pool: ThreadPool::from(config),
             workers: (0..worker_threads.get())
                 .map(|_| Worker::default())
@@ -49,13 +50,12 @@ impl Executor {
         executor
     }
 
-    pub fn schedule(self: &Arc<Self>, task: Task, worker_index: Option<usize>) {
-        match worker_index {
-            Some(worker_index) => self.workers[worker_index].run_queue.push(task),
-            None => {
-                self.injector.push(task);
-                fence(Ordering::SeqCst);
-            }
+    pub fn schedule(self: &Arc<Self>, task: Task, thread: Option<&Thread>) {
+        if let Some(producer) = thread.and_then(|t| t.producer.as_ref()) {
+            producer.push(task);
+        } else {
+            self.injector.inject(task);
+            fence(Ordering::SeqCst);
         }
         self.notify()
     }
@@ -126,18 +126,7 @@ impl Executor {
             assert!(searching <= self.workers.len());
             assert_ne!(searching, 0);
 
-            searching == 1 && {
-                let has_pending = self.injector.pending()
-                    || self
-                        .workers
-                        .iter()
-                        .map(|worker| worker.run_queue.pending())
-                        .filter(|pending| !pending)
-                        .next()
-                        .unwrap_or(false);
-
-                has_pending
-            }
+            searching == 1 && Thread::pending(self)
         }
     }
 

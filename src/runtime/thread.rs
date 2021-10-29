@@ -1,7 +1,7 @@
 use super::{
     executor::Executor,
     pool::Notified,
-    queue::{PopError, Task},
+    queue::{PopError, Producer, Task},
     rand::RandomSource,
 };
 use std::hint::spin_loop as spin_loop_hint;
@@ -9,9 +9,10 @@ use std::{cell::RefCell, collections::VecDeque, mem, rc::Rc, sync::Arc};
 
 pub struct Thread {
     pub(super) executor: Arc<Executor>,
-    pub(super) worker_index: Option<usize>,
+    pub(super) producer: Option<Producer>,
     pub(super) poll_ready: VecDeque<Task>,
     pub(super) is_polling: bool,
+    worker_index: Option<usize>,
     is_searching: bool,
     prng: RandomSource,
 }
@@ -30,6 +31,7 @@ impl Thread {
         let thread = Rc::new(RefCell::new(Self {
             executor: Arc::clone(executor),
             worker_index: Some(notified.worker_index),
+            producer: executor.workers[notified.worker_index].run_queue.swap_producer(None),
             poll_ready: VecDeque::new(),
             is_polling: false,
             is_searching: notified.searching,
@@ -42,15 +44,14 @@ impl Thread {
         }
 
         while let Some(task) = Self::poll(&*thread, executor) {
-            task.run(executor, {
+            let was_searching = {
                 let mut thread = (&*thread).borrow_mut();
-                if thread.is_searching {
-                    thread.is_searching = false;
-                    executor.search_discovered();
-                }
-
-                thread.worker_index.unwrap()
-            });
+                mem::replace(&mut thread.is_searching, false)
+            };
+            if was_searching {
+                executor.search_discovered();
+            }   
+            task.run(executor, &*thread);
         }
 
         Self::with_tls(|tls| *tls = None);
@@ -60,11 +61,11 @@ impl Thread {
         loop {
             let mut this = thread.borrow_mut();
             if let Some(worker_index) = this.worker_index {
-                if let Some(task) = this.pop(worker_index) {
+                if let Some(task) = this.producer.as_ref().unwrap().pop() {
                     return Some(task);
                 }
 
-                if let Ok(task) = executor.injector.pop() {
+                if let Ok(task) = this.producer.as_ref().unwrap().consume(&executor.injector) {
                     return Some(task);
                 }
 
@@ -73,10 +74,39 @@ impl Thread {
                 }
 
                 if this.is_searching {
-                    if let Some(task) = this.search(worker_index) {
-                        return Some(task);
+                    let mut attempts = 32usize;
+                    loop {
+                        let mut was_contended = false;
+                        for steal_index in this.prng.iter(executor.iter_gen) {
+                            if steal_index == worker_index {
+                                continue;
+                            }
+
+                            match this.producer.as_ref().unwrap().steal(&executor.workers[steal_index].run_queue) {
+                                Ok(task) => return Some(task),
+                                Err(PopError::Empty) => {},
+                                Err(PopError::Contended) => was_contended = true,
+                            }
+                        }
+                        
+                        spin_loop_hint();
+                        if was_contended && attempts != 0 {
+                            attempts -= 1;
+                        } else {
+                            break;
+                        }
                     }
                 }
+
+                if let Ok(task) = this.producer.as_ref().unwrap().consume(&executor.injector) {
+                    return Some(task);
+                }
+                
+                let p = executor
+                    .workers[worker_index]
+                    .run_queue
+                    .swap_producer(this.producer.take());
+                assert!(p.is_none());
 
                 this.worker_index = None;
                 let was_searching = mem::replace(&mut this.is_searching, false);
@@ -93,9 +123,10 @@ impl Thread {
 
             match executor.thread_pool.wait(None) {
                 Ok(Some(notified)) => {
-                    let mut thread = thread.borrow_mut();
-                    thread.worker_index = Some(notified.worker_index);
-                    thread.is_searching = notified.searching;
+                    let mut this = thread.borrow_mut();
+                    this.producer = executor.workers[notified.worker_index].run_queue.swap_producer(None);
+                    this.worker_index = Some(notified.worker_index);
+                    this.is_searching = notified.searching;
                 }
                 Ok(None) => continue,
                 Err(()) => return None,
@@ -103,29 +134,13 @@ impl Thread {
         }
     }
 
-    fn pop(&mut self, worker_index: usize) -> Option<Task> {
-        self.executor.workers[worker_index].run_queue.pop().ok()
-    }
-
-    fn search(&mut self, _worker_index: usize) -> Option<Task> {
-        let mut attempts = 32usize;
-        loop {
-            let mut was_contended = false;
-            for steal_index in self.prng.iter(self.executor.iter_gen) {
-                match self.executor.workers[steal_index].run_queue.pop() {
-                    Ok(task) => return Some(task),
-                    Err(PopError::Empty) => continue,
-                    Err(PopError::Contended) => was_contended = true,
-                }
-            }
-
-            if was_contended && attempts != 0 {
-                attempts -= 1;
-                spin_loop_hint();
-                continue;
-            }
-
-            return None;
-        }
+    pub fn pending(executor: &Executor) -> bool {
+        executor.injector.pending() || executor
+            .workers
+            .iter()
+            .map(|worker| worker.run_queue.pending())
+            .filter(|pending| !pending)
+            .next()
+            .unwrap_or(false)
     }
 }

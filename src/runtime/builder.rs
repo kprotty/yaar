@@ -80,6 +80,6 @@ impl Builder {
             .unwrap();
 
         let executor = Executor::new(worker_threads, config);
-        task::block_on(future, &executor, 0)
+        task::block_on(future, &executor)
     }
 }
