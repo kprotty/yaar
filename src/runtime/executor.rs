@@ -1,13 +1,15 @@
 use super::{
-    pool::{Notified, ThreadPool},
+    pool::{Notified, ThreadPool, ThreadPoolConfig},
     queue::{Queue, Task},
     rand::RandomIterGen,
 };
 use std::{
+    num::NonZeroUsize,
     sync::atomic::{fence, AtomicUsize, Ordering},
     sync::Arc,
 };
 
+#[derive(Default)]
 pub struct Worker {
     idle_next: AtomicUsize,
     pub run_queue: Queue,
@@ -23,6 +25,19 @@ pub struct Executor {
 }
 
 impl Executor {
+    pub fn new(worker_threads: NonZeroUsize, config: ThreadPoolConfig) -> Arc<Self> {
+        Arc::new(Self {
+            idle: AtomicUsize::new(0),
+            searching: AtomicUsize::new(0),
+            iter_gen: RandomIterGen::from(worker_threads),
+            injector: Queue::default(),
+            thread_pool: ThreadPool::from(config),
+            workers: (0..worker_threads.get())
+                .map(|_| Worker::default())
+                .collect(),
+        })
+    }
+
     pub fn schedule(self: &Arc<Self>, task: Task, worker_index: Option<usize>) {
         match worker_index {
             Some(worker_index) => self.workers[worker_index].run_queue.push(task),

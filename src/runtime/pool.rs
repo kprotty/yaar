@@ -23,14 +23,15 @@ struct Pool {
     notified: VecDeque<Notified>,
 }
 
+#[derive(Default)]
 pub struct ThreadPoolConfig {
-    pub stack_size: NonZeroUsize,
-    pub max_threads: NonZeroUsize,
-    pub on_thread_start: Box<dyn Fn() + Send + Sync + 'static>,
-    pub on_thread_stop: Box<dyn Fn() + Send + Sync + 'static>,
-    pub on_thread_park: Box<dyn Fn() + Send + Sync + 'static>,
-    pub on_thread_unpark: Box<dyn Fn() + Send + Sync + 'static>,
-    pub on_thread_name: Box<dyn Fn() -> String + Send + Sync + 'static>,
+    pub stack_size: Option<NonZeroUsize>,
+    pub max_threads: Option<NonZeroUsize>,
+    pub on_thread_start: Option<Box<dyn Fn() + Send + Sync + 'static>>,
+    pub on_thread_stop: Option<Box<dyn Fn() + Send + Sync + 'static>>,
+    pub on_thread_park: Option<Box<dyn Fn() + Send + Sync + 'static>>,
+    pub on_thread_unpark: Option<Box<dyn Fn() + Send + Sync + 'static>>,
+    pub on_thread_name: Option<Box<dyn Fn() -> String + Send + Sync + 'static>>,
 }
 
 pub struct ThreadPool {
@@ -54,13 +55,13 @@ impl From<ThreadPoolConfig> for ThreadPool {
 impl ThreadPool {
     pub fn notify(&self, executor: &Arc<Executor>, notified: Notified) -> Option<()> {
         let mut pool = self.pool.lock();
-
         if pool.idle > 0 {
             pool.notified.push_back(notified);
             return Some(());
         }
 
-        if pool.spawned == self.config.max_threads.get() {
+        let max_spawn = self.config.max_threads.unwrap().get();
+        if pool.spawned == max_spawn {
             return None;
         }
 
@@ -74,9 +75,23 @@ impl ThreadPool {
             return Some(());
         }
 
+        let thread_stack_size = self
+            .config
+            .stack_size
+            .or(NonZeroUsize::new(2 * 1024 * 1024))
+            .unwrap()
+            .get();
+
+        let thread_name = self
+            .config
+            .on_thread_name
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or(String::from("yaar-runtime-worker"));
+
         thread::Builder::new()
-            .name((self.config.on_thread_name)())
-            .stack_size(self.config.stack_size.get())
+            .name(thread_name)
+            .stack_size(thread_stack_size)
             .spawn(move || Self::run(executor, notified))
             .map_err(|_| self.finish())
             .map(mem::drop)
@@ -87,10 +102,16 @@ impl ThreadPool {
         let thread_executor = executor.clone();
         let thread_pool = &executor.thread_pool;
 
-        (thread_pool.config.on_thread_start)();
+        if let Some(callback) = thread_pool.config.on_thread_start.as_ref() {
+            (callback)();
+        }
+
         Thread::run(thread_executor, notified);
         thread_pool.finish();
-        (thread_pool.config.on_thread_stop)();
+
+        if let Some(callback) = thread_pool.config.on_thread_stop.as_ref() {
+            (callback)();
+        }
     }
 
     fn finish(&self) {

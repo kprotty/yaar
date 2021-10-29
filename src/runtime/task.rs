@@ -274,7 +274,7 @@ impl<T> Future for JoinHandle<T> {
     }
 }
 
-pub(crate) fn run<F>(future: F, executor: &Arc<Executor>, worker_index: usize) -> F::Output
+pub(crate) fn block_on<F>(future: F, executor: &Arc<Executor>, worker_index: usize) -> F::Output
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,

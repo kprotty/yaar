@@ -1,4 +1,9 @@
-use super::{executor::Executor, rand::RandomSource, pool::Notified, queue::{PopError, Task}};
+use super::{
+    executor::Executor,
+    pool::Notified,
+    queue::{PopError, Task},
+    rand::RandomSource,
+};
 use std::{
     cell::RefCell, collections::VecDeque, hint::spin_loop as spin_loop_hint, mem, rc::Rc, sync::Arc,
 };
