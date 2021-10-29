@@ -56,8 +56,10 @@ impl From<ThreadPoolConfig> for ThreadPool {
 impl ThreadPool {
     pub fn notify(&self, executor: &Arc<Executor>, notified: Notified) -> Option<()> {
         let mut pool = self.pool.lock();
+
         if pool.idle > 0 {
             pool.notified.push_back(notified);
+            self.cond.notify_one();
             return Some(());
         }
 
