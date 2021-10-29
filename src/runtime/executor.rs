@@ -62,7 +62,7 @@ impl Executor {
         assert!(searching > 0);
     }
 
-    fn shutdown(&self) {}
+    pub fn shutdown(&self) {}
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
