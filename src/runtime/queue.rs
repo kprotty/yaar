@@ -1,5 +1,6 @@
 use super::task::TaskRunnable;
 use parking_lot::Mutex;
+use try_lock::TryLock;
 use std::{
     collections::VecDeque,
     mem,
@@ -18,7 +19,7 @@ pub type Task = Arc<dyn TaskRunnable>;
 pub struct Queue {
     pending: AtomicBool,
     producer: Mutex<VecDeque<Task>>,
-    consumer: Mutex<VecDeque<Task>>,
+    consumer: TryLock<VecDeque<Task>>,
 }
 
 impl Default for Queue {
@@ -26,7 +27,7 @@ impl Default for Queue {
         Self {
             pending: AtomicBool::new(false),
             producer: Mutex::new(VecDeque::new()),
-            consumer: Mutex::new(VecDeque::new()),
+            consumer: TryLock::new(VecDeque::new()),
         }
     }
 }

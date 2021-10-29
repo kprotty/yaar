@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod runtime;
 pub mod sync;
 
