@@ -1,12 +1,12 @@
 use super::task::TaskRunnable;
 use parking_lot::Mutex;
-use try_lock::TryLock;
 use std::{
     collections::VecDeque,
     mem,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
 };
+use try_lock::TryLock;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum Error {

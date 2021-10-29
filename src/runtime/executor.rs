@@ -1,4 +1,7 @@
-use super::{queue::Queue, task::TaskRunnable, thread::Thread};
+use super::{
+    pool::{Notified, ThreadPool},
+    queue::{Queue, Task},
+};
 use std::{
     sync::atomic::{fence, AtomicUsize, Ordering},
     sync::Arc,
@@ -6,29 +9,23 @@ use std::{
 
 pub struct Worker {
     idle_next: AtomicUsize,
-    run_queue: Queue,
+    pub(super) run_queue: Queue,
 }
 
 pub struct Executor {
-    injected: Queue,
-    workers: Box<[Worker]>,
     idle: AtomicUsize,
     searching: AtomicUsize,
+    pub(super) injector: Queue,
+    pub(super) thread_pool: ThreadPool,
+    pub(super) workers: Box<[Worker]>,
 }
 
 impl Executor {
-    pub fn with_worker<F>(f: impl FnOnce(&Arc<Self>, usize) -> F) -> Option<F> {
-        Thread::with_current(|thread| {
-            let worker_index = thread.worker_index.expect("Using thread without a worker");
-            f(&thread.executor, worker_index)
-        })
-    }
-
-    pub fn schedule(self: &Arc<Self>, task: Arc<dyn TaskRunnable>, worker_index: Option<usize>) {
+    pub fn schedule(self: &Arc<Self>, task: Task, worker_index: Option<usize>) {
         match worker_index {
             Some(worker_index) => self.workers[worker_index].run_queue.push(task),
             None => {
-                self.injected.push(task);
+                self.injector.push(task);
                 fence(Ordering::SeqCst);
             }
         }
@@ -41,7 +38,7 @@ impl Executor {
         }
 
         let searching = self.searching.load(Ordering::Relaxed);
-        debug_assert!(searching <= self.workers.len());
+        assert!(searching <= self.workers.len());
         if searching > 0 {
             return;
         }
@@ -50,19 +47,83 @@ impl Executor {
             self.searching
                 .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
         {
-            debug_assert!(searching <= self.workers.len());
+            assert!(searching <= self.workers.len());
             return;
         }
 
         if let Some(worker_index) = self.pop_idle_worker() {
-            unimplemented!("TODO: try_spawn into pool")
+            match self.thread_pool.notify(
+                self,
+                Notified {
+                    worker_index,
+                    searching: true,
+                },
+            ) {
+                Some(_) => return,
+                None => self.push_idle_worker(worker_index),
+            }
         }
 
         let searching = self.searching.fetch_sub(1, Ordering::Relaxed);
-        assert!(searching > 0);
+        assert!(searching <= self.workers.len());
+        assert_ne!(searching, 0);
     }
 
-    pub fn shutdown(&self) {}
+    pub fn search_begin(&self) -> bool {
+        let searching = self.searching.load(Ordering::Relaxed);
+        if (2 * searching) >= self.workers.len() {
+            return false;
+        }
+
+        let searching = self.searching.fetch_add(1, Ordering::Relaxed);
+        assert!(searching < self.workers.len());
+        true
+    }
+
+    pub fn search_discovered(self: &Arc<Self>) {
+        let searching = self.searching.fetch_sub(1, Ordering::SeqCst);
+        assert!(searching <= self.workers.len());
+        assert_ne!(searching, 0);
+
+        if searching == 1 {
+            self.notify();
+        }
+    }
+
+    pub fn search_failed(&self, worker_index: usize, was_searching: bool) -> bool {
+        self.push_idle_worker(worker_index);
+
+        was_searching && {
+            let searching = self.searching.fetch_sub(1, Ordering::SeqCst);
+            assert!(searching <= self.workers.len());
+            assert_ne!(searching, 0);
+
+            searching == 1 && {
+                let has_pending = self.injector.pending()
+                    || self
+                        .workers
+                        .iter()
+                        .map(|worker| worker.run_queue.pending())
+                        .filter(|pending| !pending)
+                        .next()
+                        .unwrap_or(false);
+
+                has_pending
+            }
+        }
+    }
+
+    pub fn search_retry(&self) -> Option<usize> {
+        self.pop_idle_worker().map(|worker_index| {
+            let searching = self.searching.fetch_add(1, Ordering::Relaxed);
+            assert!(searching < self.workers.len());
+            worker_index
+        })
+    }
+
+    pub fn shutdown(&self) {
+        self.thread_pool.shutdown();
+    }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]

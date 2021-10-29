@@ -1,4 +1,4 @@
-use super::executor::Executor;
+use super::{executor::Executor, thread::Thread};
 use crate::sync::waker::AtomicWaker;
 use parking_lot::Mutex;
 use std::{
@@ -138,11 +138,17 @@ where
 
     fn schedule(self: Arc<Self>) {
         let mut task = Some(self);
-        let with_worker = Executor::with_worker(|executor, worker_index| {
-            executor.schedule(task.take().unwrap(), Some(worker_index))
+
+        let with_thread = Thread::with_current(|thread| {
+            let task = task.take().unwrap();
+            if thread.is_polling {
+                thread.poll_ready.borrow_mut().push_back(task);
+            } else {
+                thread.executor.schedule(task, thread.worker_index);
+            }
         });
 
-        if with_worker.is_none() {
+        if with_thread.is_none() {
             let task = task.take().unwrap();
             let executor = task.executor.clone();
             executor.schedule(task, None);
@@ -245,7 +251,7 @@ pub struct JoinHandle<T> {
 }
 
 impl<T> JoinHandle<T> {
-    pub(crate) fn consume(mut self) -> T {
+    pub(crate) fn consume(self) -> T {
         self.joinable
             .as_ref()
             .expect("JoinHandle polled to completion already")
@@ -281,8 +287,12 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    Executor::with_worker(|executor, worker_index| {
-        spawn_with(future, executor, worker_index, false)
+    Thread::with_current(|thread| {
+        let worker_index = thread
+            .worker_index
+            .expect("spawn() called from blocking thread");
+            
+        spawn_with(future, &thread.executor, worker_index, false)
     })
     .expect("spawn() called outside the runtime")
 }
