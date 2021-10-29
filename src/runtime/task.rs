@@ -142,7 +142,7 @@ where
         let with_thread = Thread::with_current(|thread| {
             let task = task.take().unwrap();
             if thread.is_polling {
-                thread.poll_ready.borrow_mut().push_back(task);
+                thread.poll_ready.push_back(task);
             } else {
                 thread.executor.schedule(task, thread.worker_index);
             }

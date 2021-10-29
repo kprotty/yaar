@@ -1,5 +1,5 @@
-use super::{executor::Executor, task, pool::ThreadPoolConfig};
-use std::{num::NonZeroUsize, future::Future};
+use super::{executor::Executor, pool::ThreadPoolConfig, task};
+use std::{future::Future, num::NonZeroUsize, time::Duration};
 
 #[derive(Default)]
 pub struct Builder {
@@ -24,6 +24,11 @@ impl Builder {
 
     pub fn thread_stack_size(&mut self, stack_size: usize) -> &mut Self {
         self.config.stack_size = NonZeroUsize::new(stack_size);
+        self
+    }
+
+    pub fn thread_keep_alive(&mut self, duration: Duration) -> &mut Self {
+        self.config.keep_alive = Some(duration);
         self
     }
 
@@ -65,7 +70,10 @@ impl Builder {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let Self { worker_threads, config } = self;
+        let Self {
+            worker_threads,
+            config,
+        } = self;
         let worker_threads = worker_threads
             .or_else(|| NonZeroUsize::new(num_cpus::get()))
             .or(NonZeroUsize::new(1))

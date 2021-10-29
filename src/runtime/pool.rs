@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[derive(Copy, Clone)]
@@ -25,6 +25,7 @@ struct Pool {
 
 #[derive(Default)]
 pub struct ThreadPoolConfig {
+    pub keep_alive: Option<Duration>,
     pub stack_size: Option<NonZeroUsize>,
     pub max_threads: Option<NonZeroUsize>,
     pub on_thread_start: Option<Box<dyn Fn() + Send + Sync + 'static>>,
@@ -99,17 +100,14 @@ impl ThreadPool {
     }
 
     fn run(executor: Arc<Executor>, notified: Notified) {
-        let thread_executor = executor.clone();
-        let thread_pool = &executor.thread_pool;
-
-        if let Some(callback) = thread_pool.config.on_thread_start.as_ref() {
+        if let Some(callback) = executor.thread_pool.config.on_thread_start.as_ref() {
             (callback)();
         }
 
-        Thread::run(thread_executor, notified);
-        thread_pool.finish();
+        Thread::run(&executor, notified);
+        executor.thread_pool.finish();
 
-        if let Some(callback) = thread_pool.config.on_thread_stop.as_ref() {
+        if let Some(callback) = executor.thread_pool.config.on_thread_stop.as_ref() {
             (callback)();
         }
     }
@@ -120,15 +118,44 @@ impl ThreadPool {
         pool.spawned -= 1;
     }
 
-    pub fn wait(&self, deadline: Option<Instant>) -> Option<Notified> {
-        unimplemented!("TODO")
-    }
+    pub fn wait(&self, deadline: Option<Instant>) -> Result<Option<Notified>, ()> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(());
+        }
 
-    pub fn is_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
+        let keep_alive = self.config.keep_alive.unwrap_or(Duration::from_secs(10));
+        let force_deadline = deadline.unwrap_or_else(|| Instant::now() + keep_alive);
+
+        let mut pool = self.pool.lock();
+        assert_ne!(pool.spawned, 0);
+
+        let mut timed_out = false;
+        loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(());
+            }
+
+            if let Some(notified) = pool.notified.pop_back() {
+                return Ok(Some(notified));
+            }
+
+            if timed_out {
+                return match deadline {
+                    Some(_) => Ok(None),
+                    None => Err(()),
+                };
+            }
+
+            pool.idle += 1;
+            timed_out = self.cond.wait_until(&mut pool, force_deadline).timed_out();
+            pool.idle -= 1;
+        }
     }
 
     pub fn shutdown(&self) {
-        unimplemented!("TODO")
+        self.shutdown.store(true, Ordering::Release);
+
+        let _pool = self.pool.lock();
+        let _ = self.cond.notify_all();
     }
 }
