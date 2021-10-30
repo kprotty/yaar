@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
-    task::{Context, Poll, Waker},
+    task::{ready, Context, Poll, Waker},
     time::Duration,
 };
 use try_lock::TryLock;
@@ -143,6 +143,35 @@ impl<S: Source> Pollable<S> {
                 assert_ne!(pending, usize::MAX);
             })
         })
+    }
+
+    pub fn poll_io<T>(
+        &self,
+        kind: WakerKind,
+        waker_ref: &Waker,
+        mut do_io: impl FnMut() -> io::Result<T>,
+    ) -> Poll<io::Result<T>> {
+        loop {
+            let mut waker_token = ready!(self.poll_ready(kind, waker_ref));
+            loop {
+                match do_io() {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => match kind {
+                        WakerKind::Write => continue,
+                        WakerKind::Read => {
+                            waker_ref.wake_by_ref();
+                            return Poll::Pending;
+                        }
+                    },
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        match self.with_waker(kind, |waker| waker.reset(waker_token)) {
+                            Ok(_) => break,
+                            Err(token) => waker_token = token,
+                        }
+                    }
+                    result => return Poll::Ready(result),
+                }
+            }
+        }
     }
 
     pub fn wait_for<'a>(&'a self, kind: WakerKind) -> impl Future<Output = ()> + 'a {

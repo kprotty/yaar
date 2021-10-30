@@ -118,6 +118,31 @@ impl AtomicWaker {
         Poll::Pending
     }
 
+    pub fn reset(&self, token: u8) -> Result<(), u8> {
+        match self.state.compare_exchange(
+            (State {
+                token,
+                status: Status::Notified,
+            })
+            .into(),
+            (State {
+                token,
+                status: Status::Empty,
+            })
+            .into(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(state) => {
+                let state = State::from(state);
+                assert_eq!(state.status, Status::Notified);
+                assert_ne!(state.token, token);
+                Err(state.token)
+            }
+        }
+    }
+
     pub fn detach(&self) -> Option<Waker> {
         self.state
             .fetch_update(Ordering::Acquire, Ordering::Relaxed, |state| {
@@ -130,17 +155,7 @@ impl AtomicWaker {
                 Some(state.into())
             })
             .ok()
-            .map(State::from)
-            .and_then(|state| {
-                let mut waker = self.waker.lock();
-
-                let current: State = self.state.load(Ordering::Relaxed).into();
-                if current.status == Status::Ready && current.token != state.token {
-                    return None;
-                }
-
-                mem::replace(&mut *waker, None)
-            })
+            .and_then(|_| mem::replace(&mut *self.waker.lock(), None))
     }
 
     pub fn wake(&self) -> Option<Waker> {
