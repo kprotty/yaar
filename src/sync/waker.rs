@@ -47,6 +47,13 @@ pub struct AtomicWaker {
 }
 
 impl AtomicWaker {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            waker: parking_lot::const_mutex(None),
+        }
+    }
+
     pub fn poll(&self, waker_ref: &Waker, waiting: impl FnOnce()) -> Poll<u8> {
         let mut state: State = self.state.load(Ordering::Acquire).into();
         match state.status {
@@ -70,17 +77,18 @@ impl AtomicWaker {
             return Poll::Ready(state.token);
         }
 
-        {
+        let kept_waker = {
             let mut waker = self.waker.lock();
             let will_wake = waker
                 .as_ref()
                 .map(|w| w.will_wake(waker_ref))
                 .unwrap_or(false);
 
-            if !will_wake {
+            will_wake || {
                 *waker = Some(waker_ref.clone());
+                false
             }
-        }
+        };
 
         if let Err(e) = self.state.compare_exchange(
             (State {
@@ -89,7 +97,7 @@ impl AtomicWaker {
             })
             .into(),
             (State {
-                token: state.token,
+                token: state.token + (!kept_waker as u8),
                 status: Status::Ready,
             })
             .into(),
@@ -110,7 +118,46 @@ impl AtomicWaker {
         Poll::Pending
     }
 
+    pub fn detach(&self) -> Option<Waker> {
+        self.state
+            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |state| {
+                let mut state = State::from(state);
+                if state.status != Status::Ready {
+                    return None;
+                }
+
+                state.status = Status::Empty;
+                Some(state.into())
+            })
+            .ok()
+            .map(State::from)
+            .and_then(|state| {
+                let mut waker = self.waker.lock();
+
+                let current: State = self.state.load(Ordering::Relaxed).into();
+                if current.status == Status::Ready && current.token != state.token {
+                    return None;
+                }
+
+                mem::replace(&mut *waker, None)
+            })
+    }
+
     pub fn wake(&self) -> Option<Waker> {
+        let mut state = State {
+            token: 0,
+            status: Status::Notified,
+        };
+
+        state = self.state.swap(state.into(), Ordering::AcqRel).into();
+        if state.status != Status::Ready {
+            return None;
+        }
+
+        mem::replace(&mut *self.waker.lock(), None)
+    }
+
+    pub fn notify(&self) -> Option<Waker> {
         let mut state: State = self.state.load(Ordering::Relaxed).into();
         loop {
             match state.status {
