@@ -16,12 +16,17 @@ tokio = { version = "1", features = ["io-util"] }
 mio = { version = "0.7", features = ["net", "os-poll"] }
 
 [[example]]
-name = "qsort"
-path = "examples/tokio_qsort.rs"
+name = "tokio_qsort"
 
 [[example]]
-name = "ysort"
-path = "examples/yaar_qsort.rs"
+name = "yaar_qsort"
+
+[[example]]
+name = "tokio_http"
+
+[[example]]
+name = "yaar_http"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
