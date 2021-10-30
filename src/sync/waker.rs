@@ -1,65 +1,150 @@
 use parking_lot::Mutex;
 use std::{
     mem,
+    sync::atomic::{AtomicU8, Ordering},
     task::{Poll, Waker},
 };
 
-enum State {
-    Empty,
-    Waiting(Waker),
-    Notified(usize),
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum Status {
+    Empty = 0,
+    Updating = 1,
+    Ready = 2,
+    Notified = 3,
 }
 
-pub struct AtomicWaker {
-    state: Mutex<State>,
+#[derive(Copy, Clone)]
+struct State {
+    token: u8,
+    status: Status,
 }
 
-impl Default for AtomicWaker {
-    fn default() -> Self {
+impl Into<u8> for State {
+    fn into(self) -> u8 {
+        (self.token << 2) | (self.status as u8)
+    }
+}
+
+impl From<u8> for State {
+    fn from(value: u8) -> Self {
         Self {
-            state: Mutex::new(State::Empty),
+            token: value >> 2,
+            status: match value & 0b11 {
+                0 => Status::Empty,
+                1 => Status::Updating,
+                2 => Status::Ready,
+                3 => Status::Notified,
+                _ => unreachable!(),
+            },
         }
     }
 }
 
-impl AtomicWaker {
-    pub fn poll(&self, waker_ref: &Waker, waiting: impl FnOnce()) -> Poll<usize> {
-        let mut state = self.state.lock();
-        let (will_wake, was_empty) = match &*state {
-            State::Empty => (false, true),
-            State::Waiting(ref waker) => (waker.will_wake(waker_ref), false),
-            State::Notified(ref token) => return Poll::Ready(token.clone()),
-        };
+#[derive(Default)]
+pub struct AtomicWaker {
+    state: AtomicU8,
+    waker: Mutex<Option<Waker>>,
+}
 
-        if !will_wake {
-            if was_empty {
-                waiting();
+impl AtomicWaker {
+    pub fn poll(&self, waker_ref: &Waker, waiting: impl FnOnce()) -> Poll<u8> {
+        let mut state: State = self.state.load(Ordering::Acquire).into();
+        match state.status {
+            Status::Empty | Status::Ready => {}
+            Status::Notified => return Poll::Ready(state.token),
+            Status::Updating => unreachable!("multiple threads polling same AtomicWaker"),
+        }
+
+        if let Err(e) = self.state.compare_exchange(
+            state.into(),
+            (State {
+                token: state.token,
+                status: Status::Updating,
+            })
+            .into(),
+            Ordering::Acquire,
+            Ordering::Acquire,
+        ) {
+            state = e.into();
+            assert_eq!(state.status, Status::Notified);
+            return Poll::Ready(state.token);
+        }
+
+        {
+            let mut waker = self.waker.lock();
+            let will_wake = waker
+                .as_ref()
+                .map(|w| w.will_wake(waker_ref))
+                .unwrap_or(false);
+
+            if !will_wake {
+                *waker = Some(waker_ref.clone());
             }
-            *state = State::Waiting(waker_ref.clone());
+        }
+
+        if let Err(e) = self.state.compare_exchange(
+            (State {
+                token: state.token,
+                status: Status::Updating,
+            })
+            .into(),
+            (State {
+                token: state.token,
+                status: Status::Ready,
+            })
+            .into(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            state = e.into();
+            assert_eq!(state.status, Status::Notified);
+            return Poll::Ready(state.token);
+        }
+
+        match state.status {
+            Status::Empty => waiting(),
+            Status::Ready => {}
+            _ => unreachable!(),
         }
 
         Poll::Pending
     }
 
-    pub fn reset(&self, token: usize) -> bool {
-        let mut state = self.state.lock();
-        match &*state {
-            State::Notified(ref t) if token.eq(t) => {
-                *state = State::Empty;
-                true
-            }
-            _ => false,
-        }
-    }
-
     pub fn wake(&self) -> Option<Waker> {
-        let mut state = self.state.lock();
-        match mem::replace(&mut *state, State::Notified(0)) {
-            State::Empty => None,
-            State::Waiting(waker) => Some(waker),
-            State::Notified(token) => {
-                *state = State::Notified(token.wrapping_add(1));
-                None
+        let mut state: State = self.state.load(Ordering::Relaxed).into();
+        loop {
+            match state.status {
+                Status::Notified => match self.state.compare_exchange_weak(
+                    state.into(),
+                    (State {
+                        token: state.token + 1,
+                        status: state.status,
+                    })
+                    .into(),
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return None,
+                    Err(e) => state = e.into(),
+                },
+                _ => match self.state.compare_exchange(
+                    state.into(),
+                    (State {
+                        token: state.token,
+                        status: Status::Notified,
+                    })
+                    .into(),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        return match state.status {
+                            Status::Ready => mem::replace(&mut *self.waker.lock(), None),
+                            _ => None,
+                        }
+                    }
+                    Err(e) => state = e.into(),
+                },
             }
         }
     }

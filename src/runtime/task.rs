@@ -3,14 +3,12 @@ use crate::sync::waker::AtomicWaker;
 use parking_lot::Mutex;
 use std::{
     any::Any,
-    iter::once,
     future::Future,
+    iter::once,
     mem, panic,
     pin::Pin,
+    sync::atomic::{AtomicU8, Ordering},
     sync::Arc,
-    sync::{
-        atomic::{AtomicU8, Ordering},
-    },
     task::{ready, Context, Poll, Wake, Waker},
 };
 
@@ -249,10 +247,10 @@ where
         match mem::replace(&mut *self.data.lock(), TaskData::Consumed) {
             TaskData::Ready(Ok(result)) => result,
             TaskData::Ready(Err(error)) => panic::resume_unwind(error),
-            // _ => unreachable!(),
-            TaskData::Polling => unreachable!("Polling when consumed"),
-            TaskData::Consumed => unreachable!("Consumed when consumed"),
-            TaskData::Idle(_) => unreachable!("Idle when consumed"),
+            _ => unreachable!(),
+            // TaskData::Polling => unreachable!("Polling when consumed"),
+            // TaskData::Consumed => unreachable!("Consumed when consumed"),
+            // TaskData::Idle(_) => unreachable!("Idle when consumed"),
         }
     }
 }
@@ -299,10 +297,8 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    Thread::with_current(|thread| {
-        spawn_with(future, &thread.executor, Some(thread), false)
-    })
-    .expect("spawn() called outside the runtime")
+    Thread::with_current(|thread| spawn_with(future, &thread.executor, Some(thread), false))
+        .expect("spawn() called outside the runtime")
 }
 
 fn spawn_with<F>(

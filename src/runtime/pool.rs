@@ -164,7 +164,7 @@ impl ThreadPool {
 
         assert!(!pool.shutdown);
         pool.shutdown = true;
-        
+
         if pool.idle > 0 {
             self.cond.notify_all();
         }

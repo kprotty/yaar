@@ -1,8 +1,8 @@
 use super::{
     pool::{Notified, ThreadPool, ThreadPoolConfig},
     queue::{Queue, Task},
-    thread::Thread,
     rand::RandomIterGen,
+    thread::Thread,
 };
 use std::{
     num::NonZeroUsize,
@@ -131,12 +131,12 @@ impl Executor {
 
             searching == 1 && {
                 let has_pending = self
-                        .workers
-                        .iter()
-                        .map(|worker| worker.run_queue.pending())
-                        .filter(|pending| !pending)
-                        .next()
-                        .unwrap_or(false);
+                    .workers
+                    .iter()
+                    .map(|worker| worker.run_queue.pending())
+                    .filter(|pending| !pending)
+                    .next()
+                    .unwrap_or(false);
 
                 has_pending
             }
