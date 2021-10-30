@@ -7,7 +7,7 @@ use std::{
     io::{self, Read, Write},
     net::{Shutdown, SocketAddr},
     pin::Pin,
-    task::{ready, Context, Waker, Poll},
+    task::{ready, Context, Poll, Waker},
 };
 
 pub struct TcpListener {
@@ -36,10 +36,11 @@ impl TcpListener {
 
     fn poll_accept_inner(&self, waker_ref: &Waker) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
         self.pollable.poll_io(WakerKind::Read, waker_ref, || {
-            self.pollable.as_ref().accept().and_then(|(stream, addr)| {
-                TcpStream::new(stream).map(|stream| (stream, addr))
-            })
-        })   
+            self.pollable
+                .as_ref()
+                .accept()
+                .and_then(|(stream, addr)| TcpStream::new(stream).map(|stream| (stream, addr)))
+        })
     }
 }
 

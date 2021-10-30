@@ -65,6 +65,9 @@ impl Executor {
                 self.notify();
                 return;
             }
+
+            thread.ready.borrow_mut().extend(tasks);
+            return;
         }
 
         self.injector.inject(tasks);

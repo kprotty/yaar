@@ -4,12 +4,14 @@ use super::{
     queue::{PopError, Producer, Task},
     rand::RandomSource,
 };
+use crate::io::driver::Poller as IoPoller;
 use std::hint::spin_loop as spin_loop_hint;
-use std::{cell::RefCell, mem, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::VecDeque, mem, rc::Rc, sync::Arc};
 
 pub struct Thread {
     pub(crate) executor: Arc<Executor>,
     pub(super) producer: RefCell<Option<Producer>>,
+    pub(super) ready: RefCell<VecDeque<Task>>,
 }
 
 impl Thread {
@@ -31,6 +33,7 @@ impl Thread {
         let thread = Rc::new(RefCell::new(Self {
             executor: Arc::clone(executor),
             producer: RefCell::new(Some(producer)),
+            ready: RefCell::new(VecDeque::new()),
         }));
 
         match Self::with_tls(|tls| mem::replace(tls, Some(thread.clone()))) {
@@ -47,6 +50,8 @@ struct ThreadRef<'a, 'b> {
     thread: &'a Thread,
     executor: &'b Arc<Executor>,
     worker_index: Option<usize>,
+    io_poller: IoPoller,
+    io_ready: VecDeque<Task>,
     prng: RandomSource,
     searching: bool,
     tick: usize,
@@ -61,6 +66,8 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
             thread,
             executor,
             worker_index: Some(notified.worker_index),
+            io_poller: IoPoller::default(),
+            io_ready: VecDeque::new(),
             prng,
             searching: notified.searching,
             tick,
@@ -130,6 +137,24 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
                 }
             }
 
+            if self.io_poller.poll(&self.executor.io_driver, None) {
+                assert_eq!(self.io_ready.len(), 0);
+                mem::swap(&mut *self.thread.ready.borrow_mut(), &mut self.io_ready);
+
+                if self.io_ready.len() > 0 {
+                    if let Some(worker_index) = self.executor.search_retry() {
+                        self.transition_to_running(Notified {
+                            worker_index,
+                            searching: true,
+                        });
+                    }
+
+                    self.executor
+                        .schedule(self.io_ready.drain(..), Some(self.thread));
+                    continue;
+                }
+            }
+            
             match self.executor.thread_pool.wait(None) {
                 Ok(Some(notified)) => self.transition_to_running(notified),
                 Ok(None) => {}

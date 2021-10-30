@@ -3,8 +3,7 @@ use crate::{runtime::thread::Thread, sync::waker::AtomicWaker};
 use mio::event::Source;
 use std::{
     future::Future,
-    io,
-    mem,
+    io, mem,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
@@ -61,17 +60,53 @@ impl Default for Poller {
 }
 
 impl Poller {
-    pub fn poll(&mut self, driver: &Driver, timeout: Option<Duration>) {
+    pub fn poll(&mut self, driver: &Driver, timeout: Option<Duration>) -> bool {
         if driver.pending.load(Ordering::Relaxed) == 0 {
-            return;
+            return false;
         }
 
         let mut selector = match driver.selector.try_lock() {
             Some(guard) => guard,
-            None => return,
+            None => return false,
         };
 
         let _ = selector.poll(&mut self.events, timeout);
+        mem::drop(selector);
+
+        let mut resumed = 0;
+        for event in self.events.iter() {
+            let index = match event.token() {
+                mio::Token(usize::MAX) => continue,
+                mio::Token(i) => WakerIndex::from(i),
+            };
+
+            if event.is_readable() {
+                if let Some(waker) = driver
+                    .wakers
+                    .with(index, WakerKind::Read, |waker| waker.notify())
+                {
+                    resumed += 1;
+                    waker.wake();
+                }
+            }
+
+            if event.is_writable() {
+                if let Some(waker) = driver
+                    .wakers
+                    .with(index, WakerKind::Write, |waker| waker.notify())
+                {
+                    resumed += 1;
+                    waker.wake();
+                }
+            }
+        }
+
+        if resumed > 0 {
+            let pending = driver.pending.fetch_sub(resumed, Ordering::Relaxed);
+            assert!(pending >= resumed);
+        }
+
+        true
     }
 }
 
@@ -216,7 +251,9 @@ impl<S: Source> Pollable<S> {
             kind: WakerKind,
         }
 
-        impl<'a, S: Source, T, F: FnMut(&mut Context<'_>) -> Poll<T> + 'a + Unpin> Future for WaitFor<'a, S, T, F> {
+        impl<'a, S: Source, T, F: FnMut(&mut Context<'_>) -> Poll<T> + 'a + Unpin> Future
+            for WaitFor<'a, S, T, F>
+        {
             type Output = T;
 
             fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -232,7 +269,9 @@ impl<S: Source> Pollable<S> {
             }
         }
 
-        impl<'a, S: Source, T, F: FnMut(&mut Context<'_>) -> Poll<T> + 'a + Unpin> Drop for WaitFor<'a, S, T, F> {
+        impl<'a, S: Source, T, F: FnMut(&mut Context<'_>) -> Poll<T> + 'a + Unpin> Drop
+            for WaitFor<'a, S, T, F>
+        {
             fn drop(&mut self) {
                 if self.poll_fn.is_some() {
                     self.drop_slow()
