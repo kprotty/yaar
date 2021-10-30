@@ -2,11 +2,9 @@ use super::task::TaskRunnable;
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
-    mem,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
 };
-use try_lock::TryLock;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum PopError {
@@ -18,57 +16,80 @@ pub type Task = Arc<dyn TaskRunnable>;
 
 pub struct Queue {
     pending: AtomicBool,
-    producer: Mutex<VecDeque<Task>>,
-    consumer: TryLock<VecDeque<Task>>,
+    deque: Mutex<VecDeque<Task>>,
 }
 
 impl Default for Queue {
     fn default() -> Self {
         Self {
             pending: AtomicBool::new(false),
-            producer: Mutex::new(VecDeque::new()),
-            consumer: TryLock::new(VecDeque::new()),
+            deque: Mutex::new(VecDeque::new()),
         }
     }
 }
 
 impl Queue {
-    pub fn push(&self, node: Task) {
-        let mut producer = self.producer.lock();
-        producer.push_back(node);
-        self.pending.store(true, Ordering::Relaxed);
+    pub fn inject(&self, tasks: impl Iterator<Item = Task>) {
+        self.push(tasks)
+    }
+
+    pub fn push(&self, tasks: impl Iterator<Item = Task>) {
+        let mut deque = self.deque.lock();
+        deque.extend(tasks);
+
+        if !self.pending.load(Ordering::Relaxed) && deque.len() > 0 {
+            self.pending.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn pending(&self) -> bool {
         self.pending.load(Ordering::Acquire)
     }
 
-    pub fn pop(&self) -> Result<Task, PopError> {
+    pub fn pop(&self) -> Option<Task> {
         if !self.pending.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let mut deque = self.deque.lock();
+        let task = deque.pop_front()?;
+
+        if deque.len() == 0 {
+            self.pending.store(false, Ordering::Relaxed);
+        }
+
+        Some(task)
+    }
+
+    pub fn steal(&self, target: &Self) -> Result<Task, PopError> {
+        if !target.pending.load(Ordering::Relaxed) {
             return Err(PopError::Empty);
         }
 
-        let mut consumer = match self.consumer.try_lock() {
+        let mut target_deque = match target.deque.try_lock() {
             Some(guard) => guard,
-            _ => return Err(PopError::Contended),
+            None => return Err(PopError::Contended),
         };
 
-        if let Some(node) = consumer.pop_front() {
-            return Ok(node);
-        }
-
-        if !self.pending.load(Ordering::Relaxed) {
+        if !target.pending.load(Ordering::Relaxed) {
             return Err(PopError::Empty);
         }
 
-        match self.producer.try_lock() {
-            Some(mut producer) => {
-                mem::swap(&mut *consumer, &mut *producer);
-                self.pending.store(consumer.len() > 0, Ordering::Relaxed);
-            }
-            _ => return Err(PopError::Contended),
+        let size = target_deque.len();
+        assert_ne!(size, 0);
+
+        let grab = (size - (size / 2)).min(64);
+        if grab == size {
+            target.pending.store(false, Ordering::Relaxed);
         }
 
-        consumer.pop_front().ok_or(PopError::Empty)
+        let mut target_iter = target_deque.drain(0..grab);
+        let task = target_iter.next().unwrap();
+
+        let mut deque = self.deque.lock();
+        deque.extend(target_iter);
+        self.pending.store(deque.len() > 0, Ordering::Relaxed);
+
+        Ok(task)
     }
 }

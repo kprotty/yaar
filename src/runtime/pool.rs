@@ -4,7 +4,6 @@ use std::{
     collections::VecDeque,
     mem,
     num::NonZeroUsize,
-    sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -20,6 +19,7 @@ pub struct Notified {
 struct Pool {
     idle: usize,
     spawned: usize,
+    shutdown: bool,
     notified: VecDeque<Notified>,
 }
 
@@ -37,7 +37,6 @@ pub struct ThreadPoolConfig {
 
 pub struct ThreadPool {
     config: ThreadPoolConfig,
-    shutdown: AtomicBool,
     pool: Mutex<Pool>,
     cond: Condvar,
 }
@@ -46,7 +45,6 @@ impl From<ThreadPoolConfig> for ThreadPool {
     fn from(config: ThreadPoolConfig) -> Self {
         Self {
             config,
-            shutdown: AtomicBool::new(false),
             pool: Mutex::new(Pool::default()),
             cond: Condvar::new(),
         }
@@ -56,6 +54,9 @@ impl From<ThreadPoolConfig> for ThreadPool {
 impl ThreadPool {
     pub fn notify(&self, executor: &Arc<Executor>, notified: Notified) -> Option<()> {
         let mut pool = self.pool.lock();
+        if pool.shutdown {
+            return None;
+        }
 
         if pool.idle > 0 {
             pool.notified.push_back(notified);
@@ -121,10 +122,6 @@ impl ThreadPool {
     }
 
     pub fn wait(&self, deadline: Option<Instant>) -> Result<Option<Notified>, ()> {
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err(());
-        }
-
         let keep_alive = self.config.keep_alive.unwrap_or(Duration::from_secs(10));
         let force_deadline = deadline.unwrap_or_else(|| Instant::now() + keep_alive);
 
@@ -133,7 +130,7 @@ impl ThreadPool {
 
         let mut timed_out = false;
         loop {
-            if self.shutdown.load(Ordering::Acquire) {
+            if pool.shutdown {
                 return Err(());
             }
 
@@ -163,9 +160,13 @@ impl ThreadPool {
     }
 
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
+        let mut pool = self.pool.lock();
 
-        let _pool = self.pool.lock();
-        let _ = self.cond.notify_all();
+        assert!(!pool.shutdown);
+        pool.shutdown = true;
+        
+        if pool.idle > 0 {
+            self.cond.notify_all();
+        }
     }
 }

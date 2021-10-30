@@ -3,12 +3,13 @@ use crate::sync::waker::AtomicWaker;
 use parking_lot::Mutex;
 use std::{
     any::Any,
+    iter::once,
     future::Future,
     mem, panic,
     pin::Pin,
+    sync::Arc,
     sync::{
         atomic::{AtomicU8, Ordering},
-        Arc,
     },
     task::{ready, Context, Poll, Wake, Waker},
 };
@@ -141,17 +142,21 @@ where
 
         let with_thread = Thread::with_current(|thread| {
             let task = task.take().unwrap();
+            let runnable: Arc<dyn TaskRunnable> = task;
+
             if thread.is_polling {
-                thread.poll_ready.push_back(task);
+                thread.ready.borrow_mut().push_back(runnable);
             } else {
-                thread.executor.schedule(task, thread.worker_index);
+                thread.executor.schedule(once(runnable), Some(thread));
             }
         });
 
         if with_thread.is_none() {
             let task = task.take().unwrap();
             let executor = task.executor.clone();
-            executor.schedule(task, None);
+
+            let runnable: Arc<dyn TaskRunnable> = task;
+            executor.schedule(once(runnable), None);
         }
     }
 }
@@ -175,7 +180,7 @@ where
 }
 
 pub trait TaskRunnable: Send + Sync {
-    fn run(self: Arc<Self>, executor: &Arc<Executor>, worker_index: usize);
+    fn run(self: Arc<Self>, executor: &Arc<Executor>, thread: &Thread);
 }
 
 impl<F> TaskRunnable for Task<F>
@@ -183,7 +188,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send,
 {
-    fn run(self: Arc<Self>, executor: &Arc<Executor>, worker_index: usize) {
+    fn run(self: Arc<Self>, executor: &Arc<Executor>, thread: &Thread) {
         let shutdown = self.transition_to_running();
 
         let mut data = self.data.lock();
@@ -204,11 +209,14 @@ where
             Ok(Poll::Pending) => {
                 *data = TaskData::Idle(future);
                 mem::drop(data);
+
                 if self.transition_to_idle() {
                     return;
-                } else {
-                    return executor.schedule(self, Some(worker_index));
                 }
+
+                let runnable: Arc<dyn TaskRunnable> = self;
+                executor.schedule(once(runnable), Some(thread));
+                return;
             }
         };
 
@@ -277,12 +285,13 @@ impl<T> Future for JoinHandle<T> {
     }
 }
 
-pub(crate) fn block_on<F>(future: F, executor: &Arc<Executor>, worker_index: usize) -> F::Output
+pub(crate) fn block_on<F>(future: F, executor: &Arc<Executor>) -> F::Output
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    spawn_with(future, executor, worker_index, true).consume()
+    let join_handle = spawn_with(future, executor, None, true);
+    join_handle.consume()
 }
 
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
@@ -291,11 +300,7 @@ where
     F::Output: Send + 'static,
 {
     Thread::with_current(|thread| {
-        let worker_index = thread
-            .worker_index
-            .expect("spawn() called from blocking thread");
-
-        spawn_with(future, &thread.executor, worker_index, false)
+        spawn_with(future, &thread.executor, Some(thread), false)
     })
     .expect("spawn() called outside the runtime")
 }
@@ -303,7 +308,7 @@ where
 fn spawn_with<F>(
     future: F,
     executor: &Arc<Executor>,
-    worker_index: usize,
+    thread: Option<&Thread>,
     shutdown: bool,
 ) -> JoinHandle<F::Output>
 where
@@ -311,7 +316,10 @@ where
     F::Output: Send + 'static,
 {
     let task = Arc::new(Task::new(future, executor.clone(), shutdown));
-    executor.schedule(task.clone(), Some(worker_index));
+
+    let runnable: Arc<dyn TaskRunnable> = task.clone();
+    executor.schedule(once(runnable), thread);
+
     JoinHandle {
         joinable: Some(task),
     }

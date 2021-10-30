@@ -1,6 +1,7 @@
 use super::{
     pool::{Notified, ThreadPool, ThreadPoolConfig},
     queue::{Queue, Task},
+    thread::Thread,
     rand::RandomIterGen,
 };
 use std::{
@@ -18,8 +19,8 @@ pub struct Worker {
 pub struct Executor {
     idle: AtomicUsize,
     searching: AtomicUsize,
+    injecting: AtomicUsize,
     pub iter_gen: RandomIterGen,
-    pub injector: Queue,
     pub thread_pool: ThreadPool,
     pub workers: Box<[Worker]>,
 }
@@ -34,8 +35,8 @@ impl Executor {
         let executor = Arc::new(Self {
             idle: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
+            injecting: AtomicUsize::new(0),
             iter_gen: RandomIterGen::from(worker_threads),
-            injector: Queue::default(),
             thread_pool: ThreadPool::from(config),
             workers: (0..worker_threads.get())
                 .map(|_| Worker::default())
@@ -49,11 +50,13 @@ impl Executor {
         executor
     }
 
-    pub fn schedule(self: &Arc<Self>, task: Task, worker_index: Option<usize>) {
-        match worker_index {
-            Some(worker_index) => self.workers[worker_index].run_queue.push(task),
+    pub fn schedule(self: &Arc<Self>, tasks: impl Iterator<Item = Task>, thread: Option<&Thread>) {
+        match thread.and_then(|thread| thread.worker_index) {
+            Some(worker_index) => self.workers[worker_index].run_queue.push(tasks),
             None => {
-                self.injector.push(task);
+                let injecting = self.injecting.fetch_add(1, Ordering::Relaxed);
+                let worker_index = injecting % self.workers.len();
+                self.workers[worker_index].run_queue.inject(tasks);
                 fence(Ordering::SeqCst);
             }
         }
@@ -127,8 +130,7 @@ impl Executor {
             assert_ne!(searching, 0);
 
             searching == 1 && {
-                let has_pending = self.injector.pending()
-                    || self
+                let has_pending = self
                         .workers
                         .iter()
                         .map(|worker| worker.run_queue.pending())
