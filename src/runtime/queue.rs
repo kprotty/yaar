@@ -1,4 +1,5 @@
 use super::task::TaskRunnable;
+use crossbeam_deque::{Steal, Stealer, Worker};
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
@@ -16,76 +17,105 @@ pub enum PopError {
 
 pub type Task = Arc<dyn TaskRunnable>;
 
-pub struct Queue {
+#[derive(Default)]
+pub struct Injector {
     pending: AtomicBool,
-    producer: Mutex<VecDeque<Task>>,
-    consumer: TryLock<VecDeque<Task>>,
+    deque: Mutex<VecDeque<Task>>,
+}
+
+impl Injector {
+    pub fn pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    pub fn inject(&self, tasks: impl Iterator<Item = Task>) {
+        let mut deque = self.deque.lock();
+        deque.extend(tasks);
+
+        if !self.pending.load(Ordering::Relaxed) && deque.len() > 0 {
+            self.pending.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+pub struct Producer {
+    worker: Worker<Task>,
+    injected: VecDeque<Task>,
+}
+
+impl Producer {
+    pub fn push(&self, tasks: impl Iterator<Item = Task>) {
+        tasks.for_each(|task| self.worker.push(task));
+    }
+
+    pub fn pop(&self, queue: &Queue, be_fair: bool) -> Option<Task> {
+        match be_fair {
+            true => match queue.stealer.steal() {
+                Steal::Success(task) => Some(task),
+                _ => None,
+            },
+            _ => self.worker.pop(),
+        }
+    }
+
+    pub fn steal(&self, queue: &Queue) -> Result<Task, PopError> {
+        match queue.stealer.steal_batch_and_pop(&self.worker) {
+            Steal::Success(task) => Ok(task),
+            Steal::Empty => Err(PopError::Empty),
+            Steal::Retry => Err(PopError::Contended),
+        }
+    }
+
+    pub fn consume(&mut self, injector: &Injector) -> Option<Task> {
+        if !injector.pending.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        {
+            let mut deque = injector.deque.lock();
+            if !injector.pending.load(Ordering::Relaxed) {
+                return None;
+            }
+
+            injector.pending.store(false, Ordering::Relaxed);
+            mem::swap(&mut *deque, &mut self.injected);
+        }
+
+        self.injected.pop_front().map(|task| {
+            self.injected
+                .drain(..)
+                .for_each(|task| self.worker.push(task));
+            task
+        })
+    }
+}
+
+pub struct Queue {
+    stealer: Stealer<Task>,
+    producer: TryLock<Option<Producer>>,
 }
 
 impl Default for Queue {
     fn default() -> Self {
+        let worker = Worker::new_lifo();
+        let stealer = worker.stealer();
+
         Self {
-            pending: AtomicBool::new(false),
-            producer: Mutex::new(VecDeque::new()),
-            consumer: TryLock::new(VecDeque::new()),
+            stealer,
+            producer: TryLock::new(Some(Producer {
+                worker,
+                injected: VecDeque::new(),
+            })),
         }
     }
 }
 
 impl Queue {
-    pub fn inject(&self, tasks: impl Iterator<Item = Task>) {
-        self.push(tasks)
-    }
-
-    pub fn push(&self, tasks: impl Iterator<Item = Task>) {
-        let mut producer = self.producer.lock();
-        producer.extend(tasks);
-
-        if !self.pending.load(Ordering::Relaxed) && producer.len() > 0 {
-            self.pending.store(true, Ordering::Relaxed);
-        }
-    }
-
     pub fn pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire)
+        self.stealer.len() > 0
     }
 
-    pub fn pop(&self) -> Option<Task> {
-        self.take().ok()
-    }
-
-    pub fn steal(&self, target: &Self) -> Result<Task, PopError> {
-        target.take()
-    }
-
-    fn take(&self) -> Result<Task, PopError> {
-        if !self.pending.load(Ordering::Relaxed) {
-            return Err(PopError::Empty);
-        }
-
-        let mut consumer = match self.consumer.try_lock() {
-            Some(guard) => guard,
-            None => return Err(PopError::Contended),
-        };
-
-        if !self.pending.load(Ordering::Relaxed) {
-            return Err(PopError::Empty);
-        }
-
-        if let Some(task) = consumer.pop_front() {
-            return Ok(task);
-        }
-
-        match self.producer.try_lock() {
-            Some(mut producer) => {
-                mem::swap(&mut *producer, &mut *consumer);
-                if consumer.len() == 0 {
-                    self.pending.store(false, Ordering::Relaxed);
-                }
-            }
-            None => return Err(PopError::Contended),
-        }
-
-        consumer.pop_front().ok_or(PopError::Contended)
+    pub fn swap_producer(&self, old: Option<Producer>) -> Option<Producer> {
+        mem::replace(&mut *self.producer.try_lock().unwrap(), old)
     }
 }

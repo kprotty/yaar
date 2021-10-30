@@ -1,6 +1,6 @@
 use super::{
     pool::{Notified, ThreadPool, ThreadPoolConfig},
-    queue::{Queue, Task},
+    queue::{Injector, Queue, Task},
     rand::RandomIterGen,
     thread::Thread,
 };
@@ -19,7 +19,7 @@ pub struct Worker {
 pub struct Executor {
     idle: AtomicUsize,
     searching: AtomicUsize,
-    injecting: AtomicUsize,
+    pub injector: Injector,
     pub iter_gen: RandomIterGen,
     pub thread_pool: ThreadPool,
     pub workers: Box<[Worker]>,
@@ -35,7 +35,7 @@ impl Executor {
         let executor = Arc::new(Self {
             idle: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
-            injecting: AtomicUsize::new(0),
+            injector: Injector::default(),
             iter_gen: RandomIterGen::from(worker_threads),
             thread_pool: ThreadPool::from(config),
             workers: (0..worker_threads.get())
@@ -51,15 +51,19 @@ impl Executor {
     }
 
     pub fn schedule(self: &Arc<Self>, tasks: impl Iterator<Item = Task>, thread: Option<&Thread>) {
-        match thread.and_then(|thread| thread.worker_index) {
-            Some(worker_index) => self.workers[worker_index].run_queue.push(tasks),
+        let mut tasks = tasks.peekable();
+        if tasks.peek().is_none() {
+            return;
+        }
+
+        match thread.and_then(|thread| thread.producer.as_ref()) {
+            Some(producer) => producer.push(tasks),
             None => {
-                let injecting = self.injecting.fetch_add(1, Ordering::Relaxed);
-                let worker_index = injecting % self.workers.len();
-                self.workers[worker_index].run_queue.inject(tasks);
+                self.injector.inject(tasks);
                 fence(Ordering::SeqCst);
             }
         }
+
         self.notify()
     }
 
@@ -130,13 +134,14 @@ impl Executor {
             assert_ne!(searching, 0);
 
             searching == 1 && {
-                let has_pending = self
-                    .workers
-                    .iter()
-                    .map(|worker| worker.run_queue.pending())
-                    .filter(|pending| !pending)
-                    .next()
-                    .unwrap_or(false);
+                let has_pending = self.injector.pending()
+                    || self
+                        .workers
+                        .iter()
+                        .map(|worker| worker.run_queue.pending())
+                        .filter(|pending| !pending)
+                        .next()
+                        .unwrap_or(false);
 
                 has_pending
             }
