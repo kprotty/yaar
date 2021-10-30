@@ -52,7 +52,7 @@ impl Default for RandomSource {
 }
 
 impl RandomSource {
-    pub fn iter(&mut self, gen: RandomIterGen) -> impl Iterator<Item = usize> {
+    pub fn next(&mut self) -> usize {
         let shifts = match size_of::<usize>() {
             8 => (13, 7, 17),
             4 => (13, 17, 5),
@@ -62,10 +62,13 @@ impl RandomSource {
         self.xorshift ^= self.xorshift << shifts.0;
         self.xorshift ^= self.xorshift >> shifts.1;
         self.xorshift ^= self.xorshift << shifts.2;
+        self.xorshift
+    }
 
+    pub fn iter(&mut self, gen: RandomIterGen) -> impl Iterator<Item = usize> {
         let range = gen.range.get();
         let prime = gen.co_prime.get();
-        let mut rng = self.xorshift % range;
+        let mut rng = self.next() % range;
 
         (0..range).map(move |_| {
             rng += prime;

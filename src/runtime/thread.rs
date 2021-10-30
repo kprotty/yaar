@@ -54,13 +54,16 @@ struct ThreadRef<'a, 'b> {
 
 impl<'a, 'b> ThreadRef<'a, 'b> {
     fn new(thread: &'a Thread, executor: &'b Arc<Executor>, notified: Notified) -> Self {
+        let mut prng = RandomSource::default();
+        let tick = prng.next();
+
         Self {
             thread,
             executor,
             worker_index: Some(notified.worker_index),
-            prng: RandomSource::default(),
+            prng,
             searching: notified.searching,
-            tick: 0,
+            tick,
         }
     }
 
