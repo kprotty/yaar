@@ -77,8 +77,8 @@ impl Producer {
                 return None;
             }
 
-            injector.pending.store(false, Ordering::Relaxed);
             mem::swap(&mut *deque, &mut self.injected);
+            injector.pending.store(false, Ordering::Relaxed);
         }
 
         self.injected.pop_front().map(|task| {
@@ -115,7 +115,12 @@ impl Queue {
         self.stealer.len() > 0
     }
 
-    pub fn swap_producer(&self, old: Option<Producer>) -> Option<Producer> {
-        mem::replace(&mut *self.producer.try_lock().unwrap(), old)
+    pub fn swap_producer(&self, new_producer: Option<Producer>) -> Option<Producer> {
+        let mut producer = self
+            .producer
+            .try_lock()
+            .expect("Multiple threads trying to update a Queue's producer");
+
+        mem::replace(&mut *producer, new_producer)
     }
 }

@@ -5,17 +5,11 @@ use super::{
     rand::RandomSource,
 };
 use std::hint::spin_loop as spin_loop_hint;
-use std::{cell::RefCell, collections::VecDeque, mem, rc::Rc, sync::Arc};
+use std::{cell::RefCell, mem, rc::Rc, sync::Arc};
 
 pub struct Thread {
     pub(super) executor: Arc<Executor>,
-    pub(super) worker_index: Option<usize>,
-    pub(super) producer: Option<Producer>,
-    pub(super) ready: RefCell<VecDeque<Task>>,
-    pub(super) is_polling: bool,
-    is_searching: bool,
-    prng: RandomSource,
-    tick: usize,
+    pub(super) producer: RefCell<Option<Producer>>,
 }
 
 impl Thread {
@@ -28,127 +22,146 @@ impl Thread {
         Self::with_tls(|tls| tls.as_ref().map(Rc::clone)).map(|rc| f(&*(&*rc).borrow()))
     }
 
-    fn with_thread(thread: Rc<RefCell<Self>>, f: impl FnOnce(&RefCell<Self>)) {
+    pub fn run(executor: &Arc<Executor>, notified: Notified) {
+        let producer = executor.workers[notified.worker_index]
+            .run_queue
+            .swap_producer(None)
+            .expect("Thread running without a producer");
+
+        let thread = Rc::new(RefCell::new(Self {
+            executor: Arc::clone(executor),
+            producer: RefCell::new(Some(producer)),
+        }));
+
         match Self::with_tls(|tls| mem::replace(tls, Some(thread.clone()))) {
             Some(_) => unreachable!("Cannot run multiple runtimes in the same thread"),
             None => {
-                f(&*thread);
+                ThreadRef::new(&*thread.borrow(), executor, notified).run();
                 Self::with_tls(|tls| *tls = None);
             }
         }
     }
+}
 
-    pub fn run(executor: &Arc<Executor>, notified: Notified) {
-        let thread = Rc::new(RefCell::new(Self {
-            executor: Arc::clone(executor),
+struct ThreadRef<'a, 'b> {
+    thread: &'a Thread,
+    executor: &'b Arc<Executor>,
+    worker_index: Option<usize>,
+    prng: RandomSource,
+    searching: bool,
+    tick: usize,
+}
+
+impl<'a, 'b> ThreadRef<'a, 'b> {
+    fn new(thread: &'a Thread, executor: &'b Arc<Executor>, notified: Notified) -> Self {
+        Self {
+            thread,
+            executor,
             worker_index: Some(notified.worker_index),
-            producer: executor.workers[notified.worker_index]
-                .run_queue
-                .swap_producer(None),
-            ready: RefCell::new(VecDeque::new()),
-            is_polling: false,
-            is_searching: notified.searching,
             prng: RandomSource::default(),
+            searching: notified.searching,
             tick: 0,
-        }));
-
-        Self::with_thread(thread, |thread| loop {
-            let task = match Self::poll(&*thread, executor) {
-                Some(task) => task,
-                None => return,
-            };
-
-            {
-                let mut this = thread.borrow_mut();
-                this.tick = this.tick.wrapping_add(1);
-                if mem::replace(&mut this.is_searching, false) {
-                    executor.search_discovered();
-                }
-            }
-
-            task.run(executor, &*thread.borrow());
-        })
+        }
     }
 
-    fn poll<'a>(thread: &'a RefCell<Self>, executor: &Arc<Executor>) -> Option<Task> {
+    fn transition_to_running(&mut self, notified: Notified) {
+        let producer = self.executor.workers[notified.worker_index]
+            .run_queue
+            .swap_producer(None)
+            .expect("Thread notified without a producer");
+
+        let mut thread_producer = self.thread.producer.borrow_mut();
+        assert!(thread_producer.is_none());
+        *thread_producer = Some(producer);
+
+        self.worker_index = Some(notified.worker_index);
+        self.searching = notified.searching;
+    }
+
+    fn transition_to_idle(&mut self, worker_index: usize) -> bool {
+        let producer = self
+            .thread
+            .producer
+            .borrow_mut()
+            .take()
+            .expect("Thread becoming idle without a producer");
+
+        self.executor.workers[worker_index]
+            .run_queue
+            .swap_producer(Some(producer))
+            .map(|_| unreachable!("Producer given back to worker that already has one"));
+
+        self.worker_index = None;
+        mem::replace(&mut self.searching, false)
+    }
+
+    fn run(&mut self) {
+        while let Some(task) = self.next() {
+            if self.searching {
+                self.searching = false;
+                self.executor.search_discovered();
+            }
+
+            self.tick = self.tick.wrapping_add(1);
+            task.run(self.executor, self.thread)
+        }
+    }
+
+    fn next(&mut self) -> Option<Task> {
         loop {
-            let mut this = thread.borrow_mut();
-            while let Some(worker_index) = this.worker_index {
-                if let Some(task) = this.pop(worker_index, executor) {
+            while let Some(worker_index) = self.worker_index {
+                if let Some(task) = self.poll(worker_index) {
                     return Some(task);
                 }
 
-                this.worker_index = None;
-                executor.workers[worker_index]
-                    .run_queue
-                    .swap_producer(this.producer.take());
+                let was_searching = self.transition_to_idle(worker_index);
+                let has_pending = self.executor.search_failed(worker_index, was_searching);
 
-                let was_searching = mem::replace(&mut this.is_searching, false);
-                if executor.search_failed(worker_index, was_searching) {
-                    if let Some(worker_index) = executor.search_retry() {
-                        this.worker_index = Some(worker_index);
-                        this.is_searching = true;
-                        this.producer =
-                            executor.workers[worker_index].run_queue.swap_producer(None);
+                if has_pending {
+                    if let Some(worker_index) = self.executor.search_retry() {
+                        self.transition_to_running(Notified {
+                            worker_index,
+                            searching: true,
+                        });
                     }
                 }
             }
 
-            mem::drop(this);
-            let waited = thread.borrow().wait(executor);
-            let mut this = thread.borrow_mut();
-
-            match waited {
-                Ok(Some(notified)) => {
-                    this.worker_index = Some(notified.worker_index);
-                    this.is_searching = notified.searching;
-                    this.producer = executor.workers[notified.worker_index]
-                        .run_queue
-                        .swap_producer(None);
-                }
+            match self.executor.thread_pool.wait(None) {
+                Ok(Some(notified)) => self.transition_to_running(notified),
                 Ok(None) => {}
                 Err(()) => return None,
-            }
-
-            let mut ready = mem::replace(&mut *this.ready.borrow_mut(), VecDeque::new());
-            let mut ready = ready.drain(..);
-            let task = this.worker_index.and_then(|_| ready.next());
-            mem::drop(this);
-
-            if ready.len() > 0 {
-                executor.schedule(ready, Some(&*thread.borrow()));
-            }
-
-            if let Some(task) = task {
-                return Some(task);
             }
         }
     }
 
-    fn pop(&mut self, worker_index: usize, executor: &Arc<Executor>) -> Option<Task> {
+    fn poll(&mut self, worker_index: usize) -> Option<Task> {
+        let executor = &self.executor;
         let run_queue = &executor.workers[worker_index].run_queue;
-        let producer = self
-            .producer
+
+        let mut producer = self.thread.producer.borrow_mut();
+        let producer = producer
             .as_mut()
-            .expect("Polling worker without a producer");
+            .expect("Thread polling without a producer");
 
         let be_fair = self.tick % 64 == 0;
         if let Some(task) = match be_fair {
-            true => producer.consume(&executor.injector).or_else(|| producer.pop(run_queue, true)),
-            _ => producer.pop(run_queue, false).or_else(|| producer.consume(&executor.injector)),
+            true => producer
+                .consume(&executor.injector)
+                .or_else(|| producer.pop(run_queue, be_fair)),
+            _ => producer
+                .pop(run_queue, be_fair)
+                .or_else(|| producer.consume(&executor.injector)),
         } {
             return Some(task);
         }
 
-        mem::drop(producer);
-        if !self.is_searching {
-            self.is_searching = executor.search_begin();
+        if !self.searching {
+            self.searching = executor.search_begin();
         }
 
-        let producer = self.producer.as_mut().unwrap();
-        if self.is_searching {
-            let mut attempts = 32;
-            loop {
+        if self.searching {
+            for _ in 0..32 {
                 let mut was_contended = false;
                 for steal_index in self.prng.iter(executor.iter_gen) {
                     if steal_index == worker_index {
@@ -158,24 +171,22 @@ impl Thread {
                     let target_queue = &executor.workers[steal_index].run_queue;
                     match producer.steal(target_queue) {
                         Ok(task) => return Some(task),
-                        Err(PopError::Empty) => continue,
+                        Err(PopError::Empty) => {}
                         Err(PopError::Contended) => was_contended = true,
                     }
                 }
 
-                if was_contended && attempts != 0 {
-                    attempts -= 1;
+                if let Some(task) = producer.consume(&executor.injector) {
+                    return Some(task);
+                }
+
+                if was_contended {
                     spin_loop_hint();
-                } else {
-                    break;
+                    continue;
                 }
             }
         }
 
-        producer.consume(&executor.injector)
-    }
-
-    fn wait(&self, executor: &Arc<Executor>) -> Result<Option<Notified>, ()> {
-        executor.thread_pool.wait(None)
+        None
     }
 }

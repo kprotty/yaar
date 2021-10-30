@@ -56,14 +56,16 @@ impl Executor {
             return;
         }
 
-        match thread.and_then(|thread| thread.producer.as_ref()) {
-            Some(producer) => producer.push(tasks),
-            None => {
-                self.injector.inject(tasks);
-                fence(Ordering::SeqCst);
+        if let Some(thread) = thread {
+            if let Some(producer) = thread.producer.borrow().as_ref() {
+                producer.push(tasks);
+                self.notify();
+                return;
             }
         }
 
+        self.injector.inject(tasks);
+        fence(Ordering::SeqCst);
         self.notify()
     }
 

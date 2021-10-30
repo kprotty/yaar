@@ -141,18 +141,12 @@ where
         let with_thread = Thread::with_current(|thread| {
             let task = task.take().unwrap();
             let runnable: Arc<dyn TaskRunnable> = task;
-
-            if thread.is_polling {
-                thread.ready.borrow_mut().push_back(runnable);
-            } else {
-                thread.executor.schedule(once(runnable), Some(thread));
-            }
+            thread.executor.schedule(once(runnable), Some(thread));
         });
 
         if with_thread.is_none() {
             let task = task.take().unwrap();
             let executor = task.executor.clone();
-
             let runnable: Arc<dyn TaskRunnable> = task;
             executor.schedule(once(runnable), None);
         }
