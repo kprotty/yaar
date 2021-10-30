@@ -5,7 +5,7 @@ use super::{
     rand::RandomSource,
 };
 use std::hint::spin_loop as spin_loop_hint;
-use std::{cell::{RefCell}, collections::VecDeque, mem, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::VecDeque, mem, rc::Rc, sync::Arc};
 
 pub struct Thread {
     pub(super) executor: Arc<Executor>,
@@ -51,7 +51,7 @@ impl Thread {
                 Some(task) => task,
                 None => return,
             };
-            
+
             if mem::replace(&mut thread.borrow_mut().is_searching, false) {
                 executor.search_discovered();
             }
@@ -67,7 +67,7 @@ impl Thread {
                 if let Some(task) = this.pop(worker_index, executor) {
                     return Some(task);
                 }
-                
+
                 this.worker_index = None;
                 let was_searching = mem::replace(&mut this.is_searching, false);
 
@@ -86,7 +86,7 @@ impl Thread {
                     this.worker_index = Some(notified.worker_index);
                     this.is_searching = notified.searching;
                 }
-                Ok(None) => {},
+                Ok(None) => {}
                 Err(()) => return None,
             }
 
@@ -119,12 +119,9 @@ impl Thread {
             loop {
                 let mut was_contended = false;
                 for steal_index in self.prng.iter(executor.iter_gen) {
-                    if steal_index == worker_index {
-                        continue;
-                    }
-
                     let run_queue = &executor.workers[worker_index].run_queue;
                     let target_queue = &executor.workers[steal_index].run_queue;
+
                     match run_queue.steal(target_queue) {
                         Ok(task) => return Some(task),
                         Err(PopError::Empty) => continue,
@@ -145,6 +142,6 @@ impl Thread {
     }
 
     fn wait(&self, executor: &Arc<Executor>) -> Result<Option<Notified>, ()> {
-        executor.thread_pool.wait(None)        
+        executor.thread_pool.wait(None)
     }
 }
