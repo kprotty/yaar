@@ -1,9 +1,10 @@
 use super::wakers::{WakerIndex, WakerKind, Wakers};
-use crate::sync::waker::AtomicWaker;
+use crate::{runtime::thread::Thread, sync::waker::AtomicWaker};
 use mio::event::Source;
 use std::{
     future::Future,
     io,
+    mem,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
@@ -38,6 +39,12 @@ impl Default for Driver {
             signal,
             wakers: Wakers::default(),
         }
+    }
+}
+
+impl Driver {
+    pub fn notify(&self) {
+        self.signal.wake().expect("Failed to send an I/O signal");
     }
 }
 
@@ -81,7 +88,15 @@ impl<S: Source> AsRef<S> for Pollable<S> {
 }
 
 impl<S: Source> Pollable<S> {
-    pub fn new(mut source: S, driver: &Arc<Driver>) -> io::Result<Self> {
+    pub fn new(source: S) -> io::Result<Self> {
+        Thread::with_current(|thread| {
+            let driver = &thread.executor.io_driver;
+            Self::with_driver(source, driver)
+        })
+        .expect("Using I/O primitives outside of the runtime")
+    }
+
+    fn with_driver(mut source: S, driver: &Arc<Driver>) -> io::Result<Self> {
         let index = match driver.wakers.alloc() {
             Some(index) => index,
             None => {
@@ -145,6 +160,35 @@ impl<S: Source> Pollable<S> {
         })
     }
 
+    pub fn try_io<T>(
+        &self,
+        kind: WakerKind,
+        token: Option<u8>,
+        mut do_io: impl FnMut() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut waker_token = token;
+        loop {
+            match do_io() {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let token = match waker_token {
+                        Some(token) => token,
+                        None => match self.with_waker(kind, |waker| waker.ready()) {
+                            Some(token) => token,
+                            None => return Err(e),
+                        },
+                    };
+
+                    match self.with_waker(kind, |waker| waker.reset(token)) {
+                        Err(token) => waker_token = Some(token),
+                        Ok(_) => return Err(e),
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
     pub fn poll_io<T>(
         &self,
         kind: WakerKind,
@@ -152,76 +196,120 @@ impl<S: Source> Pollable<S> {
         mut do_io: impl FnMut() -> io::Result<T>,
     ) -> Poll<io::Result<T>> {
         loop {
-            let mut waker_token = ready!(self.poll_ready(kind, waker_ref));
-            loop {
-                match do_io() {
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => match kind {
-                        WakerKind::Write => continue,
-                        WakerKind::Read => {
-                            waker_ref.wake_by_ref();
-                            return Poll::Pending;
-                        }
-                    },
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        match self.with_waker(kind, |waker| waker.reset(waker_token)) {
-                            Ok(_) => break,
-                            Err(token) => waker_token = token,
-                        }
-                    }
-                    result => return Poll::Ready(result),
-                }
+            let token = ready!(self.poll_ready(kind, waker_ref));
+
+            match self.try_io(kind, Some(token), &mut do_io) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                result => return Poll::Ready(result),
             }
         }
     }
 
-    pub fn wait_for<'a>(&'a self, kind: WakerKind) -> impl Future<Output = ()> + 'a {
-        struct WaitFor<'a, S: Source> {
-            pollable: Option<&'a Pollable<S>>,
+    pub fn poll_future<'a, T: 'a>(
+        &'a self,
+        kind: WakerKind,
+        poll_fn: impl FnMut(&mut Context<'_>) -> Poll<T> + 'a + Unpin,
+    ) -> impl Future<Output = T> + 'a {
+        struct WaitFor<'a, S: Source, T, F: FnMut(&mut Context<'_>) -> Poll<T> + 'a + Unpin> {
+            pollable: &'a Pollable<S>,
+            poll_fn: Option<F>,
             kind: WakerKind,
         }
 
-        impl<'a, S: Source> Future for WaitFor<'a, S> {
-            type Output = ();
+        impl<'a, S: Source, T, F: FnMut(&mut Context<'_>) -> Poll<T> + 'a + Unpin> Future for WaitFor<'a, S, T, F> {
+            type Output = T;
 
             fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-                let pollable = self
-                    .pollable
-                    .take()
-                    .expect("wait_for() polled after completion");
+                let poll_fn = self
+                    .poll_fn
+                    .as_mut()
+                    .expect("poll_future() polled after completion");
 
-                if let Poll::Ready(_) = pollable.poll_ready(self.kind, ctx.waker()) {
-                    return Poll::Ready(());
-                }
-
-                self.pollable = Some(pollable);
-                Poll::Pending
+                let result = ready!(poll_fn(ctx));
+                mem::drop(poll_fn);
+                self.poll_fn = None;
+                Poll::Ready(result)
             }
         }
 
-        impl<'a, S: Source> Drop for WaitFor<'a, S> {
+        impl<'a, S: Source, T, F: FnMut(&mut Context<'_>) -> Poll<T> + 'a + Unpin> Drop for WaitFor<'a, S, T, F> {
             fn drop(&mut self) {
-                if let Some(pollable) = self.pollable.take() {
-                    self.drop_slow(pollable)
+                if self.poll_fn.is_some() {
+                    self.drop_slow()
                 }
             }
         }
 
-        impl<'a, S: Source> WaitFor<'a, S> {
+        impl<'a, S: Source, T, F: FnMut(&mut Context<'_>) -> Poll<T> + 'a + Unpin> WaitFor<'a, S, T, F> {
             #[cold]
-            fn drop_slow(&mut self, pollable: &'a Pollable<S>) {
-                if pollable
+            fn drop_slow(&mut self) {
+                if self
+                    .pollable
                     .with_waker(self.kind, |waker| waker.detach())
                     .is_some()
                 {
-                    let pending = pollable.driver.pending.fetch_sub(1, Ordering::Relaxed);
+                    let pending = self.pollable.driver.pending.fetch_sub(1, Ordering::Relaxed);
                     assert_ne!(pending, 0);
                 }
             }
         }
 
         WaitFor {
-            pollable: Some(self),
+            poll_fn: Some(poll_fn),
+            pollable: self,
             kind,
         }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct FairState {
+    tick: u8,
+    be_fair: bool,
+}
+
+impl Into<u8> for FairState {
+    fn into(self) -> u8 {
+        (self.tick << 1) | (self.be_fair as u8)
+    }
+}
+
+impl From<u8> for FairState {
+    fn from(value: u8) -> Self {
+        Self {
+            tick: value >> 1,
+            be_fair: value & 1 != 0,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct PollFairness {
+    state: u8,
+}
+
+impl PollFairness {
+    pub fn poll_fair<T>(
+        &mut self,
+        waker_ref: &Waker,
+        do_poll: impl FnOnce() -> Poll<T>,
+    ) -> Poll<T> {
+        let mut state: FairState = self.state.into();
+
+        if state.be_fair {
+            state.be_fair = false;
+            self.state = state.into();
+
+            waker_ref.wake_by_ref();
+            return Poll::Pending;
+        }
+
+        let result = ready!(do_poll());
+
+        state.tick += 1;
+        state.be_fair = state.tick == 0;
+        self.state = state.into();
+
+        Poll::Ready(result)
     }
 }

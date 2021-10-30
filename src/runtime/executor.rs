@@ -4,6 +4,7 @@ use super::{
     rand::RandomIterGen,
     thread::Thread,
 };
+use crate::io::driver::Driver as IoDriver;
 use std::{
     num::NonZeroUsize,
     sync::atomic::{fence, AtomicUsize, Ordering},
@@ -19,6 +20,7 @@ pub struct Worker {
 pub struct Executor {
     idle: AtomicUsize,
     searching: AtomicUsize,
+    pub io_driver: Arc<IoDriver>,
     pub injector: Injector,
     pub iter_gen: RandomIterGen,
     pub thread_pool: ThreadPool,
@@ -35,6 +37,7 @@ impl Executor {
         let executor = Arc::new(Self {
             idle: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
+            io_driver: Arc::new(IoDriver::default()),
             injector: Injector::default(),
             iter_gen: RandomIterGen::from(worker_threads),
             thread_pool: ThreadPool::from(config),
@@ -160,6 +163,7 @@ impl Executor {
 
     pub fn shutdown(&self) {
         self.thread_pool.shutdown();
+        self.io_driver.notify();
     }
 }
 

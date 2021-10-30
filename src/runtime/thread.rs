@@ -8,7 +8,7 @@ use std::hint::spin_loop as spin_loop_hint;
 use std::{cell::RefCell, mem, rc::Rc, sync::Arc};
 
 pub struct Thread {
-    pub(super) executor: Arc<Executor>,
+    pub(crate) executor: Arc<Executor>,
     pub(super) producer: RefCell<Option<Producer>>,
 }
 

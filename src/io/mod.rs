@@ -1,2 +1,2 @@
 pub(crate) mod driver;
-mod wakers;
+pub(crate) mod wakers;
