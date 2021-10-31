@@ -58,7 +58,7 @@ impl ThreadPool {
             return None;
         }
 
-        if pool.idle > 0 {
+        if pool.idle > pool.notified.len() {
             pool.notified.push_back(notified);
             self.cond.notify_one();
             return Some(());
