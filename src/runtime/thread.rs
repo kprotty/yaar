@@ -6,12 +6,13 @@ use super::{
 };
 use crate::io::driver::Poller as IoPoller;
 use std::hint::spin_loop as spin_loop_hint;
-use std::{cell::RefCell, collections::VecDeque, mem, rc::Rc, sync::Arc, time::Duration};
+use std::{cell::{Cell, RefCell}, collections::VecDeque, mem, rc::Rc, sync::Arc, time::Duration};
 
 pub struct Thread {
     pub(crate) executor: Arc<Executor>,
     pub(super) producer: RefCell<Option<Producer>>,
     pub(super) ready: RefCell<VecDeque<Task>>,
+    pub(super) use_ready: Cell<bool>,
 }
 
 impl Thread {
@@ -34,6 +35,7 @@ impl Thread {
             executor: Arc::clone(executor),
             producer: RefCell::new(Some(producer)),
             ready: RefCell::new(VecDeque::new()),
+            use_ready: Cell::new(false),
         }));
 
         match Self::with_tls(|tls| mem::replace(tls, Some(thread.clone()))) {
@@ -144,26 +146,20 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
                 }
             }
 
-            if self.io_poller.poll(&self.executor.io_driver, None) {
-                assert_eq!(self.io_ready.len(), 0);
-                mem::swap(&mut *self.thread.ready.borrow_mut(), &mut self.io_ready);
+            if self.poll_io(None) && self.io_ready.len() > 0 {
+                if let Some(worker_index) = self.executor.search_retry() {
+                    self.transition_to_running(Notified {
+                        worker_index,
+                        searching: true,
+                    });
 
-                if self.io_ready.len() > 0 {
-                    if let Some(worker_index) = self.executor.search_retry() {
-                        self.transition_to_running(Notified {
-                            worker_index,
-                            searching: true,
-                        });
-
-                        let task = self.io_ready.pop_front().unwrap();
-                        self.thread.producer.borrow().as_ref().unwrap().push(self.io_ready.drain(..));
-                        return Some(task);
-                    }
-
-                    self.executor
-                        .schedule(self.io_ready.drain(..), Some(self.thread));
-                    continue;
+                    let task = self.io_ready.pop_front().unwrap();
+                    self.executor.schedule(self.io_ready.drain(..), Some(self.thread));
+                    return Some(task);
                 }
+
+                self.executor.schedule(self.io_ready.drain(..), Some(self.thread));
+                continue;
             }
 
             match self.executor.thread_pool.wait(self.is_worker_thread, None) {
@@ -175,7 +171,7 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
     }
 
     fn poll(&mut self, worker_index: usize) -> Option<Task> {
-        let executor = &self.executor;
+        let executor = self.executor;
         let run_queue = &executor.workers[worker_index].run_queue;
 
         let producer = self.thread.producer.borrow();
@@ -198,8 +194,9 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
             return Some(task);
         }
 
-        if self.io_poller.poll(&self.executor.io_driver, Some(Duration::ZERO)) {
-            if let Some(task) = producer.pop(run_queue, false) {
+        if self.poll_io(Some(Duration::ZERO)) {
+            if let Some(task) = self.io_ready.pop_front() {
+                self.executor.schedule(self.io_ready.drain(..), Some(self.thread));
                 return Some(task);
             }
         }
@@ -236,5 +233,18 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
         }
 
         producer.consume(&executor.injector)
+    }
+
+    fn poll_io(&mut self, timeout: Option<Duration>) -> bool {
+        assert!(!self.thread.use_ready.replace(true));
+        let polled = self.io_poller.poll(&self.executor.io_driver, timeout);
+
+        assert!(self.thread.use_ready.replace(false));
+        if polled {
+            assert_eq!(self.io_ready.len(), 0);
+            mem::swap(&mut *self.thread.ready.borrow_mut(), &mut self.io_ready);
+        }
+        
+        polled
     }
 }

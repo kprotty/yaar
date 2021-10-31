@@ -60,14 +60,16 @@ impl Executor {
         }
 
         if let Some(thread) = thread {
+            if thread.use_ready.get() {
+                thread.ready.borrow_mut().extend(tasks);
+                return;
+            }
+
             if let Some(producer) = thread.producer.borrow().as_ref() {
                 producer.push(tasks);
                 self.notify();
                 return;
             }
-
-            thread.ready.borrow_mut().extend(tasks);
-            return;
         }
 
         self.injector.inject(tasks);
