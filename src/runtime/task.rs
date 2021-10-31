@@ -225,6 +225,7 @@ where
 trait TaskJoinable<T>: Send + Sync {
     fn join(&self, waker_ref: &Waker) -> Poll<T>;
     fn consume(&self) -> T;
+    fn detach(&self);
 }
 
 impl<F> TaskJoinable<F::Output> for Task<F>
@@ -233,7 +234,7 @@ where
     F::Output: Send,
 {
     fn join(&self, waker_ref: &Waker) -> Poll<F::Output> {
-        match self.joiner.poll(waker_ref, || {}) {
+        match self.joiner.poll(waker_ref, || {}, || {}) {
             Poll::Ready(_) => Poll::Ready(self.consume()),
             Poll::Pending => Poll::Pending,
         }
@@ -248,6 +249,10 @@ where
             TaskData::Idle(_) => unreachable!("Idle when consumed"),
         }
     }
+
+    fn detach(&self) {
+        mem::drop(self.joiner.detach())
+    }
 }
 
 pub struct JoinHandle<T> {
@@ -260,6 +265,14 @@ impl<T> JoinHandle<T> {
             .as_ref()
             .expect("JoinHandle polled to completion already")
             .consume()
+    }
+}
+
+impl<T> Drop for JoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(joinable) = self.joinable.take() {
+            joinable.detach();
+        }
     }
 }
 

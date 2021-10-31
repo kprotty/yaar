@@ -54,7 +54,12 @@ impl AtomicWaker {
         }
     }
 
-    pub fn poll(&self, waker_ref: &Waker, waiting: impl FnOnce()) -> Poll<u8> {
+    pub fn poll(
+        &self,
+        waker_ref: &Waker,
+        waiting: impl FnOnce(),
+        cancelled: impl FnOnce(),
+    ) -> Poll<u8> {
         let mut state: State = self.state.load(Ordering::Acquire).into();
         match state.status {
             Status::Empty | Status::Ready => {}
@@ -77,18 +82,17 @@ impl AtomicWaker {
             return Poll::Ready(state.token);
         }
 
-        let kept_waker = {
+        {
             let mut waker = self.waker.lock();
             let will_wake = waker
                 .as_ref()
                 .map(|w| w.will_wake(waker_ref))
                 .unwrap_or(false);
 
-            will_wake || {
+            if !will_wake {
                 *waker = Some(waker_ref.clone());
-                false
             }
-        };
+        }
 
         if let Err(e) = self.state.compare_exchange(
             (State {
@@ -97,13 +101,18 @@ impl AtomicWaker {
             })
             .into(),
             (State {
-                token: state.token + (!kept_waker as u8),
+                token: state.token,
                 status: Status::Ready,
             })
             .into(),
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
+            *self.waker.lock() = None;
+            if state.status == Status::Ready {
+                cancelled();
+            }
+
             state = e.into();
             assert_eq!(state.status, Status::Notified);
             return Poll::Ready(state.token);
@@ -143,42 +152,33 @@ impl AtomicWaker {
         }
     }
 
+    pub fn detach(&self) -> Option<Waker> {
+        self.state
+            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |state| {
+                let mut state = State::from(state);
+                state.status = match state.status {
+                    Status::Ready => Status::Empty,
+                    Status::Empty | Status::Notified => return None,
+                    Status::Updating => unreachable!("detaching AtomicWaker with pending poll()"),
+                };
+                Some(state.into())
+            })
+            .ok()
+            .and_then(|_| mem::replace(&mut *self.waker.lock(), None))
+    }
+
     pub fn wake(&self) -> Option<Waker> {
-        let mut state: State = self.state.load(Ordering::Relaxed).into();
-        loop {
-            match state.status {
-                Status::Notified => match self.state.compare_exchange_weak(
-                    state.into(),
-                    (State {
-                        token: state.token + 1,
-                        status: state.status,
-                    })
-                    .into(),
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return None,
-                    Err(e) => state = e.into(),
-                },
-                _ => match self.state.compare_exchange(
-                    state.into(),
-                    (State {
-                        token: state.token,
-                        status: Status::Notified,
-                    })
-                    .into(),
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        return match state.status {
-                            Status::Ready => mem::replace(&mut *self.waker.lock(), None),
-                            _ => None,
-                        }
-                    }
-                    Err(e) => state = e.into(),
-                },
-            }
-        }
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |state| {
+                let mut state = State::from(state);
+                state.token += (state.status == Status::Notified) as u8;
+                state.status = Status::Notified;
+                Some(state.into())
+            })
+            .ok()
+            .and_then(|state| match State::from(state).status {
+                Status::Ready => mem::replace(&mut *self.waker.lock(), None),
+                _ => None,
+            })
     }
 }

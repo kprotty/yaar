@@ -74,8 +74,12 @@ impl Poller {
             return false;
         }
 
-        let _ = selector.poll(&mut self.events, timeout);
-        mem::drop(selector);
+        loop {
+            match selector.poll(&mut self.events, timeout) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                _ => break mem::drop(selector),
+            }
+        }
 
         let mut resumed = 0;
         for event in self.events.iter() {
@@ -177,22 +181,31 @@ impl<S: Source> Drop for Pollable<S> {
             .deregister(&mut self.source)
             .expect("I/O source failed to deregister from I/O selector");
 
-        let notified = [WakerKind::Read, WakerKind::Write]
-            .into_iter()
-            .map(|kind| self.with_waker(kind, |waker| waker.wake()))
-            .map(|waker| waker.is_some() as usize)
-            .sum();
-
-        if notified > 0 {
-            let pending = self.driver.pending.fetch_sub(notified, Ordering::Relaxed);
-            assert!(pending >= notified);
-        }
+        self.poll_detach(WakerKind::Read);
+        self.poll_detach(WakerKind::Write);
 
         self.driver.wakers.free(self.index);
     }
 }
 
 impl<S: Source> Pollable<S> {
+    fn poll_pending(&self) {
+        let pending = self.driver.pending.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(pending, usize::MAX);
+    }
+
+    fn poll_cancel(&self) {
+        let pending = self.driver.pending.fetch_sub(1, Ordering::Relaxed);
+        assert_ne!(pending, 0);
+    }
+
+    fn poll_detach(&self, kind: WakerKind) {
+        if let Some(waker) = self.with_waker(kind, |waker| waker.detach()) {
+            self.poll_cancel();
+            mem::drop(waker);
+        }
+    }
+
     pub fn poll_io<T>(
         &self,
         kind: WakerKind,
@@ -201,10 +214,7 @@ impl<S: Source> Pollable<S> {
     ) -> Poll<io::Result<T>> {
         loop {
             let mut wake_token = match self.with_waker(kind, |waker| {
-                waker.poll(waker_ref, || {
-                    let pending = self.driver.pending.fetch_add(1, Ordering::Relaxed);
-                    assert_ne!(pending, usize::MAX);
-                })
+                waker.poll(waker_ref, || self.poll_pending(), || self.poll_cancel())
             }) {
                 Poll::Ready(token) => token,
                 Poll::Pending => return Poll::Pending,
@@ -254,6 +264,14 @@ impl<S: Source> Pollable<S> {
 
                 self.completed = true;
                 Poll::Ready(result)
+            }
+        }
+
+        impl<'a, S: Source, T, F: FnMut() -> io::Result<T> + Unpin> Drop for PollFuture<'a, S, T, F> {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.pollable.poll_detach(self.kind);
+                }
             }
         }
 
