@@ -63,11 +63,7 @@ impl From<u8> for TaskState {
     }
 }
 
-impl<F> Task<F>
-where
-    F: Future + Send + 'static,
-    F::Output: Send,
-{
+impl<F: Future> Task<F> {
     fn new(future: F, executor: Arc<Executor>, shutdown: bool) -> Self {
         let state = TaskState {
             status: TaskStatus::Scheduled,
@@ -134,7 +130,31 @@ where
         self.state.store(state.into(), Ordering::Relaxed);
         false
     }
+}
 
+impl<F> Wake for Task<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn wake(self: Arc<Self>) {
+        if self.transition_to_schedule() {
+            self.schedule();
+        }
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.transition_to_schedule() {
+            Arc::clone(self).schedule();
+        }
+    }
+}
+
+impl<F> Task<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     fn schedule(self: Arc<Self>) {
         let mut task = Some(self);
 
@@ -153,24 +173,6 @@ where
     }
 }
 
-impl<F> Wake for Task<F>
-where
-    F: Future + Send + 'static,
-    F::Output: Send,
-{
-    fn wake(self: Arc<Self>) {
-        if self.transition_to_schedule() {
-            self.schedule();
-        }
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        if self.transition_to_schedule() {
-            Arc::clone(self).schedule();
-        }
-    }
-}
-
 pub trait TaskRunnable: Send + Sync {
     fn run(self: Arc<Self>, executor: &Arc<Executor>, thread: &Thread);
 }
@@ -178,7 +180,7 @@ pub trait TaskRunnable: Send + Sync {
 impl<F> TaskRunnable for Task<F>
 where
     F: Future + Send + 'static,
-    F::Output: Send,
+    F::Output: Send + 'static,
 {
     fn run(self: Arc<Self>, executor: &Arc<Executor>, thread: &Thread) {
         let shutdown = self.transition_to_running();
@@ -222,17 +224,13 @@ where
     }
 }
 
-trait TaskJoinable<T>: Send + Sync {
+trait TaskJoinable<T> {
     fn join(&self, waker_ref: &Waker) -> Poll<T>;
     fn consume(&self) -> T;
     fn detach(&self);
 }
 
-impl<F> TaskJoinable<F::Output> for Task<F>
-where
-    F: Future + Send + 'static,
-    F::Output: Send,
-{
+impl<F: Future> TaskJoinable<F::Output> for Task<F> {
     fn join(&self, waker_ref: &Waker) -> Poll<F::Output> {
         match self.joiner.poll(waker_ref, || {}, || {}) {
             Poll::Ready(_) => Poll::Ready(self.consume()),
