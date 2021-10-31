@@ -2,12 +2,12 @@ use gcd::Gcd;
 use std::{mem::size_of, num::NonZeroUsize};
 
 #[derive(Copy, Clone)]
-pub struct RandomIterGen {
+pub struct RandomIterSource {
     range: NonZeroUsize,
     co_prime: NonZeroUsize,
 }
 
-impl From<NonZeroUsize> for RandomIterGen {
+impl From<NonZeroUsize> for RandomIterSource {
     fn from(range: NonZeroUsize) -> Self {
         Self {
             range,
@@ -24,11 +24,11 @@ impl From<NonZeroUsize> for RandomIterGen {
     }
 }
 
-pub struct RandomSource {
+pub struct RandomIterGen {
     xorshift: usize,
 }
 
-impl RandomSource {
+impl RandomIterGen {
     pub fn new(seed: usize) -> Self {
         #[cfg(target_pointer_width = "64")]
         const HASH: usize = 0x9E3779B97F4A7C15;

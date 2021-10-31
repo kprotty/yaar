@@ -27,7 +27,8 @@ struct Pool {
 pub struct ThreadPoolConfig {
     pub keep_alive: Option<Duration>,
     pub stack_size: Option<NonZeroUsize>,
-    pub max_threads: Option<NonZeroUsize>,
+    pub worker_threads: Option<NonZeroUsize>,
+    pub blocking_threads: Option<NonZeroUsize>,
     pub on_thread_start: Option<Box<dyn Fn() + Send + Sync + 'static>>,
     pub on_thread_stop: Option<Box<dyn Fn() + Send + Sync + 'static>>,
     pub on_thread_park: Option<Box<dyn Fn() + Send + Sync + 'static>>,
@@ -64,20 +65,17 @@ impl ThreadPool {
             return Some(());
         }
 
-        let max_spawn = self.config.max_threads.unwrap().get();
-        if pool.spawned == max_spawn {
+        let blocking_threads = self.config.blocking_threads.unwrap().get();
+        let worker_threads = self.config.worker_threads.unwrap().get();
+        let max_threads = blocking_threads + worker_threads;
+        
+        if pool.spawned == max_threads {
             return None;
         }
 
         let position = pool.spawned;
         pool.spawned += 1;
         mem::drop(pool);
-
-        let executor = Arc::clone(executor);
-        if position == 0 {
-            Self::run(executor, notified, position);
-            return Some(());
-        }
 
         let thread_stack_size = self
             .config
@@ -93,6 +91,7 @@ impl ThreadPool {
             .map(|f| f())
             .unwrap_or(String::from("yaar-runtime-worker"));
 
+        let executor = Arc::clone(executor);
         thread::Builder::new()
             .name(thread_name)
             .stack_size(thread_stack_size)
@@ -123,17 +122,10 @@ impl ThreadPool {
 
     pub fn wait(
         &self,
-        is_worker_thread: bool,
         deadline: Option<Instant>,
     ) -> Result<Option<Notified>, ()> {
-        let force_deadline = deadline.or_else(|| {
-            if is_worker_thread {
-                return None;
-            }
-
-            let keep_alive = self.config.keep_alive.unwrap_or(Duration::from_secs(10));
-            Some(Instant::now() + keep_alive)
-        });
+        let keep_alive = self.config.keep_alive.unwrap_or(Duration::from_secs(10));
+        let force_deadline = deadline.unwrap_or_else(|| Instant::now() + keep_alive);
 
         let mut pool = self.pool.lock();
         assert_ne!(pool.spawned, 0);
@@ -160,13 +152,7 @@ impl ThreadPool {
                 (callback)();
             }
 
-            timed_out = match force_deadline {
-                Some(deadline) => self.cond.wait_until(&mut pool, deadline).timed_out(),
-                None => {
-                    self.cond.wait(&mut pool);
-                    false
-                }
-            };
+            timed_out = self.cond.wait_until(&mut pool, force_deadline).timed_out();
 
             pool.idle -= 1;
             if let Some(callback) = self.config.on_thread_unpark.as_ref() {

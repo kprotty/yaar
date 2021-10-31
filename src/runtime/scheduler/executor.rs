@@ -1,7 +1,7 @@
 use super::{
     pool::{Notified, ThreadPool, ThreadPoolConfig},
     queue::{Injector, Queue, Task},
-    rand::RandomIterGen,
+    random::RandomIterSource,
     thread::Thread,
 };
 use crate::io::driver::Driver as IoDriver;
@@ -22,7 +22,7 @@ pub struct Executor {
     searching: AtomicUsize,
     pub io_driver: Arc<IoDriver>,
     pub injector: Injector,
-    pub iter_gen: RandomIterGen,
+    pub rand_iter_source: RandomIterSource,
     pub thread_pool: ThreadPool,
     pub workers: Box<[Worker]>,
 }
@@ -39,7 +39,7 @@ impl Executor {
             searching: AtomicUsize::new(0),
             io_driver: Arc::new(IoDriver::default()),
             injector: Injector::default(),
-            iter_gen: RandomIterGen::from(worker_threads),
+            rand_iter_source: RandomIterSource::from(worker_threads),
             thread_pool: ThreadPool::from(config),
             workers: (0..worker_threads.get())
                 .map(|_| Worker::default())

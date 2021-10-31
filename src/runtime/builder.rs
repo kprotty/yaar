@@ -1,9 +1,9 @@
-use super::{executor::Executor, pool::ThreadPoolConfig, task};
+use super::executor::{Executor, pool::ThreadPoolConfig, task};
 use std::{future::Future, num::NonZeroUsize, time::Duration};
 
 #[derive(Default)]
 pub struct Builder {
-    pub(crate) worker_threads: Option<NonZeroUsize>,
+    
     pub(crate) config: ThreadPoolConfig,
 }
 
@@ -65,15 +65,12 @@ impl Builder {
         self.thread_name_fn(move || name.clone())
     }
 
-    pub fn block_on<F>(self, future: F) -> F::Output
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
+    pub fn block_on<F: Future>(self, future: F) -> F::Output {
         let Self {
             worker_threads,
             config,
         } = self;
+
         let worker_threads = worker_threads
             .or_else(|| NonZeroUsize::new(num_cpus::get()))
             .or(NonZeroUsize::new(1))

@@ -1,6 +1,7 @@
 use crate::io::{
-    driver::{PollFairness, Pollable},
-    wakers::WakerKind,
+    PollFairness,
+    Pollable,
+    WakerKind,
 };
 use std::{
     cell::RefCell,

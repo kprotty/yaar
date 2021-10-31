@@ -12,6 +12,87 @@ use std::{
     task::{Context, Poll, Wake, Waker},
 };
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum TaskStatus {
+    Idle = 0,
+    Scheduled = 1,
+    Running = 2,
+    Notified = 3,
+}
+
+impl Into<u8> for TaskStatus {
+    fn into(self) -> u8 {
+        self.status as u8
+    }
+}
+
+impl From<u8> for TaskStatus {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => TaskStatus::Idle,
+            1 => TaskStatus::Scheduled,
+            2 => TaskStatus::Running,
+            3 => TaskStatus::Notified,
+            _ => unreachable!(),
+        }
+    }
+}
+
+struct TaskState {
+    status: AtomicU8,
+}
+
+impl From<TaskStatus> for TaskState {
+    fn from(status: TaskStatus) -> Self {
+        Self {
+            status: AtomicU8::new(status.into()),
+        }
+    }
+}
+
+impl TaskState {
+    fn transition_to_schedule(&self) -> bool {
+        self.status
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |status| {
+                Some(match TaskStatus::from(status) {
+                    TaskStatus::Idle => TaskStatus::Scheduled.into(),
+                    TaskStatus::Running => TaskStatus::Notified.into(),
+                    _ => return None,
+                })
+            })
+            .map(|status| match TaskStatus::from(status) {
+                TaskStatus::Idle => true,
+                TaskStatus::Running => false,
+                _ => unreachable!(),
+            })
+            .unwrap_or(false)
+    }
+
+    fn transition_to_running(&self) {
+        let mut status: TaskStatus = self.status.load(Ordering::Acquire).into();
+        assert_eq!(status, TaskStatus::Scheduled);
+
+        status = TaskStatus::Running;
+        self.status.store(status.into(), Ordering::Relaxed);
+    }
+
+    fn transition_to_idle(&self) -> bool {
+        match self.status.compare_exchange(
+            TaskStatus::Running.into(),
+            TaskStatus::Idle.into(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(e) => {
+                let status: TaskStatus = e.into();
+                assert_eq!(status, TaskStatus::Notified);
+                false
+            }
+        }
+    }
+}
+
 type TaskError = Box<dyn Any + Send + 'static>;
 
 enum TaskData<F: Future> {
@@ -22,114 +103,10 @@ enum TaskData<F: Future> {
 }
 
 struct Task<F: Future> {
-    state: AtomicU8,
+    state: TaskState,
     joiner: AtomicWaker,
     data: Mutex<TaskData<F>>,
     executor: Arc<Executor>,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum TaskStatus {
-    Idle = 0,
-    Scheduled = 1,
-    Running = 2,
-    Notified = 3,
-}
-
-#[derive(Copy, Clone)]
-struct TaskState {
-    shutdown: bool,
-    status: TaskStatus,
-}
-
-impl Into<u8> for TaskState {
-    fn into(self) -> u8 {
-        ((self.shutdown as u8) << 2) | (self.status as u8)
-    }
-}
-
-impl From<u8> for TaskState {
-    fn from(value: u8) -> Self {
-        Self {
-            shutdown: value & (1 << 2) != 0,
-            status: match value & 0b11 {
-                0 => TaskStatus::Idle,
-                1 => TaskStatus::Scheduled,
-                2 => TaskStatus::Running,
-                3 => TaskStatus::Notified,
-                _ => unreachable!(),
-            },
-        }
-    }
-}
-
-impl<F: Future> Task<F> {
-    fn new(future: F, executor: Arc<Executor>, shutdown: bool) -> Self {
-        let state = TaskState {
-            status: TaskStatus::Scheduled,
-            shutdown,
-        };
-
-        Self {
-            state: AtomicU8::new(state.into()),
-            joiner: AtomicWaker::default(),
-            data: Mutex::new(TaskData::Idle(Box::pin(future))),
-            executor,
-        }
-    }
-
-    fn transition_to_schedule(&self) -> bool {
-        self.state
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
-                let mut state = TaskState::from(state);
-                state.status = match state.status {
-                    TaskStatus::Idle => TaskStatus::Scheduled,
-                    TaskStatus::Running => TaskStatus::Notified,
-                    _ => return None,
-                };
-                Some(state.into())
-            })
-            .map(|state| match TaskState::from(state).status {
-                TaskStatus::Idle => true,
-                TaskStatus::Running => false,
-                _ => unreachable!(),
-            })
-            .unwrap_or(false)
-    }
-
-    fn transition_to_running(&self) -> bool {
-        let mut state: TaskState = self.state.load(Ordering::Relaxed).into();
-        assert_eq!(state.status, TaskStatus::Scheduled);
-
-        state.status = TaskStatus::Running;
-        self.state.store(state.into(), Ordering::Relaxed);
-        state.shutdown
-    }
-
-    fn transition_to_idle(&self) -> bool {
-        let mut state: TaskState = self.state.load(Ordering::Acquire).into();
-
-        if state.status == TaskStatus::Running {
-            match self.state.compare_exchange(
-                state.into(),
-                (TaskState {
-                    status: TaskStatus::Idle,
-                    shutdown: state.shutdown,
-                })
-                .into(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(e) => state = TaskState::from(e),
-            }
-        }
-
-        assert_eq!(state.status, TaskStatus::Notified);
-        state.status = TaskStatus::Scheduled;
-        self.state.store(state.into(), Ordering::Relaxed);
-        false
-    }
 }
 
 impl<F> Wake for Task<F>
@@ -138,13 +115,13 @@ where
     F::Output: Send + 'static,
 {
     fn wake(self: Arc<Self>) {
-        if self.transition_to_schedule() {
+        if self.state.transition_to_schedule() {
             self.schedule();
         }
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        if self.transition_to_schedule() {
+        if self.state.transition_to_schedule() {
             Arc::clone(self).schedule();
         }
     }
@@ -293,42 +270,31 @@ impl<T> Future for JoinHandle<T> {
     }
 }
 
-pub(crate) fn block_on<F>(future: F, executor: &Arc<Executor>) -> F::Output
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let join_handle = spawn_with(future, executor, None, true);
-    join_handle.consume()
-}
-
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    Thread::with_current(|thread| spawn_with(future, &thread.executor, Some(thread), false))
+    Thread::with_current(|thread| {
+        let task = Arc::new(Self {
+            status: TaskState::from(TaskStatus::Scheduled),
+            joiner: AtomicWaker::default(),
+            data: Mutex::new(TaskData::Idle(Box::pin(future))),
+            executor: executor.clone(),
+        });
+
+        let runnable: Arc<dyn TaskRunnable> = task.clone();
+        executor.schedule(once(runnable), Some(thread));
+
+        JoinHandle {
+            joinable: Some(task),
+        }
+    })
         .expect("spawn() called outside the runtime")
 }
 
-fn spawn_with<F>(
-    future: F,
-    executor: &Arc<Executor>,
-    thread: Option<&Thread>,
-    shutdown: bool,
-) -> JoinHandle<F::Output>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let task = Arc::new(Task::new(future, executor.clone(), shutdown));
-
-    let runnable: Arc<dyn TaskRunnable> = task.clone();
-    executor.schedule(once(runnable), thread);
-
-    JoinHandle {
-        joinable: Some(task),
-    }
+pub(crate) fn block_on<F: Future>(future: F, executor: &Arc<Executor>) -> F::Output {
+    
 }
 
 pub fn yield_now() -> impl Future<Output = ()> {
