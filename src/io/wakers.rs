@@ -104,8 +104,7 @@ impl Wakers {
     pub(super) fn with<F>(
         &self,
         index: WakerIndex,
-        kind: WakerKind,
-        f: impl FnOnce(&AtomicWaker) -> F,
+        f: impl FnOnce(&WakerEntry) -> F,
     ) -> F {
         let array = self.array.load();
         let array = array
@@ -117,7 +116,6 @@ impl Wakers {
             .as_ref()
             .expect("Accessing waker index without having allocated backing block");
 
-        let entry = &block[index.entry as usize];
-        f(&entry[kind as usize])
+        f(&block[index.entry as usize])
     }
 }

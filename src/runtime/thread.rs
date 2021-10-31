@@ -6,7 +6,7 @@ use super::{
 };
 use crate::io::driver::Poller as IoPoller;
 use std::hint::spin_loop as spin_loop_hint;
-use std::{cell::RefCell, collections::VecDeque, mem, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::VecDeque, mem, rc::Rc, sync::Arc, time::Duration};
 
 pub struct Thread {
     pub(crate) executor: Arc<Executor>,
@@ -154,6 +154,10 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
                             worker_index,
                             searching: true,
                         });
+
+                        let task = self.io_ready.pop_front().unwrap();
+                        self.thread.producer.borrow().as_ref().unwrap().push(self.io_ready.drain(..));
+                        return Some(task);
                     }
 
                     self.executor
@@ -194,12 +198,12 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
             return Some(task);
         }
 
-        if self.io_poller.poll(&self.executor.io_driver, None) {
-            if let Some(task) = producer.pop(run_queue, be_fair) {
+        if self.io_poller.poll(&self.executor.io_driver, Some(Duration::ZERO)) {
+            if let Some(task) = producer.pop(run_queue, false) {
                 return Some(task);
             }
         }
-
+        
         if !self.searching {
             self.searching = executor.search_begin();
         }

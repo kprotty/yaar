@@ -80,25 +80,19 @@ impl Poller {
                 mio::Token(i) => WakerIndex::from(i),
             };
 
-            if event.is_readable() {
-                if let Some(waker) = driver
-                    .wakers
-                    .with(index, WakerKind::Read, |waker| waker.wake())
-                {
-                    resumed += 1;
-                    waker.wake();
-                }
-            }
+            let wakers = driver.wakers.with(index, |wakers| [
+                match event.is_readable() {
+                    true => wakers[WakerKind::Read as usize].wake(),
+                    _ => None,
+                },
+                match event.is_writable() {
+                    true => wakers[WakerKind::Write as usize].wake(),
+                    _ => None,
+                },
+            ]);
 
-            if event.is_writable() {
-                if let Some(waker) = driver
-                    .wakers
-                    .with(index, WakerKind::Write, |waker| waker.wake())
-                {
-                    resumed += 1;
-                    waker.wake();
-                }
-            }
+            resumed += wakers.iter().map(|w| w.is_some() as usize).sum::<usize>();
+            wakers.into_iter().filter_map(|w| w).for_each(|w| w.wake());
         }
 
         if resumed > 0 {
@@ -159,7 +153,7 @@ impl<S: Source> Pollable<S> {
     }
 
     fn with_waker<F>(&self, kind: WakerKind, f: impl FnOnce(&AtomicWaker) -> F) -> F {
-        self.driver.wakers.with(self.index, kind, f)
+        self.driver.wakers.with(self.index, |wakers| f(&wakers[kind as usize]))
     }
 }
 
