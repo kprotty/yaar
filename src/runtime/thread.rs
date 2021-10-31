@@ -154,7 +154,7 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
                     continue;
                 }
             }
-            
+
             match self.executor.thread_pool.wait(None) {
                 Ok(Some(notified)) => self.transition_to_running(notified),
                 Ok(None) => {}

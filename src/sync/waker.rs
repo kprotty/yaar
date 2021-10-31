@@ -118,14 +118,6 @@ impl AtomicWaker {
         Poll::Pending
     }
 
-    pub fn ready(&self) -> Option<u8> {
-        let state: State = self.state.load(Ordering::Acquire).into();
-        match state.status {
-            Status::Notified => Some(state.token),
-            _ => None,
-        }
-    }
-
     pub fn reset(&self, token: u8) -> Result<(), u8> {
         match self.state.compare_exchange(
             (State {

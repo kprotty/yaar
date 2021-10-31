@@ -3,7 +3,7 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Request, Response,
 };
-use std::{net::SocketAddr, convert::Infallible};
+use std::{convert::Infallible, net::SocketAddr};
 
 async fn hello_world(_: Request<Body>) -> Result<Response<Body>, Infallible> {
     Ok(Response::new(Body::from("Hello World")))

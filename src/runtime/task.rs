@@ -241,10 +241,9 @@ where
         match mem::replace(&mut *self.data.lock(), TaskData::Consumed) {
             TaskData::Ready(Ok(result)) => result,
             TaskData::Ready(Err(error)) => panic::resume_unwind(error),
-            _ => unreachable!(),
-            // TaskData::Polling => unreachable!("Polling when consumed"),
-            // TaskData::Consumed => unreachable!("Consumed when consumed"),
-            // TaskData::Idle(_) => unreachable!("Idle when consumed"),
+            TaskData::Polling => unreachable!("Polling when consumed"),
+            TaskData::Consumed => unreachable!("Consumed when consumed"),
+            TaskData::Idle(_) => unreachable!("Idle when consumed"),
         }
     }
 }
