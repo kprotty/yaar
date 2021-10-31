@@ -70,6 +70,10 @@ impl Poller {
             None => return false,
         };
 
+        if driver.pending.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+
         let _ = selector.poll(&mut self.events, timeout);
         mem::drop(selector);
 
@@ -80,19 +84,26 @@ impl Poller {
                 mio::Token(i) => WakerIndex::from(i),
             };
 
-            let wakers = driver.wakers.with(index, |wakers| [
-                match event.is_readable() {
-                    true => wakers[WakerKind::Read as usize].wake(),
-                    _ => None,
-                },
-                match event.is_writable() {
-                    true => wakers[WakerKind::Write as usize].wake(),
-                    _ => None,
-                },
-            ]);
+            let wakers = driver.wakers.with(index, |wakers| {
+                [
+                    match event.is_readable() {
+                        true => wakers[WakerKind::Read as usize].wake(),
+                        _ => None,
+                    },
+                    match event.is_writable() {
+                        true => wakers[WakerKind::Write as usize].wake(),
+                        _ => None,
+                    },
+                ]
+            });
 
-            resumed += wakers.iter().map(|w| w.is_some() as usize).sum::<usize>();
-            wakers.into_iter().filter_map(|w| w).for_each(|w| w.wake());
+            wakers
+                .into_iter()
+                .filter_map(|waker| waker)
+                .for_each(|waker| {
+                    resumed += 1;
+                    waker.wake();
+                });
         }
 
         if resumed > 0 {
@@ -153,7 +164,9 @@ impl<S: Source> Pollable<S> {
     }
 
     fn with_waker<F>(&self, kind: WakerKind, f: impl FnOnce(&AtomicWaker) -> F) -> F {
-        self.driver.wakers.with(self.index, |wakers| f(&wakers[kind as usize]))
+        self.driver
+            .wakers
+            .with(self.index, |wakers| f(&wakers[kind as usize]))
     }
 }
 

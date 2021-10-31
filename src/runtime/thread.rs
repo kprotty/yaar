@@ -6,7 +6,14 @@ use super::{
 };
 use crate::io::driver::Poller as IoPoller;
 use std::hint::spin_loop as spin_loop_hint;
-use std::{cell::{Cell, RefCell}, collections::VecDeque, mem, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    mem,
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 pub struct Thread {
     pub(crate) executor: Arc<Executor>,
@@ -154,11 +161,13 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
                     });
 
                     let task = self.io_ready.pop_front().unwrap();
-                    self.executor.schedule(self.io_ready.drain(..), Some(self.thread));
+                    self.executor
+                        .schedule(self.io_ready.drain(..), Some(self.thread));
                     return Some(task);
                 }
 
-                self.executor.schedule(self.io_ready.drain(..), Some(self.thread));
+                self.executor
+                    .schedule(self.io_ready.drain(..), Some(self.thread));
                 continue;
             }
 
@@ -196,11 +205,12 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
 
         if self.poll_io(Some(Duration::ZERO)) {
             if let Some(task) = self.io_ready.pop_front() {
-                self.executor.schedule(self.io_ready.drain(..), Some(self.thread));
+                self.executor
+                    .schedule(self.io_ready.drain(..), Some(self.thread));
                 return Some(task);
             }
         }
-        
+
         if !self.searching {
             self.searching = executor.search_begin();
         }
@@ -244,7 +254,7 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
             assert_eq!(self.io_ready.len(), 0);
             mem::swap(&mut *self.thread.ready.borrow_mut(), &mut self.io_ready);
         }
-        
+
         polled
     }
 }

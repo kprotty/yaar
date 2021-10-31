@@ -101,11 +101,7 @@ impl Wakers {
         cache.indices.push_back(index);
     }
 
-    pub(super) fn with<F>(
-        &self,
-        index: WakerIndex,
-        f: impl FnOnce(&WakerEntry) -> F,
-    ) -> F {
+    pub(super) fn with<F>(&self, index: WakerIndex, f: impl FnOnce(&WakerEntry) -> F) -> F {
         let array = self.array.load();
         let array = array
             .as_ref()
