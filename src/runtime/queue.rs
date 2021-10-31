@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     mem,
+    cell::RefCell,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
 };
@@ -40,7 +41,7 @@ impl Injector {
 
 pub struct Producer {
     worker: Worker<Task>,
-    injected: VecDeque<Task>,
+    injected: RefCell<VecDeque<Task>>,
 }
 
 impl Producer {
@@ -66,23 +67,24 @@ impl Producer {
         }
     }
 
-    pub fn consume(&mut self, injector: &Injector) -> Option<Task> {
+    pub fn consume(&self, injector: &Injector) -> Option<Task> {
         if !injector.pending.load(Ordering::Relaxed) {
             return None;
         }
 
+        let mut injected = self.injected.borrow_mut();
         {
             let mut deque = injector.deque.lock();
             if !injector.pending.load(Ordering::Relaxed) {
                 return None;
             }
 
-            mem::swap(&mut *deque, &mut self.injected);
+            mem::swap(&mut *deque, &mut *injected);
             injector.pending.store(false, Ordering::Relaxed);
         }
 
-        self.injected.pop_front().map(|task| {
-            self.injected
+        injected.pop_front().map(|task| {
+            injected
                 .drain(..)
                 .for_each(|task| self.worker.push(task));
             task
@@ -104,7 +106,7 @@ impl Default for Queue {
             stealer,
             producer: TryLock::new(Some(Producer {
                 worker,
-                injected: VecDeque::new(),
+                injected: RefCell::new(VecDeque::new()),
             })),
         }
     }

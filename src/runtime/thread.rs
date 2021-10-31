@@ -167,21 +167,30 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
         let executor = &self.executor;
         let run_queue = &executor.workers[worker_index].run_queue;
 
-        let mut producer = self.thread.producer.borrow_mut();
+        let producer = self.thread.producer.borrow();
         let producer = producer
-            .as_mut()
+            .as_ref()
             .expect("Thread polling without a producer");
 
         let be_fair = self.tick % 64 == 0;
-        if let Some(task) = match be_fair {
-            true => producer
-                .consume(&executor.injector)
-                .or_else(|| producer.pop(run_queue, be_fair)),
-            _ => producer
-                .pop(run_queue, be_fair)
-                .or_else(|| producer.consume(&executor.injector)),
-        } {
+        if be_fair {
+            if let Some(task) = producer.consume(&executor.injector) {
+                return Some(task);
+            }
+        }
+
+        if let Some(task) = producer.pop(run_queue, be_fair) {
             return Some(task);
+        }
+
+        if let Some(task) = producer.consume(&executor.injector) {
+            return Some(task);
+        }
+
+        if self.io_poller.poll(&self.executor.io_driver, None) {
+            if let Some(task) = producer.pop(run_queue, be_fair) {
+                return Some(task);
+            }
         }
 
         if !self.searching {
@@ -215,6 +224,6 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
             }
         }
 
-        None
+        producer.consume(&executor.injector)
     }
 }
