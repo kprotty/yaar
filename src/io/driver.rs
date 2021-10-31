@@ -83,7 +83,7 @@ impl Poller {
             if event.is_readable() {
                 if let Some(waker) = driver
                     .wakers
-                    .with(index, WakerKind::Read, |waker| waker.notify())
+                    .with(index, WakerKind::Read, |waker| waker.wake())
                 {
                     resumed += 1;
                     waker.wake();
@@ -93,7 +93,7 @@ impl Poller {
             if event.is_writable() {
                 if let Some(waker) = driver
                     .wakers
-                    .with(index, WakerKind::Write, |waker| waker.notify())
+                    .with(index, WakerKind::Write, |waker| waker.wake())
                 {
                     resumed += 1;
                     waker.wake();
@@ -172,7 +172,7 @@ impl<S: Source> Drop for Pollable<S> {
 
         let notified = [WakerKind::Read, WakerKind::Write]
             .into_iter()
-            .map(|kind| self.with_waker(kind, |waker| waker.detach()))
+            .map(|kind| self.with_waker(kind, |waker| waker.wake()))
             .map(|waker| waker.is_some() as usize)
             .sum();
 
@@ -221,53 +221,34 @@ impl<S: Source> Pollable<S> {
         do_io: impl FnMut() -> io::Result<T> + Unpin + 'a,
     ) -> impl Future<Output = io::Result<T>> + 'a {
         struct PollFuture<'a, S: Source, T, F: FnMut() -> io::Result<T> + Unpin> {
-            do_io: Option<F>,
-            pollable: &'a Pollable<S>,
+            do_io: F,
+            completed: bool,
             kind: WakerKind,
+            pollable: &'a Pollable<S>,
         }
 
         impl<'a, S: Source, T, F: FnMut() -> io::Result<T> + Unpin> Future for PollFuture<'a, S, T, F> {
             type Output = io::Result<T>;
 
             fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-                let pollable = self.pollable;
-                let kind = self.kind;
-                let do_io = self
-                    .do_io
-                    .as_mut()
-                    .expect("PollFuture polled after completion");
+                if self.completed {
+                    unreachable!("PollFuture polled after completion");
+                }
 
-                let result = ready!(pollable.poll_io(kind, ctx.waker(), do_io));
-                self.do_io = None;
+                let kind = self.kind;
+                let pollable = self.pollable;
+                let result = ready!(pollable.poll_io(kind, ctx.waker(), &mut self.do_io));
+
+                self.completed = true;
                 Poll::Ready(result)
             }
         }
 
-        impl<'a, S: Source, T, F: FnMut() -> io::Result<T> + Unpin> Drop for PollFuture<'a, S, T, F> {
-            fn drop(&mut self) {
-                if self.do_io.is_some() {
-                    self.drop_slow()
-                }
-            }
-        }
-
-        impl<'a, S: Source, T, F: FnMut() -> io::Result<T> + Unpin> PollFuture<'a, S, T, F> {
-            #[cold]
-            fn drop_slow(&self) {
-                if let Some(waker) = self.pollable.with_waker(self.kind, |waker| waker.detach()) {
-                    let pending = self.pollable.driver.pending.fetch_sub(1, Ordering::Relaxed);
-                    assert_ne!(pending, 0);
-
-                    // waker.wake();
-                    mem::drop(waker);
-                }
-            }
-        }
-
         PollFuture {
-            do_io: Some(do_io),
-            pollable: self,
+            do_io,
+            completed: false,
             kind,
+            pollable: self,
         }
     }
 }

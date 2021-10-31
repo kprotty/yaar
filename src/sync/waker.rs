@@ -143,36 +143,7 @@ impl AtomicWaker {
         }
     }
 
-    pub fn detach(&self) -> Option<Waker> {
-        self.state
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |state| {
-                let mut state = State::from(state);
-                if state.status != Status::Ready {
-                    return None;
-                }
-
-                state.status = Status::Empty;
-                Some(state.into())
-            })
-            .ok()
-            .and_then(|_| mem::replace(&mut *self.waker.lock(), None))
-    }
-
     pub fn wake(&self) -> Option<Waker> {
-        let mut state = State {
-            token: 0,
-            status: Status::Notified,
-        };
-
-        state = self.state.swap(state.into(), Ordering::AcqRel).into();
-        if state.status != Status::Ready {
-            return None;
-        }
-
-        mem::replace(&mut *self.waker.lock(), None)
-    }
-
-    pub fn notify(&self) -> Option<Waker> {
         let mut state: State = self.state.load(Ordering::Relaxed).into();
         loop {
             match state.status {
