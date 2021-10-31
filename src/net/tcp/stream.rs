@@ -89,7 +89,7 @@ impl tokio::io::AsyncWrite for TcpStream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.pollable.as_ref().flush()?;
+        // self.pollable.as_ref().flush()?;
         Poll::Ready(Ok(()))
     }
 
