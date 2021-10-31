@@ -7,7 +7,7 @@ use std::{
     io::{self, Read, Write},
     net::{Shutdown, SocketAddr},
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll},
 };
 
 pub struct TcpStream {
@@ -53,7 +53,11 @@ impl tokio::io::AsyncRead for TcpStream {
             })
         });
 
-        let bytes = ready!(polled);
+        let bytes = match polled {
+            Poll::Ready(bytes) => bytes,
+            Poll::Pending => return Poll::Pending,
+        };
+
         let result = bytes.map(|b| buf.advance(b));
         Poll::Ready(result)
     }
@@ -125,12 +129,14 @@ impl TcpStream {
         ctx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<usize>> {
-        let polled = self.pollable.poll_io(WakerKind::Read, ctx.waker(), || {
+        let bytes = match self.pollable.poll_io(WakerKind::Read, ctx.waker(), || {
             let buf = buf.initialize_unfilled();
             self.pollable.as_ref().peek(buf)
-        });
+        }) {
+            Poll::Ready(bytes) => bytes,
+            Poll::Pending => return Poll::Pending,
+        };
 
-        let bytes = ready!(polled);
         if let Ok(bytes) = bytes.as_ref() {
             buf.advance(*bytes);
         }

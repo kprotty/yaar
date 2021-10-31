@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
-    task::{ready, Context, Poll, Waker},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 use try_lock::TryLock;
@@ -200,12 +200,15 @@ impl<S: Source> Pollable<S> {
         mut do_io: impl FnMut() -> io::Result<T>,
     ) -> Poll<io::Result<T>> {
         loop {
-            let mut wake_token = ready!(self.with_waker(kind, |waker| {
+            let mut wake_token = match self.with_waker(kind, |waker| {
                 waker.poll(waker_ref, || {
                     let pending = self.driver.pending.fetch_add(1, Ordering::Relaxed);
                     assert_ne!(pending, usize::MAX);
                 })
-            }));
+            }) {
+                Poll::Ready(token) => token,
+                Poll::Pending => return Poll::Pending,
+            };
 
             loop {
                 match do_io() {
@@ -244,7 +247,10 @@ impl<S: Source> Pollable<S> {
 
                 let kind = self.kind;
                 let pollable = self.pollable;
-                let result = ready!(pollable.poll_io(kind, ctx.waker(), &mut self.do_io));
+                let result = match pollable.poll_io(kind, ctx.waker(), &mut self.do_io) {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => return Poll::Pending,
+                };
 
                 self.completed = true;
                 Poll::Ready(result)
@@ -302,7 +308,10 @@ impl PollFairness {
             return Poll::Pending;
         }
 
-        let result = ready!(do_poll());
+        let result = match do_poll() {
+            Poll::Ready(result) => result,
+            Poll::Pending => return Poll::Pending,
+        };
 
         state.tick += 1;
         state.be_fair = state.tick == 0;

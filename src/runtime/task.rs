@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicU8, Ordering},
     sync::Arc,
-    task::{ready, Context, Poll, Wake, Waker},
+    task::{Context, Poll, Wake, Waker},
 };
 
 type TaskError = Box<dyn Any + Send + 'static>;
@@ -233,8 +233,10 @@ where
     F::Output: Send,
 {
     fn join(&self, waker_ref: &Waker) -> Poll<F::Output> {
-        let _ = ready!(self.joiner.poll(waker_ref, || {}));
-        Poll::Ready(self.consume())
+        match self.joiner.poll(waker_ref, || {}) {
+            Poll::Ready(_) => Poll::Ready(self.consume()),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn consume(&self) -> F::Output {
@@ -270,7 +272,11 @@ impl<T> Future for JoinHandle<T> {
             .as_ref()
             .expect("JoinHandle polled to completion already");
 
-        let result = ready!(joinable.join(ctx.waker()));
+        let result = match joinable.join(ctx.waker()) {
+            Poll::Ready(result) => result,
+            Poll::Pending => return Poll::Pending,
+        };
+
         self.joinable = None;
         Poll::Ready(result)
     }
