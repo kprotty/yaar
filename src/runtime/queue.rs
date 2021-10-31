@@ -2,9 +2,9 @@ use super::task::TaskRunnable;
 use crossbeam_deque::{Steal, Stealer, Worker};
 use parking_lot::Mutex;
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     mem,
-    cell::RefCell,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
 };
@@ -84,9 +84,7 @@ impl Producer {
         }
 
         injected.pop_front().map(|task| {
-            injected
-                .drain(..)
-                .for_each(|task| self.worker.push(task));
+            injected.drain(..).for_each(|task| self.worker.push(task));
             task
         })
     }

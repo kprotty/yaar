@@ -75,7 +75,7 @@ impl ThreadPool {
 
         let executor = Arc::clone(executor);
         if position == 0 {
-            Self::run(executor, notified);
+            Self::run(executor, notified, position);
             return Some(());
         }
 
@@ -96,18 +96,18 @@ impl ThreadPool {
         thread::Builder::new()
             .name(thread_name)
             .stack_size(thread_stack_size)
-            .spawn(move || Self::run(executor, notified))
+            .spawn(move || Self::run(executor, notified, position))
             .map_err(|_| self.finish())
             .map(mem::drop)
             .ok()
     }
 
-    fn run(executor: Arc<Executor>, notified: Notified) {
+    fn run(executor: Arc<Executor>, notified: Notified, position: usize) {
         if let Some(callback) = executor.thread_pool.config.on_thread_start.as_ref() {
             (callback)();
         }
 
-        Thread::run(&executor, notified);
+        Thread::run(&executor, notified, position);
         executor.thread_pool.finish();
 
         if let Some(callback) = executor.thread_pool.config.on_thread_stop.as_ref() {
@@ -121,9 +121,19 @@ impl ThreadPool {
         pool.spawned -= 1;
     }
 
-    pub fn wait(&self, deadline: Option<Instant>) -> Result<Option<Notified>, ()> {
-        let keep_alive = self.config.keep_alive.unwrap_or(Duration::from_secs(10));
-        let force_deadline = deadline.unwrap_or_else(|| Instant::now() + keep_alive);
+    pub fn wait(
+        &self,
+        is_worker_thread: bool,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Notified>, ()> {
+        let force_deadline = deadline.or_else(|| {
+            if is_worker_thread {
+                return None;
+            }
+
+            let keep_alive = self.config.keep_alive.unwrap_or(Duration::from_secs(10));
+            Some(Instant::now() + keep_alive)
+        });
 
         let mut pool = self.pool.lock();
         assert_ne!(pool.spawned, 0);
@@ -150,7 +160,13 @@ impl ThreadPool {
                 (callback)();
             }
 
-            timed_out = self.cond.wait_until(&mut pool, force_deadline).timed_out();
+            timed_out = match force_deadline {
+                Some(deadline) => self.cond.wait_until(&mut pool, deadline).timed_out(),
+                None => {
+                    self.cond.wait(&mut pool);
+                    false
+                }
+            };
 
             pool.idle -= 1;
             if let Some(callback) = self.config.on_thread_unpark.as_ref() {

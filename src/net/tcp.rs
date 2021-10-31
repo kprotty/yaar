@@ -61,7 +61,10 @@ impl TcpStream {
         let stream = mio::net::TcpStream::connect(addr)?;
         let this = Self::new(stream)?;
 
-        this.pollable.poll_future(WakerKind::Write, || Ok(())).await.unwrap();
+        this.pollable
+            .poll_future(WakerKind::Write, || Ok(()))
+            .await
+            .unwrap();
 
         match this.pollable.as_ref().take_error()? {
             Some(error) => Err(error),

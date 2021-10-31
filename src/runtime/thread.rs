@@ -24,7 +24,7 @@ impl Thread {
         Self::with_tls(|tls| tls.as_ref().map(Rc::clone)).map(|rc| f(&*(&*rc).borrow()))
     }
 
-    pub fn run(executor: &Arc<Executor>, notified: Notified) {
+    pub fn run(executor: &Arc<Executor>, notified: Notified, position: usize) {
         let producer = executor.workers[notified.worker_index]
             .run_queue
             .swap_producer(None)
@@ -39,7 +39,7 @@ impl Thread {
         match Self::with_tls(|tls| mem::replace(tls, Some(thread.clone()))) {
             Some(_) => unreachable!("Cannot run multiple runtimes in the same thread"),
             None => {
-                ThreadRef::new(&*thread.borrow(), executor, notified).run();
+                ThreadRef::new(&*thread.borrow(), executor, notified, position).run();
                 Self::with_tls(|tls| *tls = None);
             }
         }
@@ -50,6 +50,7 @@ struct ThreadRef<'a, 'b> {
     thread: &'a Thread,
     executor: &'b Arc<Executor>,
     worker_index: Option<usize>,
+    is_worker_thread: bool,
     io_poller: IoPoller,
     io_ready: VecDeque<Task>,
     prng: RandomSource,
@@ -58,14 +59,20 @@ struct ThreadRef<'a, 'b> {
 }
 
 impl<'a, 'b> ThreadRef<'a, 'b> {
-    fn new(thread: &'a Thread, executor: &'b Arc<Executor>, notified: Notified) -> Self {
-        let mut prng = RandomSource::default();
+    fn new(
+        thread: &'a Thread,
+        executor: &'b Arc<Executor>,
+        notified: Notified,
+        position: usize,
+    ) -> Self {
+        let mut prng = RandomSource::new(position);
         let tick = prng.next();
 
         Self {
             thread,
             executor,
             worker_index: Some(notified.worker_index),
+            is_worker_thread: position < executor.workers.len(),
             io_poller: IoPoller::default(),
             io_ready: VecDeque::new(),
             prng,
@@ -155,7 +162,7 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
                 }
             }
 
-            match self.executor.thread_pool.wait(None) {
+            match self.executor.thread_pool.wait(self.is_worker_thread, None) {
                 Ok(Some(notified)) => self.transition_to_running(notified),
                 Ok(None) => {}
                 Err(()) => return None,
