@@ -1,48 +1,19 @@
 use parking_lot::Mutex;
 use std::{
     mem,
-    sync::atomic::{AtomicU8, Ordering},
-    task::{Poll, Waker},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    task::{Context, Poll, Waker},
 };
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum Status {
-    Empty = 0,
-    Updating = 1,
-    Ready = 2,
-    Notified = 3,
-}
-
-#[derive(Copy, Clone)]
-struct State {
-    token: u8,
-    status: Status,
-}
-
-impl Into<u8> for State {
-    fn into(self) -> u8 {
-        (self.token << 2) | (self.status as u8)
-    }
-}
-
-impl From<u8> for State {
-    fn from(value: u8) -> Self {
-        Self {
-            token: value >> 2,
-            status: match value & 0b11 {
-                0 => Status::Empty,
-                1 => Status::Updating,
-                2 => Status::Ready,
-                3 => Status::Notified,
-                _ => unreachable!(),
-            },
-        }
-    }
-}
+const WAKER_EMPTY: u8 = 0;
+const WAKER_UPDATING: u8 = 1;
+const WAKER_READY: u8 = 2;
+const WAKER_NOTIFIED: u8 = 3;
 
 #[derive(Default)]
 pub struct AtomicWaker {
     state: AtomicU8,
+    notified: AtomicBool,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -50,135 +21,140 @@ impl AtomicWaker {
     pub const fn new() -> Self {
         Self {
             state: AtomicU8::new(0),
+            notified: AtomicBool::new(false),
             waker: parking_lot::const_mutex(None),
         }
     }
 
-    pub fn poll(&self, waker_ref: &Waker, waiting: impl FnOnce()) -> Poll<u8> {
-        let mut state: State = self.state.load(Ordering::Acquire).into();
-        match state.status {
-            Status::Empty | Status::Ready => {}
-            Status::Notified => return Poll::Ready(state.token),
-            Status::Updating => unreachable!("multiple threads polling same AtomicWaker"),
+    fn poll_update(&self, poll_fn: impl FnOnce() -> Poll<()>) -> Poll<()> {
+        if poll_fn().is_pending() {
+            return Poll::Pending;
         }
 
-        if let Err(e) = self.state.compare_exchange(
-            state.into(),
-            (State {
-                token: state.token,
-                status: Status::Updating,
-            })
-            .into(),
-            Ordering::Acquire,
-            Ordering::Acquire,
-        ) {
-            state = e.into();
-            assert_eq!(state.status, Status::Notified);
-            return Poll::Ready(state.token);
-        }
-
-        let kept_waker = {
-            let mut waker = self.waker.lock();
-            let will_wake = waker
-                .as_ref()
-                .map(|w| w.will_wake(waker_ref))
-                .unwrap_or(false);
-
-            will_wake || {
-                *waker = Some(waker_ref.clone());
-                false
-            }
-        };
-
-        if let Err(e) = self.state.compare_exchange(
-            (State {
-                token: state.token,
-                status: Status::Updating,
-            })
-            .into(),
-            (State {
-                token: state.token + (!kept_waker as u8),
-                status: Status::Ready,
-            })
-            .into(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            state = e.into();
-            assert_eq!(state.status, Status::Notified);
-            return Poll::Ready(state.token);
-        }
-
-        match state.status {
-            Status::Empty => waiting(),
-            Status::Ready => {}
-            _ => unreachable!(),
-        }
-
-        Poll::Pending
+        self.state.store(WAKER_EMPTY, Ordering::Relaxed);
+        self.notified.store(true, Ordering::Relaxed);
+        Poll::Ready(())
     }
 
-    pub fn reset(&self, token: u8) -> Result<(), u8> {
-        match self.state.compare_exchange(
-            (State {
-                token,
-                status: Status::Notified,
-            })
-            .into(),
-            (State {
-                token,
-                status: Status::Empty,
-            })
-            .into(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(()),
-            Err(state) => {
-                let state = State::from(state);
-                assert_eq!(state.status, Status::Notified);
-                assert_ne!(state.token, token);
-                Err(state.token)
-            }
+    fn poll_with(&self, poll_fn: impl FnOnce() -> Poll<()>) -> Poll<()> {
+        if self.notified.load(Ordering::Relaxed) {
+            return Poll::Ready(());
         }
+
+        self.poll_update(poll_fn)
+    }
+
+    pub fn reset(&self) -> bool {
+        self.notified.store(false, Ordering::Relaxed);
+
+        self.poll_update(|| match self.state.load(Ordering::Acquire) {
+            WAKER_EMPTY => Poll::Pending,
+            WAKER_NOTIFIED => Poll::Ready(()),
+            WAKER_READY => unreachable!("AtomicWaker state was updated while notified"),
+            WAKER_UPDATING => unreachable!("AtomicWaker state is updating while notified"),
+            _ => unreachable!(),
+        })
+        .is_pending()
+    }
+
+    pub fn poll_ready(&self) -> Poll<()> {
+        self.poll_with(|| match self.state.load(Ordering::Acquire) {
+            WAKER_NOTIFIED => Poll::Ready(()),
+            WAKER_EMPTY | WAKER_READY => Poll::Pending,
+            WAKER_UPDATING => unreachable!("AtomicWaker state updated while polling"),
+            _ => unreachable!(),
+        })
+    }
+
+    pub fn poll(
+        &self,
+        ctx: &mut Context<'_>,
+        waiting: impl FnOnce(),
+        cancelled: impl FnOnce(),
+    ) -> Poll<()> {
+        self.poll_with(|| {
+            let mut state = self.state.load(Ordering::Acquire);
+            match state {
+                WAKER_EMPTY | WAKER_READY => {}
+                WAKER_NOTIFIED => return Poll::Ready(()),
+                WAKER_UPDATING => unreachable!("AtomicWaker state updated while polling"),
+                _ => unreachable!("invalid AtomicWaker state"),
+            }
+
+            match self.state.compare_exchange(
+                state,
+                WAKER_UPDATING,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {}
+                Err(WAKER_NOTIFIED) => return Poll::Ready(()),
+                Err(_) => unreachable!("invalid AtomicWaker state"),
+            }
+
+            {
+                let mut waker = self.waker.lock();
+                let will_wake = waker
+                    .as_ref()
+                    .map(|waker| ctx.waker().will_wake(waker))
+                    .unwrap_or(false);
+
+                if !will_wake {
+                    *waker = Some(ctx.waker().clone());
+                }
+            }
+
+            if let Err(new_state) = self.state.compare_exchange(
+                WAKER_UPDATING,
+                WAKER_READY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                *self.waker.lock() = None;
+                match state {
+                    WAKER_EMPTY => {}
+                    WAKER_READY => cancelled(),
+                    _ => unreachable!(),
+                }
+
+                assert_eq!(new_state, WAKER_NOTIFIED);
+                return Poll::Ready(());
+            }
+
+            match state {
+                WAKER_EMPTY => waiting(),
+                WAKER_READY => {}
+                _ => unreachable!(),
+            }
+
+            Poll::Pending
+        })
+    }
+
+    pub fn detach(&self) -> Option<Waker> {
+        self.notify(Ordering::Acquire, |state| match state {
+            WAKER_READY => Some(WAKER_EMPTY),
+            WAKER_EMPTY | WAKER_NOTIFIED => None,
+            WAKER_UPDATING => unreachable!("AtomicWaker state updated while detaching"),
+            _ => unreachable!(),
+        })
     }
 
     pub fn wake(&self) -> Option<Waker> {
-        let mut state: State = self.state.load(Ordering::Relaxed).into();
-        loop {
-            match state.status {
-                Status::Notified => match self.state.compare_exchange_weak(
-                    state.into(),
-                    (State {
-                        token: state.token + 1,
-                        status: state.status,
-                    })
-                    .into(),
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return None,
-                    Err(e) => state = e.into(),
-                },
-                _ => match self.state.compare_exchange(
-                    state.into(),
-                    (State {
-                        token: state.token,
-                        status: Status::Notified,
-                    })
-                    .into(),
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        return match state.status {
-                            Status::Ready => mem::replace(&mut *self.waker.lock(), None),
-                            _ => None,
-                        }
-                    }
-                    Err(e) => state = e.into(),
-                },
-            }
-        }
+        self.notify(Ordering::AcqRel, |state| match state {
+            WAKER_NOTIFIED => None,
+            WAKER_EMPTY | WAKER_READY | WAKER_UPDATING => Some(WAKER_NOTIFIED),
+            _ => unreachable!("invalid AtomicWaker state"),
+        })
+    }
+
+    fn notify(&self, ordering: Ordering, update: impl FnMut(u8) -> Option<u8>) -> Option<Waker> {
+        self.state
+            .fetch_update(ordering, Ordering::Relaxed, update)
+            .ok()
+            .and_then(|state| match state {
+                WAKER_READY => mem::replace(&mut *self.waker.lock(), None),
+                _ => None,
+            })
     }
 }
