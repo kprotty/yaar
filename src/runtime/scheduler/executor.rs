@@ -7,6 +7,7 @@ use super::{
 use crate::io::Driver as IoDriver;
 use std::{
     io,
+    iter,
     sync::atomic::{fence, AtomicUsize, Ordering},
     sync::Arc,
 };
@@ -51,10 +52,19 @@ impl Executor {
         Ok(executor)
     }
 
-    pub fn schedule(
+    pub fn yield_now(self: &Arc<Self>, runnable: Runnable, thread: &Thread) {
+        self.schedule_with(iter::once(runnable), Some(thread), true)
+    }
+
+    pub fn schedule(self: &Arc<Self>, runnable: Runnable, thread: Option<&Thread>) {
+        self.schedule_with(iter::once(runnable), thread, false)
+    }
+
+    pub(super) fn schedule_with(
         self: &Arc<Self>,
         runnables: impl Iterator<Item = Runnable>,
         thread: Option<&Thread>,
+        be_fair: bool,
     ) {
         let mut runnables = runnables.peekable();
         if runnables.peek().is_none() {
@@ -62,6 +72,10 @@ impl Executor {
         }
 
         if let Some(thread) = thread {
+            if be_fair {
+                thread.be_fair.set(true);
+            }
+
             if let Some(ref mut queue) = &mut *thread.io_intercept.borrow_mut() {
                 queue.extend(runnables);
                 return;

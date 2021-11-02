@@ -3,7 +3,7 @@ use crate::sync::AtomicWaker;
 use std::{
     any::Any,
     future::Future,
-    iter, mem, panic,
+    mem, panic,
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
     sync::Arc,
@@ -114,15 +114,13 @@ where
 
         let with_thread = Thread::try_with(|thread| {
             let task = task.take().unwrap();
-            let runnable: Arc<dyn TaskRunnable> = task;
-            thread.executor.schedule(iter::once(runnable), Some(thread));
+            thread.executor.schedule(task, Some(thread));
         });
 
         if with_thread.is_none() {
             let task = task.take().unwrap();
             let executor = task.executor.clone();
-            let runnable: Arc<dyn TaskRunnable> = task;
-            executor.schedule(iter::once(runnable), None);
+            executor.schedule(task, None);
         }
     }
 }
@@ -163,8 +161,7 @@ where
                 }
 
                 self.state.transition_from_notified();
-                let runnable: Arc<dyn TaskRunnable> = self;
-                thread.executor.schedule(iter::once(runnable), Some(thread));
+                thread.executor.yield_now(self, thread);
                 return;
             }
         };
@@ -234,7 +231,7 @@ where
     });
 
     let runnable: Arc<dyn TaskRunnable> = task.clone();
-    executor.schedule(iter::once(runnable), thread);
+    executor.schedule(runnable, thread);
 
     JoinHandle {
         joinable: Some(task),
@@ -269,15 +266,13 @@ pub fn block_on<F: Future>(future: F, executor: Arc<Executor>) -> F::Output {
 
             let with_thread = Thread::try_with(|thread| {
                 let blocker = blocker.take().unwrap();
-                let runnable: Arc<dyn TaskRunnable> = blocker;
-                thread.executor.schedule(iter::once(runnable), Some(thread));
+                thread.executor.schedule(blocker, Some(thread));
             });
 
             if with_thread.is_none() {
                 let blocker = blocker.take().unwrap();
                 let executor = blocker.executor.clone();
-                let runnable: Arc<dyn TaskRunnable> = blocker;
-                executor.schedule(iter::once(runnable), None);
+                executor.schedule(blocker, None);
             }
         }
     }

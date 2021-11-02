@@ -16,6 +16,7 @@ use std::{
 };
 
 pub struct Thread {
+    pub be_fair: Cell<bool>,
     pub executor: Arc<Executor>,
     pub worker_index: Cell<Option<usize>>,
     pub producer: RefCell<Option<Producer>>,
@@ -46,6 +47,7 @@ pub struct ThreadEnter<'a> {
 impl<'a> From<&'a Arc<Executor>> for ThreadEnter<'a> {
     fn from(executor: &'a Arc<Executor>) -> Self {
         let thread = Rc::new(Thread {
+            be_fair: Cell::new(false),
             executor: executor.clone(),
             worker_index: Cell::new(None),
             producer: RefCell::new(None),
@@ -172,7 +174,7 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
                     self.transition_to_notified(notified);
                 }
 
-                executor.schedule(io_ready.into_iter(), Some(self.thread));
+                executor.schedule_with(io_ready.into_iter(), Some(self.thread), false);
                 if runnable.is_some() {
                     return runnable;
                 }
@@ -193,7 +195,14 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
             .as_ref()
             .expect("Thread polling for work without a Producer");
 
-        let be_fair = self.tick % 64 == 0;
+        let mut be_fair = self.thread.be_fair.get();
+        if be_fair {
+            self.thread.be_fair.set(false);
+            self.tick = 0;
+        } else {
+            be_fair = self.tick % 64 == 0;
+        }
+
         if be_fair {
             if let Some(runnable) = producer.consume(&self.executor.injector) {
                 return Some(runnable);
@@ -210,7 +219,7 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
 
         if let Some(mut io_ready) = self.poll_io(Some(Duration::ZERO)) {
             let runnable = io_ready.pop_front().unwrap();
-            executor.schedule(io_ready.into_iter(), Some(self.thread));
+            executor.schedule_with(io_ready.into_iter(), Some(self.thread), false);
             return Some(runnable);
         }
 
