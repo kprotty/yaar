@@ -15,15 +15,25 @@ pub type Runnable = Arc<dyn TaskRunnable>;
 pub struct Injector {
     pending: AtomicBool,
     deque: Mutex<VecDeque<Runnable>>,
+    injector: crossbeam_deque::Injector<Runnable>,
 }
 
 impl Injector {
     pub fn pending(&self) -> bool {
-        self.pending.load(Ordering::Relaxed)
+        self.pending.load(Ordering::Relaxed) || !self.injector.is_empty()
     }
 
     pub fn push(&self, runnables: impl Iterator<Item = Runnable>) {
+        let mut runnables = runnables.peekable();
+        let runnable = runnables.next().unwrap();
+
+        if runnables.peek().is_none() {
+            self.injector.push(runnable);
+            return;
+        }
+
         let mut deque = self.deque.lock();
+        deque.push_back(runnable);
         deque.extend(runnables);
         self.pending.store(true, Ordering::Relaxed);
     }
@@ -95,25 +105,33 @@ impl Producer {
     }
 
     pub fn consume(&self, injector: &Injector) -> Option<Runnable> {
-        if !injector.pending() {
-            return None;
-        }
+        injector
+            .injector
+            .steal_batch_and_pop(&self.worker)
+            .success()
+            .or_else(|| {
+                if !injector.pending.load(Ordering::Acquire) {
+                    return None;
+                }
+        
+                let mut deque = injector.deque.lock();
+                if !injector.pending.load(Ordering::Relaxed) {
+                    return None;
+                }
+        
+                let mut injected = self.injected.borrow_mut();
+                assert_eq!(injected.len(), 0);
+                mem::swap(&mut *injected, &mut *deque);
+        
+                assert_eq!(deque.len(), 0);
+                injector.pending.store(false, Ordering::Relaxed);
+                mem::drop(deque);
+        
+                let runnable = injected.pop_front().unwrap();
+                self.push(injected.drain(..));
+                Some(runnable)
+            })
 
-        let mut deque = injector.deque.lock();
-        if !injector.pending() {
-            return None;
-        }
-
-        let mut injected = self.injected.borrow_mut();
-        assert_eq!(injected.len(), 0);
-        mem::swap(&mut *injected, &mut *deque);
-
-        assert_eq!(deque.len(), 0);
-        injector.pending.store(false, Ordering::Relaxed);
-        mem::drop(deque);
-
-        let runnable = injected.pop_front().unwrap();
-        self.push(injected.drain(..));
-        Some(runnable)
+        
     }
 }
