@@ -31,6 +31,10 @@ impl Driver {
     }
 
     pub fn notify(&self) {
+        if self.pending.load(Ordering::Acquire) == 0 {
+            return;
+        }
+
         self.signal.wake().expect("failed to wake I/O driver");
     }
 }

@@ -168,7 +168,9 @@ where
 
         *data = TaskData::Ready(result);
         mem::drop(data);
+
         self.waker.wake().map(Waker::wake).unwrap_or(());
+        thread.executor.task_finished();
     }
 }
 
@@ -223,6 +225,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    executor.task_started();
     let task = Arc::new(Task {
         state: TaskState::default(),
         waker: AtomicWaker::default(),
@@ -284,6 +287,7 @@ pub fn block_on<F: Future>(future: F, executor: Arc<Executor>) -> F::Output {
         }
     }
 
+    executor.task_started();
     let blocker = Arc::new(Blocker {
         state: TaskState::default(),
         notified: AtomicBool::new(false),
@@ -300,6 +304,7 @@ pub fn block_on<F: Future>(future: F, executor: Arc<Executor>) -> F::Output {
         blocker.notified.store(false, Ordering::Relaxed);
 
         if let Poll::Ready(result) = future.as_mut().poll(&mut ctx) {
+            blocker.executor.task_finished();
             return result;
         }
 

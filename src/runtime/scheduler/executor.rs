@@ -5,12 +5,44 @@ use super::{
     thread::Thread,
 };
 use crate::io::Driver as IoDriver;
+use parking_lot::{Condvar, Mutex};
 use std::{
-    io,
-    iter,
+    io, iter,
+    mem::drop,
     sync::atomic::{fence, AtomicUsize, Ordering},
     sync::Arc,
+    time::{Duration, Instant},
 };
+
+#[derive(Default)]
+struct Signal {
+    notified: Mutex<bool>,
+    cond: Condvar,
+}
+
+impl Signal {
+    fn wait(&self, timeout: Option<Duration>) {
+        let deadline = timeout.map(|t| Instant::now() + t);
+        let mut notified = self.notified.lock();
+
+        while !*notified {
+            if matches!(timeout, Some(Duration::ZERO)) {
+                return;
+            }
+
+            match deadline {
+                Some(deadline) => drop(self.cond.wait_until(&mut notified, deadline)),
+                None => self.cond.wait(&mut notified),
+            }
+        }
+    }
+
+    fn notify(&self) {
+        let mut notified = self.notified.lock();
+        *notified = true;
+        self.cond.notify_all();
+    }
+}
 
 #[derive(Default)]
 pub struct Worker {
@@ -20,7 +52,9 @@ pub struct Worker {
 
 pub struct Executor {
     idle: AtomicUsize,
+    tasks: AtomicUsize,
     searching: AtomicUsize,
+    joiner: Signal,
     pub injector: Injector,
     pub io_driver: Arc<IoDriver>,
     pub thread_pool: ThreadPool,
@@ -35,7 +69,9 @@ impl Executor {
 
         let executor = Self {
             idle: AtomicUsize::new(0),
+            tasks: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
+            joiner: Signal::default(),
             injector: Injector::default(),
             io_driver: Arc::new(io_driver),
             thread_pool: ThreadPool::from(config),
@@ -50,6 +86,30 @@ impl Executor {
         }
 
         Ok(executor)
+    }
+
+    pub fn task_started(&self) {
+        let tasks = self.tasks.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(tasks, usize::MAX);
+    }
+
+    pub fn task_finished(&self) {
+        let tasks = self.tasks.fetch_sub(1, Ordering::AcqRel);
+        assert_ne!(tasks, 0);
+
+        if tasks == 1 {
+            self.shutdown();
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.io_driver.notify();
+        self.thread_pool.shutdown();
+        self.joiner.notify();
+    }
+
+    pub fn join(&self, timeout: Option<Duration>) {
+        self.joiner.wait(timeout);
     }
 
     pub fn yield_now(self: &Arc<Self>, runnable: Runnable, thread: &Thread) {

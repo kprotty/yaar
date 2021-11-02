@@ -8,7 +8,7 @@ use super::{
 use std::{future::Future, io, sync::Arc};
 
 pub struct Handle {
-    executor: Arc<Executor>,
+    pub(crate) executor: Arc<Executor>,
 }
 
 impl Clone for Handle {

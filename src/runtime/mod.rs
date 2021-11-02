@@ -9,10 +9,20 @@ pub use enter::EnterGuard;
 pub use handle::Handle;
 
 use scheduler::{task::JoinHandle, Config};
-use std::{future::Future, io};
+use std::{future::Future, io, time::Duration};
 
 pub struct Runtime {
     handle: Handle,
+    shutdown: bool,
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if !self.shutdown {
+            self.handle.executor.shutdown();
+            self.handle.executor.join(None);
+        }
+    }
 }
 
 impl Runtime {
@@ -22,7 +32,10 @@ impl Runtime {
 
     pub(crate) fn from_config(config: Config) -> io::Result<Self> {
         let handle = Handle::new(config)?;
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            shutdown: false,
+        })
     }
 
     pub fn handle(&self) -> &Handle {
@@ -43,5 +56,15 @@ impl Runtime {
 
     pub fn enter(&self) -> EnterGuard<'_> {
         self.handle.enter()
+    }
+
+    pub fn shutdown_background(self) {
+        self.shutdown_timeout(Duration::ZERO)
+    }
+
+    pub fn shutdown_timeout(mut self, timeout: Duration) {
+        self.handle.executor.shutdown();
+        self.handle.executor.join(Some(timeout));
+        self.shutdown = true;
     }
 }
