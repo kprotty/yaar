@@ -82,6 +82,17 @@ impl<S: Source> AsRef<S> for Pollable<S> {
 }
 
 impl<S: Source> Pollable<S> {
+    pub fn try_io<T>(
+        &self,
+        kind: WakerKind,
+        do_io: impl FnMut() -> io::Result<T>,
+    ) -> io::Result<T> {
+        match self.poll_io(kind, None, do_io) {
+            Poll::Ready(result) => result,
+            Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        }
+    }
+
     pub fn poll_io<T>(
         &self,
         kind: WakerKind,
@@ -139,7 +150,9 @@ impl<S: Source> Pollable<S> {
             pollable: Option<&'a Pollable<S>>,
         }
 
-        impl<'a, S: Source, T, F: FnMut() -> io::Result<T> + Unpin + 'a> Future for PollFuture<'a, S, T, F> {
+        impl<'a, S: Source, T, F: FnMut() -> io::Result<T> + Unpin + 'a> Future
+            for PollFuture<'a, S, T, F>
+        {
             type Output = io::Result<T>;
 
             fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
