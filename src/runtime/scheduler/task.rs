@@ -34,7 +34,7 @@ impl TaskState {
             })
             .map(|state| match state {
                 TASK_IDLE => true,
-                TASK_NOTIFIED => false,
+                TASK_RUNNING => false,
                 _ => unreachable!(),
             })
             .unwrap_or(false)
