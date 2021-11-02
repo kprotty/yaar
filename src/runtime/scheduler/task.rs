@@ -113,13 +113,15 @@ where
 
         let with_thread = Thread::try_with(|thread| {
             let task = task.take().unwrap();
-            thread.executor.schedule(iter::once(task), Some(thread));
+            let runnable: Arc<dyn TaskRunnable> = task;
+            thread.executor.schedule(iter::once(runnable), Some(thread));
         });
 
         if with_thread.is_none() {
             let task = task.take().unwrap();
             let executor = task.executor.clone();
-            executor.schedule(iter::once(task), None);
+            let runnable: Arc<dyn TaskRunnable> = task;
+            executor.schedule(iter::once(runnable), None);
         }
     }
 }
@@ -145,7 +147,7 @@ where
         let poll_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             let waker = Waker::from(self.clone());
             let mut ctx = Context::from_waker(&waker);
-            future.as_ref().poll(&mut ctx)
+            future.as_mut().poll(&mut ctx)
         }));
 
         let result = match poll_result {
@@ -160,7 +162,8 @@ where
                 }
 
                 self.state.transition_from_notified();
-                thread.executor.schedule(iter::once(self), Some(thread));
+                let runnable: Arc<dyn TaskRunnable> = self;
+                thread.executor.schedule(iter::once(runnable), Some(thread));
                 return;
             }
         };
@@ -169,18 +172,17 @@ where
         mem::drop(data);
 
         self.waker.wake().map(Waker::wake).unwrap_or(());
-        thread.executor.finish_task();
+        thread.executor.task_finished();
     }
 }
 
 trait TaskJoinable<T> {
     fn poll_join(&self, ctx: &mut Context<'_>) -> Poll<T>;
-    fn poll_detach(&self);
 }
 
 impl<F: Future> TaskJoinable<F::Output> for Task<F> {
     fn poll_join(&self, ctx: &mut Context<'_>) -> Poll<F::Output> {
-        match self.waker.poll(ctx, || {}, || {}) {
+        match self.waker.poll(Some(ctx.waker()), || {}, || {}) {
             Poll::Ready(_) => {}
             Poll::Pending => return Poll::Pending,
         }
@@ -190,10 +192,6 @@ impl<F: Future> TaskJoinable<F::Output> for Task<F> {
             TaskData::Ready(Err(error)) => panic::resume_unwind(error),
             _ => unreachable!(),
         }
-    }
-
-    fn poll_detach(&self) {
-        mem::drop(self.waker.detach());
     }
 }
 
@@ -207,24 +205,15 @@ impl<T> Future for JoinHandle<T> {
     fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let joinable = self
             .joinable
-            .as_ref()
+            .take()
             .expect("JoinHandle polled after completion");
 
-        let result = match joinable.poll_join(ctx) {
-            Poll::Ready(result) => result,
-            Poll::Pending => return Poll::Pending,
-        };
-
-        mem::drop(joinable);
-        self.joinable = None;
-        Poll::Ready(result)
-    }
-}
-
-impl<T> Drop for JoinHandle<T> {
-    fn drop(&mut self) {
-        if let Some(joinable) = self.joinable.take() {
-            joinable.poll_detach();
+        match joinable.poll_join(ctx) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => {
+                self.joinable = Some(joinable);
+                Poll::Pending
+            }
         }
     }
 }
@@ -242,9 +231,8 @@ where
             executor: thread.executor.clone(),
         });
 
-        thread
-            .executor
-            .schedule(iter::once(task.clone()), Some(thread));
+        let runnable: Arc<dyn TaskRunnable> = task.clone();
+        thread.executor.schedule(iter::once(runnable), Some(thread));
 
         JoinHandle {
             joinable: Some(task),

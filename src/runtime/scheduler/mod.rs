@@ -1,5 +1,6 @@
 mod executor;
 mod pool;
 mod queue;
-mod task;
-mod thread;
+mod random;
+pub mod task;
+pub mod thread;

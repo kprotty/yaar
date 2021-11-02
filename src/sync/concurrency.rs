@@ -16,6 +16,6 @@ fn get_slow() -> NonZeroUsize {
         .or(NonZeroUsize::new(1))
         .unwrap();
 
-    CPU_COUNT.store(cpu_count, Ordering::Relaxed);
+    CPU_COUNT.store(cpu_count.get(), Ordering::Relaxed);
     cpu_count
 }

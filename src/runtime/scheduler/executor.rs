@@ -1,17 +1,19 @@
 use super::{
     pool::{Config as ThreadPoolConfig, Notified, ThreadPool},
     queue::{Injector, Queue, Runnable},
+    random::RandomIterGen,
     thread::Thread,
 };
-use crate::io::driver::Driver as IoDriver;
+use crate::io::Driver as IoDriver;
 use std::{
+    io,
     sync::atomic::{fence, AtomicUsize, Ordering},
     sync::Arc,
 };
 
 #[derive(Default)]
 pub struct Worker {
-    run_queue: Queue,
+    pub run_queue: Queue,
     idle_next: AtomicUsize,
 }
 
@@ -22,15 +24,14 @@ pub struct Executor {
     pub injector: Injector,
     pub io_driver: Arc<IoDriver>,
     pub thread_pool: ThreadPool,
+    pub rng_iter_gen: RandomIterGen,
     pub workers: Box<[Worker]>,
 }
 
 impl Executor {
     pub fn new(config: ThreadPoolConfig) -> io::Result<Self> {
         let io_driver = IoDriver::new()?;
-
-        let worker_threads = config.worker_threads.unwrap().get();
-        let workers: Box<[Worker]> = (0..worker_threads).map(|_| Worker::default()).collect();
+        let worker_threads = config.worker_threads.unwrap();
 
         let executor = Self {
             idle: AtomicUsize::new(0),
@@ -39,27 +40,31 @@ impl Executor {
             injector: Injector::default(),
             io_driver: Arc::new(io_driver),
             thread_pool: ThreadPool::from(config),
-            workers,
+            rng_iter_gen: RandomIterGen::from(worker_threads),
+            workers: (0..worker_threads.get())
+                .map(|_| Worker::default())
+                .collect(),
         };
 
-        for worker_index in (0..worker_threads).rev() {
+        for worker_index in (0..worker_threads.get()).rev() {
             executor.push_idle_worker(worker_index);
         }
 
-        executor
+        Ok(executor)
     }
 
-    pub fn begin_task(&self) {
+    pub fn task_started(&self) {
         let active_tasks = self.active_tasks.fetch_add(1, Ordering::Relaxed);
         assert_ne!(active_tasks, usize::MAX);
     }
 
-    pub fn finish_task(&self) {
+    pub fn task_finished(&self) {
         let active_tasks = self.active_tasks.fetch_sub(1, Ordering::AcqRel);
         assert_ne!(active_tasks, 0);
 
         if active_tasks == 0 {
-            unimplemented!("shutdown");
+            self.thread_pool.shutdown();
+            self.io_driver.notify();
         }
     }
 
@@ -74,13 +79,13 @@ impl Executor {
         }
 
         if let Some(thread) = thread {
-            if thread.use_ready.get() {
-                thread.ready.borrow_mut().extend(runnables);
+            if let Some(ref mut queue) = &mut *thread.io_intercept.borrow_mut() {
+                queue.extend(runnables);
                 return;
             }
 
-            if let Some(worker_index) = thread.worker_index.get() {
-                self.workers[worker_index].run_queue.push(runnables);
+            if let Some(ref producer) = thread.producer.borrow().as_ref() {
+                producer.push(runnables);
                 self.notify();
                 return;
             }
@@ -111,10 +116,12 @@ impl Executor {
         }
 
         if let Some(worker_index) = self.pop_idle_worker() {
-            match self.thread_pool.notify(Notified {
+            let notified = Notified {
                 worker_index,
                 searching: true,
-            }) {
+            };
+
+            match self.thread_pool.notify(self, notified) {
                 Ok(_) => return,
                 Err(_) => self.push_idle_worker(worker_index),
             }
@@ -125,7 +132,7 @@ impl Executor {
         assert_ne!(searching, 0);
     }
 
-    fn search_begin(&self) -> bool {
+    pub fn search_begin(&self) -> bool {
         let searching = self.searching.load(Ordering::Relaxed);
         assert!(searching <= self.workers.len());
 
@@ -138,7 +145,7 @@ impl Executor {
         true
     }
 
-    fn search_discovered(self: &Arc<Self>) {
+    pub fn search_discovered(self: &Arc<Self>) {
         let searching = self.searching.fetch_sub(1, Ordering::SeqCst);
         assert!(searching <= self.workers.len());
         assert_ne!(searching, 0);
@@ -148,7 +155,7 @@ impl Executor {
         }
     }
 
-    fn search_failed(&self, worker_index: usize, was_searching: bool) -> bool {
+    pub fn search_failed(&self, worker_index: usize, was_searching: bool) -> bool {
         assert!(worker_index < self.workers.len());
         self.push_idle_worker(worker_index);
 
@@ -160,7 +167,7 @@ impl Executor {
         }
     }
 
-    fn search_retry(&self) -> Option<Notified> {
+    pub fn search_retry(&self) -> Option<Notified> {
         self.pop_idle_worker().map(|worker_index| Notified {
             worker_index,
             searching: false,
@@ -182,7 +189,7 @@ impl Executor {
 }
 
 const IDLE_BITS: u32 = usize::BITS / 2;
-const IDLE_MASK: u32 = (1 << IDLE_BITS) - 1;
+const IDLE_MASK: usize = (1 << IDLE_BITS) - 1;
 
 impl Executor {
     fn push_idle_worker(&self, worker_index: usize) {
@@ -210,7 +217,7 @@ impl Executor {
 
     fn pop_idle_worker(&self) -> Option<usize> {
         self.idle
-            .fetch_udpate(Ordering::AcqRel, Ordering::Acquire, |mut idle| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |mut idle| {
                 let worker_index = match idle & IDLE_MASK {
                     0 => return None,
                     top_index => top_index - 1,

@@ -2,13 +2,14 @@ use super::{concurrency, AtomicWaker};
 use arc_swap::ArcSwapOption;
 use parking_lot::{Mutex, Once};
 use std::{
+    cell::Cell,
     collections::VecDeque,
     future::Future,
     mem,
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
-    task::{Context, Waker},
+    task::{Context, Poll, Waker},
 };
 
 #[derive(Default)]
@@ -18,11 +19,18 @@ struct Buffer<T> {
 }
 
 impl<T> Buffer<T> {
+    fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            deque: Mutex::new(VecDeque::new()),
+        }
+    }
+
     fn push(&self, item: T) {
         let mut deque = self.deque.lock();
         deque.push_back(item);
 
-        if !self.pending.load(Ordering::Relaxed) && self.deque.len() > 0 {
+        if !self.pending.load(Ordering::Relaxed) && deque.len() > 0 {
             self.pending.store(true, Ordering::Relaxed);
         }
     }
@@ -55,10 +63,10 @@ struct Chan<T> {
     buffers: ArcSwapOption<Box<[Buffer<T>]>>,
 }
 
-pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
-    let chan = Arc::new(Self {
+pub fn unbounded<T: Send>() -> (Sender<T>, Receiver<T>) {
+    let chan = Arc::new(Chan {
         once: Once::new(),
-        waker: AtomicWaker::defalt(),
+        waker: AtomicWaker::default(),
         ref_count: AtomicUsize::new((1 << 1) | 1),
         buffers: ArcSwapOption::const_empty(),
     });
@@ -74,7 +82,7 @@ pub struct Sender<T> {
     chan: Arc<Chan<T>>,
 }
 
-impl<T> Clone for Sender<T> {
+impl<T: Send> Clone for Sender<T> {
     fn clone(&self) -> Self {
         let ref_count = self.chan.ref_count.fetch_add(1 << 1, Ordering::Relaxed);
         assert_ne!(ref_count >> 1, usize::MAX >> 1);
@@ -105,11 +113,11 @@ impl<T> Sender<T> {
             return Err(SendError(value));
         }
 
-        self.with_buffers(|buffers| {
+        Ok(self.with_buffers(|buffers| {
             let slot = Self::buffer_index() % buffers.len();
             buffers[slot].push(value);
-            self.chan.waker.wake();
-        })
+            self.chan.waker.wake().map(Waker::wake).unwrap_or(())
+        }))
     }
 
     fn buffer_index() -> usize {
@@ -120,7 +128,7 @@ impl<T> Sender<T> {
                 static INDEX: AtomicUsize = AtomicUsize::new(0);
 
                 let index = INDEX.fetch_add(1, Ordering::Relaxed);
-                tls.set(index);
+                tls.set(Some(index));
                 index
             })
         })
@@ -128,18 +136,19 @@ impl<T> Sender<T> {
 
     fn with_buffers<F>(&self, f: impl FnOnce(&[Buffer<T>]) -> F) -> F {
         let buffers = self.chan.buffers.load();
-        if let Some(buffers) = &*buffers {
+        if let Some(buffers) = buffers.as_ref() {
             return f(buffers);
         }
 
         mem::drop(buffers);
-        once.call_once(|| {
-            let buffers = (0..concurrency::get()).map(|_| Buffer::default()).collect();
-            self.chan.buffers.store(Some(buffers));
+        self.chan.once.call_once(|| {
+            let buffer_count = concurrency::get().get();
+            let buffers: Box<[Buffer<T>]> = (0..buffer_count).map(|_| Buffer::new()).collect();
+            self.chan.buffers.store(Some(Arc::new(buffers)));
         });
 
-        let buffers = self.buffers.load();
-        f(&*buffers.unwrap())
+        let buffers = self.chan.buffers.load();
+        f(&*buffers.as_ref().unwrap())
     }
 }
 
@@ -171,25 +180,24 @@ impl<T> Receiver<T> {
     }
 
     pub fn close(&mut self) {
-        self.chan.ref_count.fetch_and(!1, Ordering::Relaxed);
+        let ref_count = self.chan.ref_count.load(Ordering::Relaxed);
+        if ref_count & 1 != 0 {
+            self.chan.ref_count.fetch_and(!1, Ordering::Relaxed);
+        }
     }
 
-    fn poll_with(&mut self, mut poll_ready: impl FnMut() -> Poll<()>) -> Poll<Option<T>> {
+    fn poll_recv_with(&mut self, waker: Option<&Waker>) -> Poll<Option<T>> {
         loop {
-            if self.disconnected {
-                return Poll::Ready(None);
-            }
-
             if let Some(value) = self.local.pop_front() {
                 return Poll::Ready(Some(value));
             }
 
-            if poll_ready().is_pending() {
-                return Poll::Pending;
+            if self.disconnected {
+                return Poll::Ready(None);
             }
 
-            loop {
-                self.chan.buffers.load().map(|buffers| {
+            while let Poll::Ready(_) = self.chan.waker.poll(waker, || {}, || {}) {
+                self.chan.buffers.load().as_ref().map(|buffers| {
                     for buffer in buffers.iter() {
                         if buffer.try_swap(&mut self.local) {
                             return;
@@ -197,23 +205,24 @@ impl<T> Receiver<T> {
                     }
                 });
 
-                if let Some(value) = self.local.pop_front() {
-                    return Poll::Ready(Some(value));
-                }
-
-                if self.chan.waker.reset() {
-                    break;
+                match self.local.pop_front() {
+                    Some(value) => return Poll::Ready(Some(value)),
+                    None => self.chan.waker.reset(),
                 }
             }
 
             let ref_count = self.chan.ref_count.load(Ordering::Relaxed);
-            let senders = ref_count >> 1;
-            self.disconnected = senders == 0;
+            if (ref_count >> 1) > 0 {
+                return Poll::Pending;
+            }
+
+            self.disconnected = true;
+            return Poll::Ready(None);
         }
     }
 
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        match self.poll_with(|| self.chan.waker.poll_ready()) {
+        match self.poll_recv_with(None) {
             Poll::Ready(Some(value)) => Ok(value),
             Poll::Ready(None) => Err(TryRecvError::Disconnected),
             Poll::Pending => Err(TryRecvError::Empty),
@@ -221,7 +230,7 @@ impl<T> Receiver<T> {
     }
 
     pub fn poll_recv(&mut self, ctx: &mut Context<'_>) -> Poll<Option<T>> {
-        self.poll_with(|| self.chan.waker.poll(ctx, || {}, || {}))
+        self.poll_recv_with(Some(ctx.waker()))
     }
 
     pub fn recv<'a>(&'a mut self) -> impl Future<Output = Option<T>> + 'a {
@@ -244,14 +253,6 @@ impl<T> Receiver<T> {
                         self.receiver = Some(receiver);
                         Poll::Pending
                     }
-                }
-            }
-        }
-
-        impl<'a, T> Drop for RecvFuture<'a, T> {
-            fn drop(&mut self) {
-                if let Some(receiver) = self.receiver.take() {
-                    mem::drop(receiver.chan.waker.detach());
                 }
             }
         }

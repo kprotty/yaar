@@ -1,6 +1,13 @@
-use super::executor::Executor;
+use super::{executor::Executor, thread::Thread};
 use parking_lot::{Condvar, Mutex};
-use std::{collections::VecDeque, mem, num::NonZeroUsize, time::Instant};
+use std::{
+    collections::VecDeque,
+    mem,
+    num::NonZeroUsize,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum NotifyError {
@@ -47,7 +54,7 @@ pub struct ThreadPool {
 }
 
 impl From<Config> for ThreadPool {
-    fn from(config: Config) {
+    fn from(config: Config) -> Self {
         Self {
             config,
             cond: Condvar::new(),
@@ -124,7 +131,7 @@ impl ThreadPool {
     }
 
     pub fn wait(&self, deadline: Option<Instant>) -> Result<Notified, WaitError> {
-        if let Some(callback) = executor.thread_pool.config.on_thread_park.as_ref() {
+        if let Some(callback) = self.config.on_thread_park.as_ref() {
             (callback)();
         }
 
@@ -133,7 +140,7 @@ impl ThreadPool {
             Instant::now() + default_delay
         }));
 
-        if let Some(callback) = executor.thread_pool.config.on_thread_unpark.as_ref() {
+        if let Some(callback) = self.config.on_thread_unpark.as_ref() {
             (callback)();
         }
 

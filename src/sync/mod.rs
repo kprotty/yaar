@@ -1,5 +1,5 @@
-mod concurrency;
-mod mpsc;
+pub(crate) mod concurrency;
+pub mod mpsc;
 mod waker;
 
-pub(crate) use self::{concurrency, waker::AtomicWaker};
+pub(crate) use waker::AtomicWaker;

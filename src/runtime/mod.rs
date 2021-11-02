@@ -1,1 +1,1 @@
-mod scheduler;
+pub(crate) mod scheduler;

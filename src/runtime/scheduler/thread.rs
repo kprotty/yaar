@@ -1,14 +1,15 @@
 use super::{
     executor::Executor,
     pool::{Notified, WaitError},
-    queue::{Runnable, Steal},
-    random::RandomIterGen,
+    queue::{Producer, Runnable, Steal},
+    random::RandomSource,
 };
-use crate::io::driver::Poller as IoPoller;
+use crate::io::Poller as IoPoller;
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
     hint::spin_loop,
+    mem,
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -17,8 +18,8 @@ use std::{
 pub struct Thread {
     pub executor: Arc<Executor>,
     pub worker_index: Cell<Option<usize>>,
-    pub use_ready: Cell<bool>,
-    pub ready: RefCell<VecDeque<Runnable>>,
+    pub producer: RefCell<Option<Producer>>,
+    pub io_intercept: RefCell<Option<VecDeque<Runnable>>>,
 }
 
 impl Thread {
@@ -31,21 +32,69 @@ impl Thread {
         Self::with_tls(|tls| tls.as_ref().map(Rc::clone)).map(|rc| f(&*rc))
     }
 
-    pub fn run(executor: &Arc<Executor>, notified: Notified) {}
+    pub fn run(executor: &Arc<Executor>, notified: Notified) {
+        let thread = Rc::new(Self {
+            executor: executor.clone(),
+            worker_index: Cell::new(None),
+            producer: RefCell::new(None),
+            io_intercept: RefCell::new(None),
+        });
+
+        match Self::with_tls(|tls| mem::replace(tls, Some(thread.clone()))) {
+            Some(_) => unreachable!("Nested runtimes are not supported"),
+            None => {}
+        }
+
+        ThreadRef::run(executor, &*thread, notified);
+
+        match Self::with_tls(|tls| mem::replace(tls, None)) {
+            Some(old_thread) => assert!(Rc::ptr_eq(&thread, &old_thread)),
+            None => unreachable!("Thread was removed from thread_local storage"),
+        }
+    }
 }
 
 struct ThreadRef<'a, 'b> {
     thread: &'a Thread,
     executor: &'b Arc<Executor>,
     io_poller: IoPoller,
-    io_ready: VecDeque<Runnable>,
-    tick: u8,
+    io_ready: Option<VecDeque<Runnable>>,
+    tick: usize,
     searching: bool,
-    rng_gen: RandomIterGen,
+    rng_source: RandomSource,
 }
 
 impl<'a, 'b> ThreadRef<'a, 'b> {
+    fn run(executor: &'b Arc<Executor>, thread: &'a Thread, notified: Notified) {
+        let mut rng_source = RandomSource::new(notified.worker_index);
+        let tick = rng_source.next();
+
+        let mut thread_ref = Self {
+            thread,
+            executor,
+            io_poller: IoPoller::default(),
+            io_ready: Some(VecDeque::new()),
+            tick,
+            searching: false,
+            rng_source,
+        };
+
+        thread_ref.transition_to_notified(notified);
+        thread_ref.run_thread();
+    }
+
     fn transition_to_notified(&mut self, notified: Notified) {
+        let producer = self.executor.workers[notified.worker_index]
+            .run_queue
+            .swap_producer(None)
+            .expect("Thread running on Worker without a Producer");
+
+        self.thread
+            .producer
+            .borrow_mut()
+            .replace(producer)
+            .map(|_| unreachable!("Thread notified when it already has a Producer"));
+
         assert_eq!(self.thread.worker_index.get(), None);
         self.thread.worker_index.set(Some(notified.worker_index));
 
@@ -53,17 +102,46 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
         self.searching = notified.searching;
     }
 
-    fn poll(&mut self) -> Option<Task> {
-        let thread = self.thread;
+    fn transition_to_idle(&mut self, worker_index: usize) -> bool {
+        let producer = self
+            .thread
+            .producer
+            .borrow_mut()
+            .take()
+            .expect("Thread becoming idle without a Producer");
+
+        self.executor.workers[worker_index]
+            .run_queue
+            .swap_producer(Some(producer))
+            .map(|_| unreachable!("Thread relenquishing Worker that already has a Producer"));
+
+        assert_eq!(self.thread.worker_index.get(), Some(worker_index));
+        self.thread.worker_index.set(None);
+
+        let was_searching = mem::replace(&mut self.searching, false);
+        self.executor.search_failed(worker_index, was_searching)
+    }
+
+    fn run_thread(&mut self) {
+        while let Some(runnable) = self.poll() {
+            if mem::replace(&mut self.searching, false) {
+                self.executor.search_discovered();
+            }
+
+            self.tick = self.tick.wrapping_add(1);
+            runnable.run(self.thread);
+        }
+    }
+
+    fn poll(&mut self) -> Option<Runnable> {
         let executor = self.executor;
         loop {
-            if let Some(worker_index) = thread.worker_index.get() {
+            if let Some(worker_index) = self.thread.worker_index.get() {
                 if let Some(runnable) = self.poll_search(worker_index) {
                     return Some(runnable);
                 }
 
-                let was_searching = mem::replace(&mut self.searching, false);
-                if executor.search_failed(worker_index, was_searching) {
+                if self.transition_to_idle(worker_index) {
                     if let Some(notified) = executor.search_retry() {
                         self.transition_to_notified(notified);
                         continue;
@@ -71,14 +149,14 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
                 }
             }
 
-            if self.poll_for_io(None) {
+            if let Some(mut io_ready) = self.poll_io(None) {
                 let mut runnable = None;
                 if let Some(notified) = executor.search_retry() {
-                    runnable = self.io_ready.pop_first();
+                    runnable = Some(io_ready.pop_front().unwrap());
                     self.transition_to_notified(notified);
                 }
 
-                executor.schedule(self.io_ready.drain(..), Some(thread));
+                executor.schedule(io_ready.into_iter(), Some(self.thread));
                 if runnable.is_some() {
                     return runnable;
                 }
@@ -93,37 +171,43 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
     }
 
     fn poll_search(&mut self, worker_index: usize) -> Option<Runnable> {
-        let thread = self.thread;
         let executor = self.executor;
-        let run_queue = &executor.workers[worker_index].run_queue;
+        let producer = self.thread.producer.borrow();
+        let producer = producer
+            .as_ref()
+            .expect("Thread polling for work without a Producer");
 
         let be_fair = self.tick % 64 == 0;
-        if let Some(runnable) = run_queue.pop(be_fair) {
+        if be_fair {
+            if let Some(runnable) = producer.consume(&self.executor.injector) {
+                return Some(runnable);
+            }
+        }
+
+        if let Some(runnable) = producer.pop(be_fair) {
             return Some(runnable);
         }
 
-        if self.poll_io(Some(Duration::ZERO)) {
-            let runnable = self.io_ready.pop_first().unwrap();
-            executor.schedule(self.io_ready.drain(..), Some(thread));
+        if let Some(runnable) = producer.consume(&self.executor.injector) {
+            return Some(runnable);
+        }
+
+        if let Some(mut io_ready) = self.poll_io(Some(Duration::ZERO)) {
+            let runnable = io_ready.pop_front().unwrap();
+            executor.schedule(io_ready.into_iter(), Some(self.thread));
             return Some(runnable);
         }
 
         self.searching = self.searching || executor.search_begin();
         if self.searching {
             for _attempt in 0..32 {
-                let mut was_contended = match run_queue.consume(&executor.injector) {
-                    Steal::Success(runnable) => return Some(runnable),
-                    Steal::Empty => false,
-                    Steal::Retry => true,
-                };
-
-                for steal_index in self.rng_gen.iter() {
+                let mut was_contended = false;
+                for steal_index in self.rng_source.iter(executor.rng_iter_gen) {
                     if steal_index == worker_index {
                         continue;
                     }
 
-                    let target_queue = &executor.workers[steal_index].run_queue;
-                    match run_queue.steal(target_queue) {
+                    match producer.steal(&executor.workers[steal_index].run_queue) {
                         Steal::Success(runnable) => return Some(runnable),
                         Steal::Retry => was_contended = true,
                         Steal::Empty => {}
@@ -137,18 +221,33 @@ impl<'a, 'b> ThreadRef<'a, 'b> {
             }
         }
 
-        None
+        producer.consume(&self.executor.injector)
     }
 
-    fn poll_io(&mut self, timeout: Option<Duration>) -> bool {
-        assert!(!self.thread.use_ready.replace(true));
-        let polled = self.io_poller.poll(&*self.executor.io_driver, timeout);
-        assert!(self.thread.use_ready.replace(false));
+    fn poll_io(&mut self, timeout: Option<Duration>) -> Option<VecDeque<Runnable>> {
+        let io_ready = self
+            .io_ready
+            .take()
+            .expect("Polling for I/O without a VecDeque");
 
-        polled && {
-            assert_eq!(self.io_ready.len(), 0);
-            mem::swap(&mut self.io_ready, &mut *self.thread.ready.borrow_mut());
-            self.io_ready.len() > 0
+        match mem::replace(&mut *self.thread.io_intercept.borrow_mut(), Some(io_ready)) {
+            Some(_) => unreachable!("Polling for I/O with io_intercept is already set"),
+            None => {}
         }
+
+        self.io_poller.poll(&*self.executor.io_driver, timeout);
+
+        let io_ready = match mem::replace(&mut *self.thread.io_intercept.borrow_mut(), None) {
+            Some(io_intercept) => io_intercept,
+            None => unreachable!("Polled I/O without an io_intercept queue"),
+        };
+
+        if io_ready.len() > 0 {
+            return Some(io_ready);
+        }
+
+        assert!(self.io_ready.is_none());
+        self.io_ready = Some(io_ready);
+        None
     }
 }
