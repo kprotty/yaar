@@ -1,7 +1,7 @@
 const SIZE: usize = 10_000_000;
 
 pub fn main() {
-    yaar::runtime::Builder::new().block_on(async move {
+    yaar::runtime::Builder::new().build().unwrap().block_on(async move {
         println!("filling");
         let arr = (0..SIZE)
             .map(|i| i.try_into().unwrap())

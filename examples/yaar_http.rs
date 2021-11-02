@@ -10,7 +10,7 @@ async fn hello_world(_: Request<Body>) -> Result<Response<Body>, Infallible> {
 }
 
 pub fn main() -> Result<(), hyper::Error> {
-    yaar::runtime::Builder::new().block_on(async {
+    yaar::runtime::Builder::new().build().unwrap().block_on(async {
         let addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         let listener = yaar::net::TcpListener::bind(addr).expect("failed to bind TcpListener");
 

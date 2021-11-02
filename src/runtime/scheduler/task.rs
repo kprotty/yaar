@@ -194,7 +194,7 @@ impl<F: Future> TaskJoinable<F::Output> for Task<F> {
 }
 
 pub struct JoinHandle<T> {
-    joinable: Option<Arc<dyn TaskJoinable<T>>>,
+    joinable: Option<Arc<dyn TaskJoinable<T> + Send + Sync>>,
 }
 
 impl<T> Future for JoinHandle<T> {
