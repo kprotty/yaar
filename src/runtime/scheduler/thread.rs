@@ -33,22 +33,38 @@ impl Thread {
     }
 
     pub fn run(executor: &Arc<Executor>, notified: Notified) {
-        let thread = Rc::new(Self {
+        let enter = ThreadEnter::from(executor);
+        ThreadRef::run(enter.executor, &*enter.thread, notified);
+    }
+}
+
+pub struct ThreadEnter<'a> {
+    executor: &'a Arc<Executor>,
+    thread: Rc<Thread>,
+}
+
+impl<'a> From<&'a Arc<Executor>> for ThreadEnter<'a> {
+    fn from(executor: &'a Arc<Executor>) -> Self {
+        let thread = Rc::new(Thread {
             executor: executor.clone(),
             worker_index: Cell::new(None),
             producer: RefCell::new(None),
             io_intercept: RefCell::new(None),
         });
 
-        match Self::with_tls(|tls| mem::replace(tls, Some(thread.clone()))) {
+        match Thread::with_tls(|tls| mem::replace(tls, Some(thread.clone()))) {
             Some(_) => unreachable!("Nested runtimes are not supported"),
             None => {}
         }
 
-        ThreadRef::run(executor, &*thread, notified);
+        Self { executor, thread }
+    }
+}
 
-        match Self::with_tls(|tls| mem::replace(tls, None)) {
-            Some(old_thread) => assert!(Rc::ptr_eq(&thread, &old_thread)),
+impl<'a> Drop for ThreadEnter<'a> {
+    fn drop(&mut self) {
+        match Thread::with_tls(|tls| mem::replace(tls, None)) {
+            Some(old_thread) => assert!(Rc::ptr_eq(&self.thread, &old_thread)),
             None => unreachable!("Thread was removed from thread_local storage"),
         }
     }

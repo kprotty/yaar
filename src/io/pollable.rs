@@ -2,7 +2,7 @@ use super::{
     driver::Driver,
     wakers::{WakerIndex, WakerKind},
 };
-use crate::runtime::scheduler::thread::Thread;
+use crate::runtime::scheduler::Thread;
 use mio::event::Source;
 use std::{
     future::Future,

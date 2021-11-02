@@ -20,7 +20,6 @@ pub struct Worker {
 pub struct Executor {
     idle: AtomicUsize,
     searching: AtomicUsize,
-    active_tasks: AtomicUsize,
     pub injector: Injector,
     pub io_driver: Arc<IoDriver>,
     pub thread_pool: ThreadPool,
@@ -36,7 +35,6 @@ impl Executor {
         let executor = Self {
             idle: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
-            active_tasks: AtomicUsize::new(0),
             injector: Injector::default(),
             io_driver: Arc::new(io_driver),
             thread_pool: ThreadPool::from(config),
@@ -51,21 +49,6 @@ impl Executor {
         }
 
         Ok(executor)
-    }
-
-    pub fn task_started(&self) {
-        let active_tasks = self.active_tasks.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(active_tasks, usize::MAX);
-    }
-
-    pub fn task_finished(&self) {
-        let active_tasks = self.active_tasks.fetch_sub(1, Ordering::AcqRel);
-        assert_ne!(active_tasks, 0);
-
-        if active_tasks == 0 {
-            self.thread_pool.shutdown();
-            self.io_driver.notify();
-        }
     }
 
     pub fn schedule(

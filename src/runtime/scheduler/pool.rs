@@ -27,16 +27,21 @@ pub struct Notified {
     pub searching: bool,
 }
 
+pub type Callback = Arc<dyn Fn() + Send + Sync>;
+
+pub type ThreadNameFn = Arc<dyn Fn() -> String + Send + Sync + 'static>;
+
+#[derive(Default)]
 pub struct Config {
     pub keep_alive: Option<Duration>,
     pub stack_size: Option<NonZeroUsize>,
     pub worker_threads: Option<NonZeroUsize>,
     pub blocking_threads: Option<NonZeroUsize>,
-    pub on_thread_start: Option<Box<dyn Fn() + Send + Sync + 'static>>,
-    pub on_thread_stop: Option<Box<dyn Fn() + Send + Sync + 'static>>,
-    pub on_thread_park: Option<Box<dyn Fn() + Send + Sync + 'static>>,
-    pub on_thread_unpark: Option<Box<dyn Fn() + Send + Sync + 'static>>,
-    pub on_thread_name: Option<Box<dyn Fn() -> String + Send + Sync + 'static>>,
+    pub on_thread_start: Option<Callback>,
+    pub on_thread_stop: Option<Callback>,
+    pub on_thread_park: Option<Callback>,
+    pub on_thread_unpark: Option<Callback>,
+    pub on_thread_name: Option<ThreadNameFn>,
 }
 
 #[derive(Default)]
@@ -136,8 +141,8 @@ impl ThreadPool {
         }
 
         let wait_result = self.wait_until(deadline.unwrap_or_else(|| {
-            let default_delay = Duration::from_secs(10);
-            Instant::now() + default_delay
+            let keep_alive = self.config.keep_alive.unwrap();
+            Instant::now() + keep_alive
         }));
 
         if let Some(callback) = self.config.on_thread_unpark.as_ref() {

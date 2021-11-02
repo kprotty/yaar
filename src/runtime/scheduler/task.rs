@@ -5,9 +5,10 @@ use std::{
     future::Future,
     iter, mem, panic,
     pin::Pin,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
     sync::Arc,
     task::{Context, Poll, Wake, Waker},
+    thread,
 };
 use try_lock::TryLock;
 
@@ -170,9 +171,7 @@ where
 
         *data = TaskData::Ready(result);
         mem::drop(data);
-
         self.waker.wake().map(Waker::wake).unwrap_or(());
-        thread.executor.task_finished();
     }
 }
 
@@ -218,25 +217,104 @@ impl<T> Future for JoinHandle<T> {
     }
 }
 
-pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+pub fn spawn<F>(
+    future: F,
+    executor: Arc<Executor>,
+    thread: Option<&Thread>,
+) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    Thread::try_with(|thread| {
-        let task = Arc::new(Task {
-            state: TaskState::default(),
-            waker: AtomicWaker::default(),
-            data: TryLock::new(TaskData::Idle(Box::pin(future))),
-            executor: thread.executor.clone(),
-        });
+    let task = Arc::new(Task {
+        state: TaskState::default(),
+        waker: AtomicWaker::default(),
+        data: TryLock::new(TaskData::Idle(Box::pin(future))),
+        executor: executor.clone(),
+    });
 
-        let runnable: Arc<dyn TaskRunnable> = task.clone();
-        thread.executor.schedule(iter::once(runnable), Some(thread));
+    let runnable: Arc<dyn TaskRunnable> = task.clone();
+    executor.schedule(iter::once(runnable), thread);
 
-        JoinHandle {
-            joinable: Some(task),
+    JoinHandle {
+        joinable: Some(task),
+    }
+}
+
+pub fn block_on<F: Future>(future: F, executor: Arc<Executor>) -> F::Output {
+    struct Blocker {
+        state: TaskState,
+        notified: AtomicBool,
+        thread: thread::Thread,
+        executor: Arc<Executor>,
+    }
+
+    impl Wake for Blocker {
+        fn wake(self: Arc<Self>) {
+            if self.state.transition_to_scheduled() {
+                self.schedule();
+            }
         }
-    })
-    .expect("spawn() called outside of the runtime")
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            if self.state.transition_to_scheduled() {
+                self.clone().schedule();
+            }
+        }
+    }
+
+    impl Blocker {
+        fn schedule(self: Arc<Self>) {
+            let mut blocker = Some(self);
+
+            let with_thread = Thread::try_with(|thread| {
+                let blocker = blocker.take().unwrap();
+                let runnable: Arc<dyn TaskRunnable> = blocker;
+                thread.executor.schedule(iter::once(runnable), Some(thread));
+            });
+
+            if with_thread.is_none() {
+                let blocker = blocker.take().unwrap();
+                let executor = blocker.executor.clone();
+                let runnable: Arc<dyn TaskRunnable> = blocker;
+                executor.schedule(iter::once(runnable), None);
+            }
+        }
+    }
+
+    impl TaskRunnable for Blocker {
+        fn run(self: Arc<Self>, _thread: &Thread) {
+            self.notified.store(true, Ordering::Release);
+            self.thread.unpark();
+        }
+    }
+
+    let blocker = Arc::new(Blocker {
+        state: TaskState::default(),
+        notified: AtomicBool::new(false),
+        thread: thread::current(),
+        executor,
+    });
+
+    let waker = Waker::from(blocker.clone());
+    let mut ctx = Context::from_waker(&waker);
+    pin_utils::pin_mut!(future);
+
+    loop {
+        blocker.state.transition_to_running();
+        blocker.notified.store(false, Ordering::Relaxed);
+
+        if let Poll::Ready(result) = future.as_mut().poll(&mut ctx) {
+            return result;
+        }
+
+        if !blocker.state.transition_to_idle() {
+            blocker.state.transition_from_notified();
+            continue;
+        }
+
+        while !blocker.notified.load(Ordering::Acquire) {
+            thread::park();
+        }
+    }
 }
