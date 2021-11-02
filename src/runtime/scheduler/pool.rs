@@ -178,9 +178,11 @@ impl ThreadPool {
 
     pub fn shutdown(&self) {
         let mut state = self.state.lock();
-        assert_eq!(state.shutdown, false);
-        state.shutdown = true;
+        if state.shutdown {
+            return;
+        }
 
+        state.shutdown = true;
         if state.idle > 0 && state.notified.len() < state.idle {
             self.cond.notify_all();
         }

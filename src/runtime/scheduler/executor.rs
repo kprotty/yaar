@@ -15,32 +15,46 @@ use std::{
 };
 
 #[derive(Default)]
+struct SignalState {
+    notified: bool,
+    waiting: usize,
+}
+
+#[derive(Default)]
 struct Signal {
-    notified: Mutex<bool>,
+    state: Mutex<SignalState>,
     cond: Condvar,
 }
 
 impl Signal {
     fn wait(&self, timeout: Option<Duration>) {
         let deadline = timeout.map(|t| Instant::now() + t);
-        let mut notified = self.notified.lock();
+        let mut state = self.state.lock();
 
-        while !*notified {
+        while !state.notified {
             if matches!(timeout, Some(Duration::ZERO)) {
                 return;
             }
 
+            state.waiting += 1;
             match deadline {
-                Some(deadline) => drop(self.cond.wait_until(&mut notified, deadline)),
-                None => self.cond.wait(&mut notified),
+                Some(deadline) => drop(self.cond.wait_until(&mut state, deadline)),
+                None => self.cond.wait(&mut state),
             }
+            state.waiting -= 1;
         }
     }
 
     fn notify(&self) {
-        let mut notified = self.notified.lock();
-        *notified = true;
-        self.cond.notify_all();
+        let mut state = self.state.lock();
+        if state.notified {
+            return;
+        }
+
+        state.notified = true;
+        if state.waiting > 0 {
+            self.cond.notify_all();
+        }
     }
 }
 
