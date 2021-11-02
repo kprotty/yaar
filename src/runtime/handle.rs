@@ -54,6 +54,7 @@ impl Handle {
     }
 
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        let _guard = self.enter();
         task::block_on(future, self.executor.clone())
     }
 
