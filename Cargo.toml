@@ -7,7 +7,6 @@ authors = ["kprotty"]
 
 [dependencies]
 gcd = "2"
-pin-utils = "0.1"
 num_cpus = "1"
 arc-swap = "1"
 try-lock = "0.2"
@@ -15,19 +14,3 @@ parking_lot = "0.11"
 crossbeam-deque = "0.8"
 tokio = { version = "1", features = ["io-util"] }
 mio = { version = "0.7", features = ["net", "os-poll"] }
-
-[[example]]
-name = "tokio_qsort"
-
-[[example]]
-name = "yaar_qsort"
-
-[[example]]
-name = "tokio_http"
-
-[[example]]
-name = "yaar_http"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
-hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
