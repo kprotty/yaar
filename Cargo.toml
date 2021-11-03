@@ -8,9 +8,25 @@ authors = ["kprotty"]
 [dependencies]
 gcd = "2"
 num_cpus = "1"
-arc-swap = "1"
+# arc-swap = "1"
 try-lock = "0.2"
 parking_lot = "0.11"
 crossbeam-deque = "0.8"
-tokio = { version = "1", features = ["io-util"] }
-mio = { version = "0.7", features = ["net", "os-poll"] }
+# tokio = { version = "1", features = ["io-util"] }
+# mio = { version = "0.7", features = ["net", "os-poll"] }
+
+[[example]]
+name = "yaar_qsort"
+path = "examples/qsort/yaar.rs"
+
+[[example]]
+name = "rayon_qsort"
+path = "examples/qsort/rayon.rs"
+
+[[example]]
+name = "tokio_qsort"
+path = "examples/qsort/tokio.rs"
+
+[dev-dependencies]
+rayon = "1.5"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
