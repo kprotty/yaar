@@ -13,7 +13,7 @@ impl From<NonZeroUsize> for RandomIterSource {
             range,
             prime: ((range.get() / 2)..range.get())
                 .rev()
-                .map(|prime| prime.gcd(range.get()))
+                .filter(|prime| prime.gcd(range.get()) == 1)
                 .filter_map(NonZeroUsize::new)
                 .next()
                 .unwrap(),
@@ -59,16 +59,17 @@ impl RandomGenerator {
     }
 
     pub fn gen_iter(&mut self, iter_source: RandomIterSource) -> impl Iterator<Item = usize> {
-        let mut offset = self.gen();
+        let range = iter_source.range.get();
+        let prime = iter_source.prime.get();
+        let mut index = self.gen() % range;
 
-        (0..iter_source.range.get()).map(move |_| {
-            offset += iter_source.prime.get();
-            if offset >= iter_source.range.get() {
-                offset -= iter_source.range.get();
+        (0..range).map(move |_| {
+            index += prime;
+            if index >= range {
+                index -= range;
             }
 
-            let index = offset;
-            assert!(index < iter_source.range.get());
+            assert!(index < range);
             index
         })
     }

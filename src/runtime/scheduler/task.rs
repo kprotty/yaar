@@ -94,6 +94,8 @@ where
         });
 
         executor.task_begin();
+
+        assert!(task.state.transition_to_scheduled());
         executor.schedule(task.clone(), thread, false);
         
         task
