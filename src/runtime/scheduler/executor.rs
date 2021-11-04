@@ -4,9 +4,11 @@ use super::{
     thread::{Thread, ThreadPool},
     worker::Worker,
 };
+use crate::io::driver::Driver as IoDriver;
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
+    io,
     num::NonZeroUsize,
     sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
@@ -54,6 +56,7 @@ pub struct Executor {
     idle: IdleQueue,
     tasks: AtomicUsize,
     searching: AtomicUsize,
+    pub io_driver: Arc<IoDriver>,
     pub thread_pool: ThreadPool,
     pub injector: Injector,
     pub rng_iter_source: RandomIterSource,
@@ -61,25 +64,25 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new(worker_threads: Option<NonZeroUsize>) -> Self {
+    pub fn new(worker_threads: Option<NonZeroUsize>) -> io::Result<Self> {
+        let io_driver = IoDriver::new()?;
         let worker_threads = worker_threads
             .or_else(|| NonZeroUsize::new(num_cpus::get()))
             .or(NonZeroUsize::new(1))
             .unwrap();
 
-        let executor = Self {
+        Ok(Self {
             idle: IdleQueue::from(worker_threads),
             tasks: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
+            io_driver: Arc::new(io_driver),
             thread_pool: ThreadPool::new(worker_threads),
             rng_iter_source: RandomIterSource::from(worker_threads),
             injector: Injector::default(),
             workers: (0..worker_threads.get())
                 .map(|_| Worker::default())
                 .collect(),
-        };
-
-        executor
+        })
     }
 
     pub fn schedule(self: &Arc<Self>, runnable: Runnable, thread: Option<&Thread>, be_fair: bool) {

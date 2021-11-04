@@ -1,7 +1,7 @@
-use super::waker::{WakerIndex, WakerEntry, WakerStorage};
-use try_lock::TryLock;
+use super::waker::{WakerEntry, WakerIndex, WakerStorage};
 use mio::event::Source;
 use std::io;
+use try_lock::TryLock;
 
 pub struct Driver {
     waker_storage: WakerStorage,

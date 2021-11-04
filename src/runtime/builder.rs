@@ -26,7 +26,9 @@ impl Builder {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let executor = Arc::new(Executor::new(self.worker_threads));
+        let executor = Executor::new(self.worker_threads).unwrap();
+        let executor = Arc::new(executor);
+
         let task = Task::spawn(future, &executor, None);
         task.join()
     }
