@@ -1,5 +1,9 @@
 use gcd::Gcd;
-use std::{mem::size_of, num::NonZeroUsize};
+use std::{
+    mem::size_of,
+    num::NonZeroUsize,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 #[derive(Copy, Clone)]
 pub struct RandomIterSource {
@@ -25,11 +29,13 @@ pub struct RandomGenerator {
     xorshift: NonZeroUsize,
 }
 
-impl From<usize> for RandomGenerator {
-    fn from(seed: usize) -> Self {
+impl RandomGenerator {
+    pub fn new() -> Self {
+        static SEED: AtomicUsize = AtomicUsize::new(0);
+        let seed = SEED.fetch_add(1, Ordering::Relaxed);
+
         #[cfg(target_pointer_width = "64")]
         const HASH: usize = 0x9E3779B97F4A7C15;
-
         #[cfg(target_pointer_width = "32")]
         const HASH: usize = 0x9E3779B9;
 
@@ -39,9 +45,7 @@ impl From<usize> for RandomGenerator {
                 .unwrap(),
         }
     }
-}
 
-impl RandomGenerator {
     pub fn gen(&mut self) -> usize {
         let shifts = match size_of::<usize>() {
             8 => (13, 7, 17),

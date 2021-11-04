@@ -1,11 +1,8 @@
-use super::{executor::Executor, queue::Producer, worker::WorkerThread};
+use super::{config::Config, context::Context, executor::Executor, worker::WorkerContext};
 use parking_lot::{Condvar, Mutex};
-use std::{
-    cell::RefCell, collections::VecDeque, mem::replace, num::NonZeroUsize, rc::Rc, sync::Arc,
-    thread,
-};
+use std::{collections::VecDeque, mem::replace, sync::Arc, thread};
 
-struct Pool {
+struct PoolState {
     idle: usize,
     spawned: usize,
     shutdown: bool,
@@ -13,127 +10,109 @@ struct Pool {
 }
 
 pub struct ThreadPool {
-    max_threads: NonZeroUsize,
+    pub config: Config,
     condvar: Condvar,
-    pool: Mutex<Pool>,
+    state: Mutex<PoolState>,
 }
 
 impl ThreadPool {
-    pub fn new(max_threads: NonZeroUsize) -> Self {
+    pub fn from(config: Config) -> Self {
+        let max_threads = config.max_threads().unwrap().get();
         Self {
-            max_threads,
+            config,
             condvar: Condvar::new(),
-            pool: Mutex::new(Pool {
+            state: Mutex::new(PoolState {
                 idle: 0,
                 spawned: 0,
                 shutdown: false,
-                notified: VecDeque::with_capacity(max_threads.get()),
+                notified: VecDeque::with_capacity(max_threads),
             }),
         }
     }
 
     pub fn spawn(&self, executor: &Arc<Executor>, worker_index: usize) -> Result<(), ()> {
-        let mut pool = self.pool.lock();
-        if pool.shutdown {
+        let mut state = self.state.lock();
+        if state.shutdown {
             return Err(());
         }
 
-        if pool.notified.len() < pool.idle {
-            pool.notified.push_back(worker_index);
+        if state.notified.len() < state.idle {
+            state.notified.push_back(worker_index);
             self.condvar.notify_one();
             return Ok(());
         }
 
-        assert!(pool.spawned <= self.max_threads.get());
-        if pool.spawned == self.max_threads.get() {
+        let max_threads = self.config.max_threads().unwrap().get();
+        assert!(state.spawned <= max_threads);
+        if state.spawned == max_threads {
             return Err(());
         }
 
-        let position = pool.spawned;
-        pool.spawned += 1;
-        drop(pool);
+        let position = state.spawned;
+        state.spawned += 1;
+        drop(state);
 
         if position == 0 {
-            Self::run(executor, worker_index, position);
+            Self::run(executor, worker_index);
             return Ok(());
         }
 
         let executor = executor.clone();
         thread::Builder::new()
-            .spawn(move || Self::run(&executor, worker_index, position))
+            .name(self.config.on_thread_name.as_ref().unwrap()())
+            .stack_size(self.config.stack_size.unwrap().get())
+            .spawn(move || Self::run(&executor, worker_index))
             .map(drop)
             .map_err(|_| self.finish())
     }
 
-    fn run(executor: &Arc<Executor>, worker_index: usize, position: usize) {
-        Thread::run(executor, worker_index, position);
+    fn run(executor: &Arc<Executor>, worker_index: usize) {
+        let context_ref = Context::enter(executor);
+        WorkerContext::run(context_ref.as_ref(), worker_index);
         executor.thread_pool.finish();
     }
 
     fn finish(&self) {
-        let mut pool = self.pool.lock();
-        assert!(pool.spawned <= self.max_threads.get());
-        assert_ne!(pool.spawned, 0);
-        pool.spawned -= 1;
+        let mut state = self.state.lock();
+
+        let max_threads = self.config.max_threads().unwrap().get();
+        assert!(state.spawned <= max_threads);
+
+        assert_ne!(state.spawned, 0);
+        state.spawned -= 1;
     }
 
     pub fn wait(&self) -> Result<usize, ()> {
-        let mut pool = self.pool.lock();
+        let mut state = self.state.lock();
         loop {
-            if pool.shutdown {
+            if state.shutdown {
                 return Err(());
             }
 
-            if let Some(worker_index) = pool.notified.pop_back() {
+            if let Some(worker_index) = state.notified.pop_back() {
                 return Ok(worker_index);
             }
 
-            pool.idle += 1;
-            assert!(pool.idle <= self.max_threads.get());
+            let max_threads = self.config.max_threads().unwrap().get();
+            state.idle += 1;
+            assert!(state.idle <= max_threads);
 
-            self.condvar.wait(&mut pool);
+            self.condvar.wait(&mut state);
 
-            assert!(pool.idle <= self.max_threads.get());
-            assert_ne!(pool.idle, 0);
-            pool.idle -= 1;
+            assert!(state.idle <= max_threads);
+            assert_ne!(state.idle, 0);
+            state.idle -= 1;
         }
     }
 
     pub fn shutdown(&self) {
-        let mut pool = self.pool.lock();
-        if replace(&mut pool.shutdown, true) {
+        let mut state = self.state.lock();
+        if replace(&mut state.shutdown, true) {
             return;
         }
 
-        if pool.idle > 0 && pool.notified.len() < pool.idle {
+        if state.idle > 0 && state.notified.len() < state.idle {
             self.condvar.notify_all();
         }
-    }
-}
-
-pub struct Thread {
-    pub executor: Arc<Executor>,
-    pub producer: RefCell<Option<Producer>>,
-}
-
-impl Thread {
-    fn with_tls<F>(f: impl FnOnce(&mut Option<Rc<Self>>) -> F) -> F {
-        thread_local!(static TLS: RefCell<Option<Rc<Thread>>> = RefCell::new(None));
-        TLS.with(|ref_cell| f(&mut *ref_cell.borrow_mut()))
-    }
-
-    pub fn try_with<F>(f: impl FnOnce(&Self) -> F) -> Option<F> {
-        Self::with_tls(|tls| tls.as_ref().map(Rc::clone)).map(|rc| f(&*rc))
-    }
-
-    fn run(executor: &Arc<Executor>, worker_index: usize, position: usize) {
-        let thread = Rc::new(Self {
-            executor: executor.clone(),
-            producer: RefCell::new(None),
-        });
-
-        let old_tls = Self::with_tls(|tls| replace(tls, Some(thread.clone())));
-        WorkerThread::run(&*thread, worker_index, position);
-        Self::with_tls(|tls| *tls = old_tls);
     }
 }

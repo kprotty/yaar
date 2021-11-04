@@ -1,12 +1,12 @@
 use crate::runtime::scheduler::{
+    context::Context,
     task::{Task, TaskJoinable},
-    thread::Thread,
 };
 use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context as PollContext, Poll},
 };
 
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
@@ -14,23 +14,23 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    Thread::try_with(|thread| {
-        let task = Task::spawn(future, &thread.executor, Some(thread));
-        JoinHandle {
-            joinable: Some(task),
-        }
-    })
-    .expect("spawn() called outside of the runtime")
+    let context_ref = Context::current();
+    let context = context_ref.as_ref();
+
+    let task = Task::spawn(future, &context.executor, Some(context));
+    JoinHandle {
+        joinable: Some(task),
+    }
 }
 
 pub struct JoinHandle<T> {
-    joinable: Option<Arc<dyn TaskJoinable<T> + Send + Sync>>,
+    pub(crate) joinable: Option<Arc<dyn TaskJoinable<T> + Send + Sync>>,
 }
 
 impl<T> Future for JoinHandle<T> {
     type Output = T;
 
-    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut PollContext<'_>) -> Poll<Self::Output> {
         let joinable = self
             .joinable
             .as_ref()
@@ -53,7 +53,7 @@ pub async fn yield_now() {
     impl Future for YieldFuture {
         type Output = ();
 
-        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<()> {
+        fn poll(mut self: Pin<&mut Self>, ctx: &mut PollContext<'_>) -> Poll<()> {
             if self.yielded {
                 return Poll::Ready(());
             }

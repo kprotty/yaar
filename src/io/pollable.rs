@@ -1,5 +1,4 @@
 use super::{
-    super::runtime::scheduler::thread::Thread,
     driver::Driver,
     waker::{WakerIndex, WakerKind},
 };
@@ -25,18 +24,15 @@ pub struct Pollable<S: Source> {
 
 impl<S: Source> Pollable<S> {
     pub fn new(mut source: S) -> io::Result<Self> {
-        Thread::try_with(|thread| {
-            let driver = thread.executor.io_driver.clone();
+        Driver::with(|driver| {
             let index = driver.register(&mut source)?;
-
             Ok(Self {
                 source,
                 index,
-                driver,
+                driver: driver.clone(),
                 budgets: [AtomicU8::new(BUDGET), AtomicU8::new(BUDGET)],
             })
         })
-        .expect("Using I/O primitives outside of the runtime context")
     }
 
     pub fn try_io<T>(

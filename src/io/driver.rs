@@ -1,6 +1,7 @@
 use super::waker::{WakerEntry, WakerIndex, WakerStorage};
+use crate::runtime::scheduler::context::Context;
 use mio::event::Source;
-use std::io;
+use std::{io, sync::Arc};
 use try_lock::TryLock;
 
 pub struct Driver {
@@ -22,6 +23,11 @@ impl Driver {
             selector: TryLock::new(selector),
             signal,
         })
+    }
+
+    pub fn with<F>(f: impl FnOnce(&Arc<Self>) -> F) -> F {
+        let context_ref = Context::current();
+        f(&context_ref.as_ref().executor.io_driver)
     }
 
     pub fn notify(&self) {

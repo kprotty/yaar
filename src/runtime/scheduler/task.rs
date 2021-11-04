@@ -1,4 +1,4 @@
-use super::{executor::Executor, thread::Thread};
+use super::{context::Context, executor::Executor};
 use crate::internal::waker::AtomicWaker;
 use std::{
     any::Any,
@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::atomic::{fence, AtomicU8, Ordering},
     sync::Arc,
-    task::{Context, Poll, Wake, Waker},
+    task::{Context as PollContext, Poll, Wake, Waker},
 };
 use try_lock::TryLock;
 
@@ -81,7 +81,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    pub fn spawn(future: F, executor: &Arc<Executor>, thread: Option<&Thread>) -> Arc<Self> {
+    pub fn spawn(future: F, executor: &Arc<Executor>, context: Option<&Context>) -> Arc<Self> {
         let task = Arc::new(Self {
             state: TaskState::new(),
             waker: AtomicWaker::default(),
@@ -90,24 +90,21 @@ where
         });
 
         executor.task_begin();
-
         assert!(task.state.transition_to_scheduled());
-        executor.schedule(task.clone(), thread, false);
+        executor.schedule(task.clone(), context, false);
 
         task
     }
 
     fn schedule(self: Arc<Self>) {
-        let mut task = Some(self);
-        let _ = Thread::try_with(|thread| {
-            let task = task.take().unwrap();
-            thread.executor.schedule(task, Some(thread), false);
-        });
-
-        if let Some(task) = task.take() {
-            let executor = task.executor.clone();
-            executor.schedule(task, None, false);
+        if let Some(context_ref) = Context::try_current() {
+            let context = context_ref.as_ref();
+            context.executor.schedule(self, Some(context), false);
+            return;
         }
+
+        let executor = self.executor.clone();
+        executor.schedule(self, None, false);
     }
 }
 
@@ -130,7 +127,7 @@ where
 }
 
 pub trait TaskRunnable: Send + Sync {
-    fn run(self: Arc<Self>, thread: &Thread);
+    fn run(self: Arc<Self>, context: &Context);
 }
 
 impl<F> TaskRunnable for Task<F>
@@ -138,7 +135,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    fn run(self: Arc<Self>, thread: &Thread) {
+    fn run(self: Arc<Self>, context: &Context) {
         self.state.transition_to_running();
 
         let mut data = self.data.try_lock().unwrap();
@@ -149,7 +146,7 @@ where
 
         let poll_result = catch_unwind(AssertUnwindSafe(|| {
             let waker = Waker::from(self.clone());
-            let mut ctx = Context::from_waker(&waker);
+            let mut ctx = PollContext::from_waker(&waker);
             future.as_mut().poll(&mut ctx)
         }));
 
@@ -161,7 +158,7 @@ where
                 drop(data);
 
                 if !self.state.transition_to_idle() {
-                    thread.executor.schedule(self, Some(thread), true);
+                    context.executor.schedule(self, Some(context), true);
                 }
 
                 return;
@@ -172,17 +169,17 @@ where
         drop(data);
 
         self.waker.wake();
-        thread.executor.task_complete();
+        context.executor.task_complete();
     }
 }
 
 pub trait TaskJoinable<T> {
-    fn poll_join(&self, ctx: &mut Context<'_>) -> Poll<T>;
+    fn poll_join(&self, ctx: &mut PollContext<'_>) -> Poll<T>;
     fn join(&self) -> T;
 }
 
 impl<F: Future> TaskJoinable<F::Output> for Task<F> {
-    fn poll_join(&self, ctx: &mut Context<'_>) -> Poll<F::Output> {
+    fn poll_join(&self, ctx: &mut PollContext<'_>) -> Poll<F::Output> {
         match self.waker.poll(Some(ctx)) {
             Poll::Ready(_) => Poll::Ready(self.join()),
             Poll::Pending => Poll::Pending,

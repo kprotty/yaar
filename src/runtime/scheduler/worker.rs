@@ -1,7 +1,7 @@
 use super::{
+    context::Context,
     queue::{Queue, Runnable, Steal},
     random::RandomGenerator,
-    thread::Thread,
 };
 use std::{hint::spin_loop, mem::replace};
 
@@ -10,29 +10,29 @@ pub struct Worker {
     pub run_queue: Queue,
 }
 
-pub struct WorkerThread<'a> {
-    thread: &'a Thread,
+pub struct WorkerContext<'a> {
+    context: &'a Context,
     tick: usize,
     searching: bool,
     rng: RandomGenerator,
     worker_index: Option<usize>,
 }
 
-impl<'a> WorkerThread<'a> {
-    pub fn run(thread: &'a Thread, worker_index: usize, position: usize) {
-        let mut rng = RandomGenerator::from(position);
+impl<'a> WorkerContext<'a> {
+    pub fn run(context: &'a Context, worker_index: usize) {
+        let mut rng = RandomGenerator::new();
         let tick = rng.gen();
 
-        let mut thread_ref = Self {
-            thread,
+        let mut worker_context = Self {
+            context,
             tick,
             searching: false,
             rng,
             worker_index: None,
         };
 
-        thread_ref.transition_to_running(worker_index);
-        thread_ref.run_until_shutdown();
+        worker_context.transition_to_running(worker_index);
+        worker_context.run_until_shutdown();
     }
 
     fn transition_to_running(&mut self, worker_index: usize) {
@@ -42,20 +42,20 @@ impl<'a> WorkerThread<'a> {
         assert!(!self.searching);
         self.searching = true;
 
-        let producer = self.thread.executor.workers[worker_index]
+        let producer = self.context.executor.workers[worker_index]
             .run_queue
             .swap_producer(None)
             .unwrap();
 
-        self.thread
+        self.context
             .producer
             .replace(Some(producer))
             .map(|_| unreachable!());
     }
 
     fn transition_to_idle(&mut self, worker_index: usize) -> bool {
-        let producer = self.thread.producer.take().unwrap();
-        self.thread.executor.workers[worker_index]
+        let producer = self.context.producer.take().unwrap();
+        self.context.executor.workers[worker_index]
             .run_queue
             .swap_producer(Some(producer))
             .map(|_| unreachable!());
@@ -64,7 +64,7 @@ impl<'a> WorkerThread<'a> {
         self.worker_index = None;
 
         let was_searching = replace(&mut self.searching, false);
-        self.thread
+        self.context
             .executor
             .search_failed(worker_index, was_searching)
     }
@@ -72,11 +72,11 @@ impl<'a> WorkerThread<'a> {
     fn run_until_shutdown(&mut self) {
         while let Some(runnable) = self.poll() {
             if replace(&mut self.searching, false) {
-                self.thread.executor.search_discovered();
+                self.context.executor.search_discovered();
             }
 
             self.tick = self.tick.wrapping_add(1);
-            runnable.run(self.thread);
+            runnable.run(self.context);
         }
     }
 
@@ -88,14 +88,14 @@ impl<'a> WorkerThread<'a> {
                 }
 
                 if self.transition_to_idle(worker_index) {
-                    if let Some(worker_index) = self.thread.executor.search_retry() {
+                    if let Some(worker_index) = self.context.executor.search_retry() {
                         self.transition_to_running(worker_index);
                         continue;
                     }
                 }
             }
 
-            match self.thread.executor.thread_pool.wait() {
+            match self.context.executor.thread_pool.wait() {
                 Ok(worker_index) => self.transition_to_running(worker_index),
                 Err(()) => return None,
             }
@@ -103,9 +103,9 @@ impl<'a> WorkerThread<'a> {
     }
 
     fn pop(&mut self, worker_index: usize) -> Option<Runnable> {
-        let producer = self.thread.producer.borrow();
+        let producer = self.context.producer.borrow();
         let producer = producer.as_ref().unwrap();
-        let executor = &self.thread.executor;
+        let executor = &self.context.executor;
 
         let be_fair = self.tick % 61 == 0;
         if be_fair {

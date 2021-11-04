@@ -1,28 +1,31 @@
 const SIZE: usize = 100_000_000;
 
 pub fn main() {
-    yaar::runtime::Builder::new().block_on(async move {
-        println!("filling");
-        let arr = (0..SIZE)
-            .map(|i| i.try_into().unwrap())
-            .collect::<Vec<i32>>()
-            .into_boxed_slice();
+    yaar::runtime::Builder::new()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            println!("filling");
+            let arr = (0..SIZE)
+                .map(|i| i.try_into().unwrap())
+                .collect::<Vec<i32>>()
+                .into_boxed_slice();
 
-        let mut arr = Box::leak(arr);
-        let arr_ptr = arr.as_ptr() as usize;
+            let mut arr = Box::leak(arr);
+            let arr_ptr = arr.as_ptr() as usize;
 
-        println!("shuffling");
-        shuffle(&mut arr);
+            println!("shuffling");
+            shuffle(&mut arr);
 
-        println!("running");
-        let start = std::time::Instant::now();
-        quick_sort(arr).await;
+            println!("running");
+            let start = std::time::Instant::now();
+            quick_sort(arr).await;
 
-        println!("took {:?}", start.elapsed());
-        assert!(verify(unsafe {
-            std::slice::from_raw_parts(arr_ptr as *const i32, SIZE)
-        }));
-    });
+            println!("took {:?}", start.elapsed());
+            assert!(verify(unsafe {
+                std::slice::from_raw_parts(arr_ptr as *const i32, SIZE)
+            }));
+        });
 }
 
 fn verify(arr: &[i32]) -> bool {

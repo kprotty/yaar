@@ -1,7 +1,9 @@
 use super::{
+    config::Config,
+    context::Context,
     queue::{Injector, Runnable},
     random::RandomIterSource,
-    thread::{Thread, ThreadPool},
+    thread::ThreadPool,
     worker::Worker,
 };
 use crate::io::driver::Driver as IoDriver;
@@ -12,6 +14,7 @@ use std::{
     num::NonZeroUsize,
     sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
+    time::Duration,
 };
 
 struct IdleQueue {
@@ -64,19 +67,16 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new(worker_threads: Option<NonZeroUsize>) -> io::Result<Self> {
+    pub fn from(config: Config) -> io::Result<Self> {
         let io_driver = IoDriver::new()?;
-        let worker_threads = worker_threads
-            .or_else(|| NonZeroUsize::new(num_cpus::get()))
-            .or(NonZeroUsize::new(1))
-            .unwrap();
+        let worker_threads = config.worker_threads.unwrap();
 
         Ok(Self {
             idle: IdleQueue::from(worker_threads),
             tasks: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
             io_driver: Arc::new(io_driver),
-            thread_pool: ThreadPool::new(worker_threads),
+            thread_pool: ThreadPool::from(config),
             rng_iter_source: RandomIterSource::from(worker_threads),
             injector: Injector::default(),
             workers: (0..worker_threads.get())
@@ -85,9 +85,16 @@ impl Executor {
         })
     }
 
-    pub fn schedule(self: &Arc<Self>, runnable: Runnable, thread: Option<&Thread>, be_fair: bool) {
-        if let Some(thread) = thread {
-            if let Some(producer) = thread.producer.borrow().as_ref() {
+    pub fn schedule(
+        self: &Arc<Self>,
+        runnable: Runnable,
+        context: Option<&Context>,
+        be_fair: bool,
+    ) {
+        if let Some(context) = context {
+            assert!(Arc::ptr_eq(self, &context.executor));
+
+            if let Some(producer) = context.producer.borrow().as_ref() {
                 producer.push(runnable, be_fair);
                 self.notify();
                 return;
@@ -130,6 +137,14 @@ impl Executor {
         assert_ne!(searching, 0);
     }
 
+    pub fn shutdown(&self) {
+        self.thread_pool.shutdown();
+    }
+
+    pub fn join(&self, _timeout: Option<Duration>) {
+        // unimplemented!("TODO: join()")
+    }
+
     pub fn task_begin(&self) {
         let tasks = self.tasks.fetch_add(1, Ordering::Relaxed);
         assert_ne!(tasks, usize::MAX);
@@ -140,7 +155,7 @@ impl Executor {
         assert_ne!(tasks, 0);
 
         if tasks == 1 {
-            self.thread_pool.shutdown();
+            self.shutdown();
         }
     }
 
