@@ -46,7 +46,7 @@ struct WakerAllocator {
     available: VecDeque<WakerIndex>,
 }
 
-pub struct WakerStorage {
+pub(super) struct WakerStorage {
     array: WakerArrayRef,
     allocator: Mutex<WakerAllocator>,
 }
