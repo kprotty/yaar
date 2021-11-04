@@ -6,59 +6,66 @@ use std::{
     mem::{drop, replace},
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     pin::Pin,
-    sync::atomic::{fence, AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
     sync::Arc,
     task::{Context as PollContext, Poll, Wake, Waker},
 };
 use try_lock::TryLock;
+
+const TASK_IDLE: u8 = 0;
+const TASK_SCHEDULED: u8 = 1;
+const TASK_RUNNING: u8 = 2;
+const TASK_NOTIFIED: u8 = 3;
 
 struct TaskState {
     state: AtomicU8,
 }
 
 impl TaskState {
-    const IDLE: u8 = 0;
-    const SCHEDULED: u8 = 1;
-    const RUNNING: u8 = 2;
-    const NOTIFIED: u8 = 3;
-
     fn new() -> Self {
         Self {
-            state: AtomicU8::new(Self::IDLE),
+            state: AtomicU8::new(TASK_IDLE),
         }
     }
 
     fn transition_to_scheduled(&self) -> bool {
         self.state
             .fetch_update(Ordering::Release, Ordering::Relaxed, |state| match state {
-                Self::IDLE => Some(Self::SCHEDULED),
-                Self::RUNNING => Some(Self::NOTIFIED),
+                TASK_IDLE => Some(TASK_SCHEDULED),
+                TASK_RUNNING => Some(TASK_NOTIFIED),
                 _ => None,
             })
-            .map(|state| state == Self::IDLE)
+            .map(|state| state == TASK_IDLE)
             .unwrap_or(false)
     }
 
-    fn transition_to_running(&self) {
-        assert_eq!(self.state.load(Ordering::Relaxed), Self::SCHEDULED);
-        self.state.store(Self::RUNNING, Ordering::Relaxed);
+    fn transition_to_running(&self) -> bool {
+        match self.state.load(Ordering::Acquire) {
+            TASK_SCHEDULED => {},
+            TASK_IDLE => return false,
+            _ => unreachable!("Task transitioned to running with invalid state"),
+        }
+
+        self.state.store(TASK_RUNNING, Ordering::Relaxed);
+        true
     }
 
     fn transition_to_idle(&self) -> bool {
         match self.state.compare_exchange(
-            Self::RUNNING,
-            Self::IDLE,
+            TASK_RUNNING,
+            TASK_IDLE,
             Ordering::Release,
             Ordering::Relaxed,
         ) {
             Ok(_) => true,
-            Err(state) => {
-                assert_eq!(state, Self::NOTIFIED);
-                fence(Ordering::Acquire);
-                self.state.store(Self::RUNNING, Ordering::Relaxed);
-                false
-            }
+            Err(TASK_NOTIFIED) => false,
+            Err(_) => unreachable!("Task transitioned to idle with invalid state"),
         }
+    }
+
+    fn transition_to_scheduled_from_notified(&self) {
+        assert_eq!(self.state.load(Ordering::Acquire), TASK_NOTIFIED);
+        self.state.store(TASK_SCHEDULED, Ordering::Relaxed);
     }
 }
 
@@ -136,7 +143,8 @@ where
     F::Output: Send + 'static,
 {
     fn run(self: Arc<Self>, context: &Context) {
-        self.state.transition_to_running();
+        let is_running = self.state.transition_to_running();
+        assert!(is_running);
 
         let mut data = self.data.try_lock().unwrap();
         let mut future = match replace(&mut *data, TaskData::Polling) {
@@ -158,6 +166,7 @@ where
                 drop(data);
 
                 if !self.state.transition_to_idle() {
+                    self.state.transition_to_scheduled_from_notified();
                     context.executor.schedule(self, Some(context), true);
                 }
 
