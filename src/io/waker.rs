@@ -9,6 +9,7 @@ pub enum WakerKind {
     Write = 1,
 }
 
+#[derive(Copy, Clone, Debug)]
 pub struct WakerIndex {
     block: u16,
     entry: u16,
@@ -33,7 +34,7 @@ const CHUNK_SIZE: usize = 64 * 1024;
 const NUM_ENTRIES: usize = CHUNK_SIZE / size_of::<WakerEntry>();
 const NUM_BLOCKS: usize = CHUNK_SIZE / size_of::<WakerBlockRef>();
 
-type WakerEntry = [AtomicWaker; 2];
+pub type WakerEntry = [AtomicWaker; 2];
 type WakerBlock = [WakerEntry; NUM_ENTRIES];
 type WakerArray = [WakerBlockRef; NUM_BLOCKS];
 
