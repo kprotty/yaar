@@ -88,7 +88,7 @@ where
     ) -> Arc<Self> {
         let task = Arc::new(Self {
             state: TaskState::new(),
-            waker: AtomicWaker::new(),
+            waker: AtomicWaker::default(),
             data: TryLock::new(TaskData::Pending(Box::pin(future))),
             executor: executor.clone(),
         });
