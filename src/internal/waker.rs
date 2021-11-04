@@ -18,6 +18,13 @@ pub struct AtomicWaker {
 }
 
 impl AtomicWaker {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(EMPTY),
+            waker: parking_lot::const_mutex(None),
+        }
+    }
+
     pub fn poll(&self, ctx: Option<&mut Context<'_>>) -> Poll<()> {
         let state = self.state.load(Ordering::Acquire);
         if state & NOTIFIED != 0 {
@@ -28,42 +35,38 @@ impl AtomicWaker {
             AWOKEN => {
                 self.state.store(EMPTY | NOTIFIED, Ordering::Relaxed);
                 return Poll::Ready(());
-            },
-            EMPTY | WAITING => {},
+            }
+            EMPTY | WAITING => {}
             UPDATING => unreachable!("AtomicWaker being polled by multiple threads"),
             _ => unreachable!("AtomicWaker being polled with an invalid state"),
         }
 
         if let Some(ctx) = ctx {
-            if let Err(state) = self.state.compare_exchange(
-                state,
-                UPDATING,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
+            if let Err(state) =
+                self.state
+                    .compare_exchange(state, UPDATING, Ordering::Acquire, Ordering::Acquire)
+            {
                 assert_eq!(state, AWOKEN | NOTIFIED);
                 self.state.store(EMPTY | NOTIFIED, Ordering::Relaxed);
                 return Poll::Ready(());
             }
-    
+
             {
                 let mut waker = self.waker.try_lock().unwrap();
                 let will_wake = waker
                     .as_ref()
                     .map(|waker| ctx.waker().will_wake(waker))
                     .unwrap_or(false);
-    
+
                 if !will_wake {
                     *waker = Some(ctx.waker().clone());
                 }
             }
-    
-            if let Err(state) = self.state.compare_exchange(
-                UPDATING,
-                WAITING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+
+            if let Err(state) =
+                self.state
+                    .compare_exchange(UPDATING, WAITING, Ordering::AcqRel, Ordering::Acquire)
+            {
                 assert_eq!(state, AWOKEN | NOTIFIED);
                 *self.waker.try_lock().unwrap() = None;
                 self.state.store(EMPTY | NOTIFIED, Ordering::Relaxed);
@@ -77,10 +80,12 @@ impl AtomicWaker {
     #[cold]
     pub fn wake(&self) {
         self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |state| match state & 0b11 {
-                AWOKEN => None,
-                EMPTY | UPDATING | WAITING => Some(AWOKEN | NOTIFIED),
-                _ => unreachable!("AtomicWaker waking with invalid state"),
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |state| {
+                match state & 0b11 {
+                    AWOKEN => None,
+                    EMPTY | UPDATING | WAITING => Some(AWOKEN | NOTIFIED),
+                    _ => unreachable!("AtomicWaker waking with invalid state"),
+                }
             })
             .ok()
             .and_then(|state| match state & 0b11 {

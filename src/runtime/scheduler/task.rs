@@ -1,5 +1,5 @@
-use crate::internal::waker::AtomicWaker;
 use super::{executor::Executor, thread::Thread};
+use crate::internal::waker::AtomicWaker;
 use std::{
     any::Any,
     future::Future,
@@ -81,11 +81,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    pub fn spawn(
-        future: F,
-        executor: &Arc<Executor>,
-        thread: Option<&Thread>,
-    ) -> Arc<Self> {
+    pub fn spawn(future: F, executor: &Arc<Executor>, thread: Option<&Thread>) -> Arc<Self> {
         let task = Arc::new(Self {
             state: TaskState::new(),
             waker: AtomicWaker::default(),
@@ -97,7 +93,7 @@ where
 
         assert!(task.state.transition_to_scheduled());
         executor.schedule(task.clone(), thread, false);
-        
+
         task
     }
 

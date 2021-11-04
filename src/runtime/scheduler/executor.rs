@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     num::NonZeroUsize,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence},
+    sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
 };
 
