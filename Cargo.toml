@@ -27,6 +27,15 @@ path = "examples/qsort/rayon.rs"
 name = "tokio_qsort"
 path = "examples/qsort/tokio.rs"
 
+[[example]]
+name = "yaar_http"
+path = "examples/http/yaar.rs"
+
+[[example]]
+name = "tokio_http"
+path = "examples/http/tokio.rs"
+
 [dev-dependencies]
 rayon = "1.5"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
