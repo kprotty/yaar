@@ -97,15 +97,17 @@ impl AtomicWaker {
     }
 
     pub fn reset(&self) {
-        match self.state.compare_exchange(
+        if let Err(state) = self.state.compare_exchange(
             EMPTY | NOTIFIED,
             EMPTY,
             Ordering::Release,
             Ordering::Relaxed,
         ) {
-            Ok(_) => {}
-            Err(AWOKEN | NOTIFIED) => {}
-            Err(_) => unreachable!("AtomicWaker reset with invalid state"),
+            assert_eq!(
+                state,
+                AWOKEN | NOTIFIED,
+                "AtomicWaker reset with invalid state"
+            );
         }
     }
 }
