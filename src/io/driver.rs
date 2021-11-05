@@ -1,10 +1,11 @@
 use super::waker::{WakerEntry, WakerIndex, WakerKind, WakerStorage};
 use crate::runtime::scheduler::context::Context;
 use mio::event::Source;
-use std::{io, sync::Arc, time::Duration};
+use std::{io, sync::Arc, time::Duration, sync::atomic::{AtomicUsize, Ordering}};
 use try_lock::{Locked, TryLock};
 
 pub struct Driver {
+    pending: AtomicUsize,
     waker_storage: WakerStorage,
     registry: mio::Registry,
     selector: TryLock<mio::Poll>,
@@ -18,6 +19,7 @@ impl Driver {
         let signal = mio::Waker::new(&registry, mio::Token(usize::MAX))?;
 
         Ok(Self {
+            pending: AtomicUsize::new(0),
             waker_storage: WakerStorage::new(),
             registry,
             selector: TryLock::new(selector),
@@ -30,6 +32,10 @@ impl Driver {
     }
 
     pub fn try_poll(&self) -> Option<PollGuard<'_>> {
+        if self.pending.load(Ordering::SeqCst) == 0 {
+            return None;
+        }
+
         self.selector
             .try_lock()
             .map(|selector| PollGuard { selector })
@@ -67,6 +73,16 @@ impl Driver {
 
     pub(super) fn with_wakers<F>(&self, index: WakerIndex, f: impl FnOnce(&WakerEntry) -> F) -> F {
         self.waker_storage.with(index, f)
+    }
+
+    pub(super) fn io_pending_begin(&self) {
+        let pending = self.pending.fetch_add(1, Ordering::SeqCst);
+        assert_ne!(pending, usize::MAX);
+    }
+
+    pub(super) fn io_pending_complete(&self) {
+        let pending = self.pending.fetch_sub(1, Ordering::SeqCst);
+        assert_ne!(pending, 0);
     }
 }
 

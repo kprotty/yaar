@@ -118,16 +118,16 @@ impl<'a> WorkerContext<'a> {
 
         let be_fair = self.tick % 61 == 0;
         if be_fair {
-            if let Some(runnable) = self.poll_io(Some(Duration::ZERO)) {
-                return Some(runnable);
-            }
-
             if let Some(runnable) = producer.consume(&executor.injector).success() {
                 return Some(runnable);
             }
         }
 
         if let Some(runnable) = producer.pop(be_fair) {
+            return Some(runnable);
+        }
+
+        if let Some(runnable) = self.poll_io(Some(Duration::ZERO)) {
             return Some(runnable);
         }
 
@@ -193,8 +193,10 @@ impl<'a> WorkerContext<'a> {
                 runnable = self.poll_ready.pop_front();
             }
 
-            let runnables = self.poll_ready.drain(..);
-            executor.inject(runnables);
+            if self.poll_ready.len() > 0 {
+                let runnables = self.poll_ready.drain(..);
+                executor.inject(runnables);
+            }
         }
 
         runnable
