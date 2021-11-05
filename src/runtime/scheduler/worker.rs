@@ -118,16 +118,16 @@ impl<'a> WorkerContext<'a> {
 
         let be_fair = self.tick % 61 == 0;
         if be_fair {
+            if let Some(runnable) = self.poll_io(Some(Duration::ZERO)) {
+                return Some(runnable);
+            }
+
             if let Some(runnable) = producer.consume(&executor.injector).success() {
                 return Some(runnable);
             }
         }
 
         if let Some(runnable) = producer.pop(be_fair) {
-            return Some(runnable);
-        }
-
-        if let Some(runnable) = self.poll_io(Some(Duration::ZERO)) {
             return Some(runnable);
         }
 
