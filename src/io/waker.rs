@@ -24,8 +24,8 @@ impl Into<usize> for WakerIndex {
 impl From<usize> for WakerIndex {
     fn from(value: usize) -> Self {
         Self {
-            block: (value & 0xffff).try_into().unwrap(),
-            entry: ((value >> 16) & 0xffff).try_into().unwrap(),
+            block: ((value >> 16) & 0xffff).try_into().unwrap(),
+            entry: (value & 0xffff).try_into().unwrap(),
         }
     }
 }
