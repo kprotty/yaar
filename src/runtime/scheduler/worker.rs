@@ -19,7 +19,7 @@ pub struct WorkerContext<'a> {
 }
 
 impl<'a> WorkerContext<'a> {
-    pub fn run(context: &'a Context, worker_index: usize) {
+    pub fn new(context: &'a Context, worker_index: Option<usize>) -> Self {
         let mut rng = RandomGenerator::new();
         let tick = rng.gen();
 
@@ -31,8 +31,11 @@ impl<'a> WorkerContext<'a> {
             worker_index: None,
         };
 
-        worker_context.transition_to_running(worker_index);
-        worker_context.run_until_shutdown();
+        if let Some(worker_index) = worker_index {
+            worker_context.transition_to_running(worker_index);
+        }
+
+        worker_context
     }
 
     fn transition_to_running(&mut self, worker_index: usize) {
@@ -69,8 +72,8 @@ impl<'a> WorkerContext<'a> {
             .search_failed(worker_index, was_searching)
     }
 
-    fn run_until_shutdown(&mut self) {
-        while let Some(runnable) = self.poll() {
+    pub fn poll<F: Future>(&mut self, future: Pin<&mut F>) -> Result<Poll<F::Output>> {
+        while let Some(runnable) = self.poll(future.as_mut()) {
             if replace(&mut self.searching, false) {
                 self.context.executor.search_discovered();
             }
@@ -80,25 +83,23 @@ impl<'a> WorkerContext<'a> {
         }
     }
 
-    fn poll(&mut self) -> Option<Runnable> {
-        loop {
-            if let Some(worker_index) = self.worker_index {
-                if let Some(runnable) = self.pop(worker_index) {
-                    return Some(runnable);
-                }
-
-                if self.transition_to_idle(worker_index) {
-                    if let Some(worker_index) = self.context.executor.search_retry() {
-                        self.transition_to_running(worker_index);
-                        continue;
-                    }
-                }
+    fn poll_runnable(&mut self) -> Result<Option<Runnable>, ()> {
+        if let Some(worker_index) = self.worker_index {
+            if let Some(runnable) = self.pop(worker_index) {
+                return Ok(Some(runnable));
             }
 
-            match self.context.executor.thread_pool.wait() {
-                Ok(worker_index) => self.transition_to_running(worker_index),
-                Err(()) => return None,
+            if self.transition_to_idle(worker_index) {
+                if let Some(worker_index) = self.context.executor.search_retry() {
+                    self.transition_to_running(worker_index);
+                    continue;
+                }
             }
+        }
+
+        match self.context.executor.thread_pool.wait() {
+            Ok(worker_index) => self.transition_to_running(worker_index),
+            Err(()) => return None,
         }
     }
 
