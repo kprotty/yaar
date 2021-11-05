@@ -3,7 +3,8 @@ use super::{
     queue::{Queue, Runnable, Steal},
     random::RandomGenerator,
 };
-use std::{hint::spin_loop, mem::replace};
+use crate::io::driver::PollEvents;
+use std::{collections::VecDeque, hint::spin_loop, mem::replace, time::Duration};
 
 #[derive(Default)]
 pub struct Worker {
@@ -16,6 +17,8 @@ pub struct WorkerContext<'a> {
     searching: bool,
     rng: RandomGenerator,
     worker_index: Option<usize>,
+    poll_events: PollEvents,
+    poll_ready: VecDeque<Runnable>,
 }
 
 impl<'a> WorkerContext<'a> {
@@ -29,6 +32,8 @@ impl<'a> WorkerContext<'a> {
             searching: false,
             rng,
             worker_index: None,
+            poll_events: PollEvents::new(),
+            poll_ready: VecDeque::new(),
         };
 
         worker_context.transition_to_running(worker_index);
@@ -95,6 +100,10 @@ impl<'a> WorkerContext<'a> {
                 }
             }
 
+            if let Some(runnable) = self.poll_io(None) {
+                return Some(runnable);
+            }
+
             match self.context.executor.thread_pool.wait() {
                 Ok(worker_index) => self.transition_to_running(worker_index),
                 Err(()) => return None,
@@ -109,6 +118,10 @@ impl<'a> WorkerContext<'a> {
 
         let be_fair = self.tick % 61 == 0;
         if be_fair {
+            if let Some(runnable) = self.poll_io(Some(Duration::ZERO)) {
+                return Some(runnable);
+            }
+
             if let Some(runnable) = producer.consume(&executor.injector).success() {
                 return Some(runnable);
             }
@@ -148,5 +161,42 @@ impl<'a> WorkerContext<'a> {
         }
 
         None
+    }
+
+    fn poll_io(&mut self, timeout: Option<Duration>) -> Option<Runnable> {
+        let executor = &self.context.executor;
+        let mut poll_guard = match executor.io_driver.try_poll() {
+            Some(guard) => guard,
+            None => return None,
+        };
+
+        poll_guard.poll(&mut self.poll_events, timeout);
+        drop(poll_guard);
+
+        let io_ready = replace(&mut self.poll_ready, VecDeque::new());
+        *self.context.intercept.borrow_mut() = Some(io_ready);
+
+        self.poll_events.process(&executor.io_driver);
+
+        let io_ready = self.context.intercept.borrow_mut().take().unwrap();
+        drop(replace(&mut self.poll_ready, io_ready));
+
+        let mut runnable = None;
+        if self.poll_ready.len() > 0 {
+            if self.worker_index.is_none() {
+                if let Some(worker_index) = executor.search_retry() {
+                    self.transition_to_running(worker_index);
+                }
+            }
+
+            if self.worker_index.is_some() {
+                runnable = self.poll_ready.pop_front();
+            }
+
+            let runnables = self.poll_ready.drain(..);
+            executor.inject(runnables);
+        }
+
+        runnable
     }
 }

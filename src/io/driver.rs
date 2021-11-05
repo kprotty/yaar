@@ -30,7 +30,9 @@ impl Driver {
     }
 
     pub fn try_poll(&self) -> Option<PollGuard<'_>> {
-        self.selector.try_lock().map(|selector| PollGuard { selector })
+        self.selector
+            .try_lock()
+            .map(|selector| PollGuard { selector })
     }
 
     pub(super) fn with<F>(f: impl FnOnce(&Arc<Self>) -> F) -> F {
@@ -82,15 +84,13 @@ pub struct PollEvents {
     events: mio::event::Events,
 }
 
-impl Default for PollEvents {
-    fn default() -> Self {
+impl PollEvents {
+    pub fn new() -> Self {
         Self {
             events: mio::event::Events::with_capacity(256),
         }
     }
-}
 
-impl PollEvents {
     pub fn process(&self, driver: &Driver) {
         for event in self.events.iter() {
             let index = match event.token() {

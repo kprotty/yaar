@@ -41,7 +41,7 @@ impl TaskState {
 
     fn transition_to_running(&self) -> bool {
         match self.state.load(Ordering::Acquire) {
-            TASK_SCHEDULED => {},
+            TASK_SCHEDULED => {}
             TASK_IDLE => return false,
             _ => unreachable!("Task transitioned to running with invalid state"),
         }
