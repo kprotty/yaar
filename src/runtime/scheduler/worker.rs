@@ -100,8 +100,11 @@ impl<'a> WorkerContext<'a> {
                 }
             }
 
-            if let Some(runnable) = self.poll_io(None) {
-                return Some(runnable);
+            if let Ok(runnable) = self.poll_io(None) {
+                match runnable {
+                    Some(runnable) => return Some(runnable),
+                    None => continue,
+                }
             }
 
             match self.context.executor.thread_pool.wait() {
@@ -118,7 +121,7 @@ impl<'a> WorkerContext<'a> {
 
         let be_fair = self.tick % 61 == 0;
         if be_fair {
-            if let Some(runnable) = self.poll_io(Some(Duration::ZERO)) {
+            if let Ok(Some(runnable)) = self.poll_io(Some(Duration::ZERO)) {
                 return Some(runnable);
             }
 
@@ -163,11 +166,11 @@ impl<'a> WorkerContext<'a> {
         None
     }
 
-    fn poll_io(&mut self, timeout: Option<Duration>) -> Option<Runnable> {
+    fn poll_io(&mut self, timeout: Option<Duration>) -> Result<Option<Runnable>, ()> {
         let executor = &self.context.executor;
         let mut poll_guard = match executor.io_driver.try_poll() {
             Some(guard) => guard,
-            None => return None,
+            None => return Err(()),
         };
 
         poll_guard.poll(&mut self.poll_events, timeout);
@@ -199,6 +202,6 @@ impl<'a> WorkerContext<'a> {
             }
         }
 
-        runnable
+        Ok(runnable)
     }
 }
