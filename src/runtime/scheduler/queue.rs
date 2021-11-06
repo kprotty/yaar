@@ -1,13 +1,31 @@
 use super::task::TaskRunnable;
 use crossbeam_deque::{
-    Injector as QueueInjector, Steal as QueueSteal, Stealer as QueueStealer, Worker as QueueWorker,
+    Injector as QueueInjector, 
+    Steal as QueueSteal, 
+    Stealer as QueueStealer, 
+    Worker as QueueWorker
 };
 use std::{cell::Cell, hint::spin_loop, mem::replace, sync::Arc};
 use try_lock::TryLock;
 
 pub type Runnable = Arc<dyn TaskRunnable>;
-
 pub type Steal = QueueSteal<Runnable>;
+
+#[derive(Default)]
+pub struct Injector {
+    injector: QueueInjector<Runnable>,
+}
+
+impl Injector {
+    pub fn push(&self, runnable: Runnable) {
+        self.injector.push(runnable);
+    }
+
+    pub fn pending(&self) -> bool {
+        !self.injector.is_empty()
+    }
+}
+
 
 pub struct Queue {
     stealer: QueueStealer<Runnable>,
@@ -16,9 +34,9 @@ pub struct Queue {
 
 impl Default for Queue {
     fn default() -> Self {
-        let producer = Producer::default();
+        let producer = Producer::new();
         let stealer = producer.stealer.clone();
-
+        
         Self {
             stealer,
             producer: TryLock::new(Some(producer)),
@@ -33,33 +51,14 @@ impl Queue {
     }
 }
 
-#[derive(Default)]
-pub struct Injector {
-    injector: QueueInjector<Runnable>,
-}
-
-impl Injector {
-    pub fn push(&self, runnable: Runnable) {
-        self.injector.push(runnable);
-    }
-
-    pub fn inject(&self, runnables: impl Iterator<Item = Runnable>) {
-        runnables.for_each(|runnable| self.push(runnable));
-    }
-
-    pub fn pending(&self) -> bool {
-        !self.injector.is_empty()
-    }
-}
-
 pub struct Producer {
     be_fair: Cell<bool>,
     worker: QueueWorker<Runnable>,
     stealer: QueueStealer<Runnable>,
 }
 
-impl Default for Producer {
-    fn default() -> Self {
+impl Producer {
+    fn new() -> Self {
         let worker = QueueWorker::new_lifo();
         let stealer = worker.stealer();
 
@@ -69,9 +68,7 @@ impl Default for Producer {
             stealer,
         }
     }
-}
 
-impl Producer {
     pub fn push(&self, runnable: Runnable, be_fair: bool) {
         self.worker.push(runnable);
         if be_fair {

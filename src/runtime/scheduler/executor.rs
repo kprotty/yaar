@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     io,
+    iter,
     num::NonZeroUsize,
     sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
@@ -85,12 +86,6 @@ impl Executor {
         })
     }
 
-    pub fn inject(self: &Arc<Self>, runnables: impl Iterator<Item = Runnable>) {
-        self.injector.inject(runnables);
-        fence(Ordering::SeqCst);
-        self.notify();
-    }
-
     pub fn schedule(
         self: &Arc<Self>,
         runnable: Runnable,
@@ -112,7 +107,11 @@ impl Executor {
             }
         }
 
-        self.injector.push(runnable);
+        self.inject(iter::once(runnable))
+    }
+
+    pub fn inject(self: &Arc<Self>, runnables: impl Iterator<Item = Runnable>) {
+        runnables.for_each(|runnable| self.injector.push(runnable));
         fence(Ordering::SeqCst);
         self.notify();
     }
