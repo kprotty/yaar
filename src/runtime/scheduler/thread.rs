@@ -38,6 +38,7 @@ impl ThreadPool {
 
         if state.notified.len() < state.idle {
             state.notified.push_back(worker_index);
+            drop(state);
             self.condvar.notify_one();
             return Ok(());
         }
