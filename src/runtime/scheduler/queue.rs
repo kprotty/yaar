@@ -2,12 +2,7 @@ use super::task::TaskRunnable;
 use crossbeam_deque::{
     Injector as QueueInjector, Steal as QueueSteal, Stealer as QueueStealer, Worker as QueueWorker,
 };
-use std::{
-    cell::Cell,
-    hint::spin_loop,
-    mem::{replace},
-    sync::Arc,
-};
+use std::{cell::Cell, hint::spin_loop, mem::replace, sync::Arc};
 use try_lock::TryLock;
 
 pub type Runnable = Arc<dyn TaskRunnable>;

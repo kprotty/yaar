@@ -139,7 +139,7 @@ impl<'a> WorkerContext<'a> {
             if let Ok(Some(runnable)) = self.poll_io(Some(Duration::ZERO)) {
                 return Some(runnable);
             }
-            
+
             for _attempt in 0..32 {
                 let mut was_contended = match producer.consume(&executor.injector) {
                     Steal::Success(runnable) => return Some(runnable),

@@ -8,7 +8,7 @@ use std::{
     hint::spin_loop,
     io,
     pin::Pin,
-    sync::atomic::{AtomicU8, AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -65,7 +65,7 @@ impl<S: Source> Pollable<S> {
                 }
                 return Poll::Pending;
             }
-            
+
             if is_pending {
                 pending.store(false, Ordering::Relaxed);
                 self.driver.io_pending_complete();
