@@ -2,13 +2,10 @@ use super::task::TaskRunnable;
 use crossbeam_deque::{
     Injector as QueueInjector, Steal as QueueSteal, Stealer as QueueStealer, Worker as QueueWorker,
 };
-use parking_lot::Mutex;
 use std::{
-    cell::{Cell, RefCell},
-    collections::VecDeque,
+    cell::Cell,
     hint::spin_loop,
-    mem::{drop, replace, swap},
-    sync::atomic::{AtomicBool, Ordering},
+    mem::{replace},
     sync::Arc,
 };
 use try_lock::TryLock;
@@ -44,8 +41,6 @@ impl Queue {
 #[derive(Default)]
 pub struct Injector {
     injector: QueueInjector<Runnable>,
-    batch_pending: AtomicBool,
-    batch: Mutex<VecDeque<Runnable>>,
 }
 
 impl Injector {
@@ -54,19 +49,16 @@ impl Injector {
     }
 
     pub fn inject(&self, runnables: impl Iterator<Item = Runnable>) {
-        let mut batch = self.batch.lock();
-        batch.extend(runnables);
-        self.batch_pending.store(batch.len() > 0, Ordering::Relaxed);
+        runnables.for_each(|runnable| self.push(runnable));
     }
 
     pub fn pending(&self) -> bool {
-        !self.injector.is_empty() || self.batch_pending.load(Ordering::SeqCst)
+        !self.injector.is_empty()
     }
 }
 
 pub struct Producer {
     be_fair: Cell<bool>,
-    batch: RefCell<VecDeque<Runnable>>,
     worker: QueueWorker<Runnable>,
     stealer: QueueStealer<Runnable>,
 }
@@ -78,7 +70,6 @@ impl Default for Producer {
 
         Self {
             be_fair: Cell::new(false),
-            batch: RefCell::new(VecDeque::new()),
             worker,
             stealer,
         }
@@ -113,39 +104,6 @@ impl Producer {
     }
 
     pub fn consume(&self, injector: &Injector) -> Steal {
-        let result = match injector.injector.steal_batch_and_pop(&self.worker) {
-            Steal::Success(runnable) => return Steal::Success(runnable),
-            s => s,
-        };
-
-        if !injector.batch_pending.load(Ordering::SeqCst) {
-            return result;
-        }
-
-        let mut injector_batch = match injector.batch.try_lock() {
-            Some(guard) => guard,
-            None => return Steal::Retry,
-        };
-
-        if !injector.batch_pending.load(Ordering::Relaxed) {
-            return result;
-        }
-
-        let mut batch = self.batch.borrow_mut();
-        assert_eq!(batch.len(), 0);
-
-        swap(&mut *batch, &mut *injector_batch);
-        injector.batch_pending.store(false, Ordering::Relaxed);
-        drop(injector_batch);
-
-        let runnable = batch.pop_front();
-        batch
-            .drain(..)
-            .for_each(|runnable| self.worker.push(runnable));
-
-        match runnable {
-            Some(runnable) => Steal::Success(runnable),
-            None => result,
-        }
+        injector.injector.steal_batch_and_pop(&self.worker)
     }
 }

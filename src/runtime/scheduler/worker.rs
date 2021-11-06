@@ -136,7 +136,11 @@ impl<'a> WorkerContext<'a> {
 
         self.searching = self.searching || executor.search_begin();
         if self.searching {
-            for _retries in 0..32 {
+            if let Ok(Some(runnable)) = self.poll_io(Some(Duration::ZERO)) {
+                return Some(runnable);
+            }
+            
+            for _attempt in 0..32 {
                 let mut was_contended = match producer.consume(&executor.injector) {
                     Steal::Success(runnable) => return Some(runnable),
                     Steal::Empty => false,
