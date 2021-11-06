@@ -140,6 +140,7 @@ impl<'a> WorkerContext<'a> {
                 return Some(runnable);
             }
 
+            let mut retries: usize = 4;
             for _attempt in 0..32 {
                 let mut was_contended = match producer.consume(&executor.injector) {
                     Steal::Success(runnable) => return Some(runnable),
@@ -159,7 +160,8 @@ impl<'a> WorkerContext<'a> {
                     }
                 }
 
-                if was_contended {
+                retries -= !was_contended as usize;
+                if was_contended || retries > 0 {
                     spin_loop();
                 } else {
                     break;
