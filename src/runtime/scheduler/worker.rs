@@ -75,7 +75,7 @@ impl WorkerContext {
         let result = worker_context.run(context, future);
         executor.thread_pool.task_complete();
 
-        if let Some(worker_index) = worker_context.worker_index.take() {
+        if let Some(worker_index) = worker_context.worker_index {
             if worker_context.transition_to_idle(context, worker_index) {
                 executor.notify();
             }
