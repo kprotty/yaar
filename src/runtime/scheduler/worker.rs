@@ -268,12 +268,13 @@ impl WorkerContext {
         };
 
         let mut runnable = None;
-        self.parker.park_polling(poll_guard, Some(Duration::ZERO), |ready| {
-            runnable = ready.pop_front();
-            if ready.len() > 0 {
-                context.executor.inject(ready.drain(..));
-            }
-        });
+        self.parker
+            .park_polling(poll_guard, Some(Duration::ZERO), |ready| {
+                runnable = ready.pop_front();
+                if ready.len() > 0 {
+                    context.executor.inject(ready.drain(..));
+                }
+            });
 
         runnable
     }

@@ -1,4 +1,7 @@
-use super::{executor::Executor, queue::{Runnable, Producer}};
+use super::{
+    executor::Executor,
+    queue::{Producer, Runnable},
+};
 use std::{cell::RefCell, collections::VecDeque, mem::replace, rc::Rc, sync::Arc};
 
 pub struct Context {

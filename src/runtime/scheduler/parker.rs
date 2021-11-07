@@ -1,12 +1,12 @@
-use super::{executor::Executor, context::Context, task::TaskState, queue::Runnable};
+use super::{context::Context, executor::Executor, queue::Runnable, task::TaskState};
 use crate::io::driver::{PollEvents, PollGuard};
 use parking_lot::{Condvar, Mutex};
 use std::{
+    collections::VecDeque,
     mem::{drop, replace},
     sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
     time::Duration,
-    collections::VecDeque,
 };
 use try_lock::TryLock;
 
@@ -144,7 +144,12 @@ impl Parker {
     }
 
     #[cold]
-    pub fn park_polling(&self, mut poll_guard: PollGuard<'_>, timeout: Option<Duration>, f: impl FnOnce(&mut VecDeque<Runnable>)) {
+    pub fn park_polling(
+        &self,
+        mut poll_guard: PollGuard<'_>,
+        timeout: Option<Duration>,
+        f: impl FnOnce(&mut VecDeque<Runnable>),
+    ) {
         let context_ref = Context::current();
         let context = context_ref.as_ref();
 
