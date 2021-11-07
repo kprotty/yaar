@@ -8,7 +8,7 @@ use std::{
     hint::spin_loop,
     io,
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -20,7 +20,6 @@ pub struct Pollable<S: Source> {
     index: WakerIndex,
     driver: Arc<Driver>,
     budgets: [AtomicU8; 2],
-    pendings: [AtomicBool; 2],
 }
 
 impl<S: Source> Pollable<S> {
@@ -32,7 +31,6 @@ impl<S: Source> Pollable<S> {
                 index,
                 driver: driver.clone(),
                 budgets: [AtomicU8::new(BUDGET), AtomicU8::new(BUDGET)],
-                pendings: [AtomicBool::new(false), AtomicBool::new(false)],
             })
         })
     }
@@ -55,20 +53,8 @@ impl<S: Source> Pollable<S> {
         mut do_io: impl FnMut() -> io::Result<T>,
     ) -> Poll<io::Result<T>> {
         self.driver.with_wakers(self.index, |wakers| loop {
-            let pending = &self.pendings[kind as usize];
-            let is_pending = pending.load(Ordering::Relaxed);
-
             if wakers[kind as usize].poll(ctx.as_deref_mut()).is_pending() {
-                if !is_pending {
-                    pending.store(true, Ordering::Relaxed);
-                    self.driver.io_pending_begin();
-                }
                 return Poll::Pending;
-            }
-
-            if is_pending {
-                pending.store(false, Ordering::Relaxed);
-                self.driver.io_pending_complete();
             }
 
             if let Some(ctx) = ctx.as_ref() {
@@ -146,12 +132,6 @@ impl<S: Source> Drop for Pollable<S> {
             wakers[WakerKind::Read as usize].wake();
             wakers[WakerKind::Write as usize].wake();
         });
-
-        for pending in self.pendings.iter() {
-            if pending.load(Ordering::Relaxed) {
-                self.driver.io_pending_complete();
-            }
-        }
 
         self.driver.deregister(&mut self.source, self.index);
     }

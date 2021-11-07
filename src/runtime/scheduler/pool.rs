@@ -38,10 +38,8 @@ impl ThreadPool {
     pub fn spawn(&self, executor: &Arc<Executor>, worker_index: usize) -> Result<(), ()> {
         loop {
             let mut state = self.state.lock();
-
-            let num_idle = state.idle.len();
-            if num_idle > 0 {
-                let parker = state.idle.swap_remove(num_idle - 1);
+            if state.idle.len() > 0 {
+                let parker = state.idle.swap_remove(0);
                 drop(state);
 
                 if parker.unpark(Some(worker_index)) {
