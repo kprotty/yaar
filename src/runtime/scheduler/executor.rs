@@ -91,6 +91,11 @@ impl Executor {
         if let Some(context) = context {
             assert!(Arc::ptr_eq(self, &context.executor));
 
+            if let Some(intercept) = context.intercept.borrow_mut().as_mut() {
+                intercept.push_back(runnable);
+                return;
+            }
+
             if let Some(producer) = context.producer.borrow().as_ref() {
                 producer.push(runnable, be_fair);
                 self.notify();

@@ -1,11 +1,12 @@
-use super::{executor::Executor, task::TaskState};
+use super::{executor::Executor, context::Context, task::TaskState, queue::Runnable};
 use crate::io::driver::{PollEvents, PollGuard};
 use parking_lot::{Condvar, Mutex};
 use std::{
-    mem::drop,
+    mem::{drop, replace},
     sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
     time::Duration,
+    collections::VecDeque,
 };
 use try_lock::TryLock;
 
@@ -44,13 +45,18 @@ impl Into<usize> for ParkState {
     }
 }
 
+struct PollState {
+    poll_events: PollEvents,
+    poll_ready: VecDeque<Runnable>,
+}
+
 pub struct Parker {
     executor: Arc<Executor>,
     pub task_state: TaskState,
     state: AtomicUsize,
     mutex: Mutex<()>,
     condvar: Condvar,
-    poll_events: TryLock<PollEvents>,
+    poll_state: TryLock<PollState>,
 }
 
 impl Parker {
@@ -61,7 +67,10 @@ impl Parker {
             state: AtomicUsize::new(0),
             mutex: Mutex::new(()),
             condvar: Condvar::new(),
-            poll_events: TryLock::new(PollEvents::new()),
+            poll_state: TryLock::new(PollState {
+                poll_events: PollEvents::new(),
+                poll_ready: VecDeque::new(),
+            }),
         }
     }
 
@@ -90,8 +99,10 @@ impl Parker {
         }
 
         match poll_guard {
-            Some(guard) => self.park_polling(guard, timeout),
             None => self.park_waiting(timeout),
+            Some(guard) => self.park_polling(guard, timeout, |ready| {
+                self.executor.inject(ready.drain(..));
+            }),
         }
 
         if let Err(_) = self.state.compare_exchange(
@@ -133,13 +144,24 @@ impl Parker {
     }
 
     #[cold]
-    pub fn park_polling(&self, mut poll_guard: PollGuard<'_>, timeout: Option<Duration>) {
-        let mut poll_events = self.poll_events.try_lock().unwrap();
-        poll_guard.poll(&mut *poll_events, timeout);
+    pub fn park_polling(&self, mut poll_guard: PollGuard<'_>, timeout: Option<Duration>, f: impl FnOnce(&mut VecDeque<Runnable>)) {
+        let context_ref = Context::current();
+        let context = context_ref.as_ref();
+
+        let mut poll_state = self.poll_state.try_lock().unwrap();
+
+        let poll_ready = replace(&mut poll_state.poll_ready, VecDeque::new());
+        let intercept = context.intercept.borrow_mut().replace(poll_ready);
+        assert!(intercept.is_none());
+
+        poll_guard.poll(&mut poll_state.poll_events, timeout);
         drop(poll_guard);
 
-        let io_driver = &self.executor.io_driver;
-        poll_events.process(io_driver);
+        let intercept = context.intercept.borrow_mut().take();
+        poll_state.poll_ready = intercept.unwrap();
+
+        poll_state.poll_events.process(&self.executor.io_driver);
+        f(&mut poll_state.poll_ready);
     }
 
     #[cold]

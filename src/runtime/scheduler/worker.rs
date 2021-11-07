@@ -2,7 +2,7 @@ use super::{
     context::Context,
     executor::Executor,
     parker::Parker,
-    queue::{Producer, Queue, Runnable, Steal},
+    queue::{Queue, Runnable, Steal},
     random::RandomGenerator,
     task::TaskError,
 };
@@ -210,7 +210,7 @@ impl WorkerContext {
 
         let be_fair = self.tick % 61 == 0;
         if be_fair {
-            if let Some(runnable) = self.poll_io(context, producer) {
+            if let Some(runnable) = self.poll_io(context) {
                 return Some(runnable);
             }
 
@@ -225,7 +225,7 @@ impl WorkerContext {
 
         self.searching = self.searching || executor.search_begin();
         if self.searching {
-            if let Some(runnable) = self.poll_io(context, producer) {
+            if let Some(runnable) = self.poll_io(context) {
                 return Some(runnable);
             }
 
@@ -261,13 +261,20 @@ impl WorkerContext {
         None
     }
 
-    fn poll_io(&mut self, context: &Context, producer: &Producer) -> Option<Runnable> {
+    fn poll_io(&mut self, context: &Context) -> Option<Runnable> {
         let poll_guard = match context.executor.io_driver.try_poll() {
             Some(guard) => guard,
             None => return None,
         };
 
-        self.parker.park_polling(poll_guard, Some(Duration::ZERO));
-        producer.pop(true)
+        let mut runnable = None;
+        self.parker.park_polling(poll_guard, Some(Duration::ZERO), |ready| {
+            runnable = ready.pop_front();
+            if ready.len() > 0 {
+                context.executor.inject(ready.drain(..));
+            }
+        });
+
+        runnable
     }
 }
