@@ -87,7 +87,7 @@ pub struct PollEvents {
 impl PollEvents {
     pub fn new() -> Self {
         Self {
-            events: mio::event::Events::with_capacity(256),
+            events: mio::event::Events::with_capacity(1024),
         }
     }
 
