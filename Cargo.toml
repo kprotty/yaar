@@ -29,14 +29,22 @@ name = "tokio_qsort"
 path = "examples/qsort/tokio.rs"
 
 [[example]]
-name = "yaar_http"
-path = "examples/http/yaar.rs"
+name = "yaar_http_hyper"
+path = "examples/http_hyper/yaar.rs"
 
 [[example]]
-name = "tokio_http"
-path = "examples/http/tokio.rs"
+name = "tokio_http_hyper"
+path = "examples/http_hyper/tokio.rs"
+
+[[example]]
+name = "yaar_http_tcp"
+path = "examples/http_tcp/yaar.rs"
+
+[[example]]
+name = "tokio_http_tcp"
+path = "examples/http_tcp/tokio.rs"
 
 [dev-dependencies]
 rayon = "1.5"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util"] }
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
