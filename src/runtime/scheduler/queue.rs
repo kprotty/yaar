@@ -1,9 +1,6 @@
 use super::task::TaskRunnable;
 use crossbeam_deque::{
-    Injector as QueueInjector, 
-    Steal as QueueSteal, 
-    Stealer as QueueStealer, 
-    Worker as QueueWorker
+    Injector as QueueInjector, Steal as QueueSteal, Stealer as QueueStealer, Worker as QueueWorker,
 };
 use std::{cell::Cell, hint::spin_loop, mem::replace, sync::Arc};
 use try_lock::TryLock;
@@ -26,7 +23,6 @@ impl Injector {
     }
 }
 
-
 pub struct Queue {
     stealer: QueueStealer<Runnable>,
     producer: TryLock<Option<Producer>>,
@@ -36,7 +32,7 @@ impl Default for Queue {
     fn default() -> Self {
         let producer = Producer::new();
         let stealer = producer.stealer.clone();
-        
+
         Self {
             stealer,
             producer: TryLock::new(Some(producer)),

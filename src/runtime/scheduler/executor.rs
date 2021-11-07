@@ -1,21 +1,19 @@
 use super::{
     config::Config,
     context::Context,
+    pool::ThreadPool,
     queue::{Injector, Runnable},
     random::RandomIterSource,
-    thread::ThreadPool,
     worker::Worker,
 };
 use crate::io::driver::Driver as IoDriver;
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
-    io,
-    iter,
+    io, iter,
     num::NonZeroUsize,
     sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
-    time::Duration,
 };
 
 struct IdleQueue {
@@ -58,7 +56,6 @@ impl IdleQueue {
 
 pub struct Executor {
     idle: IdleQueue,
-    tasks: AtomicUsize,
     searching: AtomicUsize,
     pub io_driver: Arc<IoDriver>,
     pub thread_pool: ThreadPool,
@@ -74,7 +71,6 @@ impl Executor {
 
         Ok(Self {
             idle: IdleQueue::from(worker_threads),
-            tasks: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
             io_driver: Arc::new(io_driver),
             thread_pool: ThreadPool::from(config),
@@ -95,11 +91,6 @@ impl Executor {
         if let Some(context) = context {
             assert!(Arc::ptr_eq(self, &context.executor));
 
-            if let Some(intercept) = context.intercept.borrow_mut().as_mut() {
-                intercept.push_back(runnable);
-                return;
-            }
-
             if let Some(producer) = context.producer.borrow().as_ref() {
                 producer.push(runnable, be_fair);
                 self.notify();
@@ -116,7 +107,7 @@ impl Executor {
         self.notify();
     }
 
-    fn notify(self: &Arc<Self>) {
+    pub fn notify(self: &Arc<Self>) {
         if !self.idle.pending() {
             return;
         }
@@ -145,29 +136,6 @@ impl Executor {
         let searching = self.searching.fetch_sub(1, Ordering::Relaxed);
         assert!(searching <= self.workers.len());
         assert_ne!(searching, 0);
-    }
-
-    pub fn shutdown(&self) {
-        self.thread_pool.shutdown();
-        self.io_driver.notify();
-    }
-
-    pub fn join(&self, _timeout: Option<Duration>) {
-        // unimplemented!("TODO: join()")
-    }
-
-    pub fn task_begin(&self) {
-        let tasks = self.tasks.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(tasks, usize::MAX);
-    }
-
-    pub fn task_complete(&self) {
-        let tasks = self.tasks.fetch_sub(1, Ordering::Release);
-        assert_ne!(tasks, 0);
-
-        if tasks == 1 {
-            self.shutdown();
-        }
     }
 
     pub fn search_begin(&self) -> bool {

@@ -8,6 +8,7 @@ authors = ["kprotty"]
 [dependencies]
 gcd = "2"
 num_cpus = "1"
+pin-utils = "0.1"
 arc-swap = "1"
 try-lock = "0.2"
 parking_lot = "0.11"

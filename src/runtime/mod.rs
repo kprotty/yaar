@@ -7,16 +7,10 @@ pub use handle::{EnterGuard, Handle};
 
 use crate::task::JoinHandle;
 use scheduler::config::Config;
-use std::{future::Future, io, time::Duration};
+use std::{future::Future, io};
 
 pub struct Runtime {
     handle: Handle,
-}
-
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        self.shutdown_with(None)
-    }
 }
 
 impl Runtime {
@@ -41,29 +35,11 @@ impl Runtime {
         self.handle.spawn(future)
     }
 
-    pub fn block_on<F>(&self, future: F) -> F::Output
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         self.handle.block_on(future)
     }
 
     pub fn enter(&self) -> EnterGuard<'_> {
         self.handle.enter()
-    }
-
-    pub fn shutdown_background(self) {
-        self.shutdown_timeout(Duration::ZERO)
-    }
-
-    pub fn shutdown_timeout(mut self, timeout: Duration) {
-        self.shutdown_with(Some(timeout))
-    }
-
-    fn shutdown_with(&mut self, timeout: Option<Duration>) {
-        let executor = &self.handle.executor;
-        executor.shutdown();
-        executor.join(timeout)
     }
 }

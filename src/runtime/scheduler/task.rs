@@ -17,18 +17,18 @@ const TASK_SCHEDULED: u8 = 1;
 const TASK_RUNNING: u8 = 2;
 const TASK_NOTIFIED: u8 = 3;
 
-struct TaskState {
+pub struct TaskState {
     state: AtomicU8,
 }
 
 impl TaskState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: AtomicU8::new(TASK_IDLE),
         }
     }
 
-    fn transition_to_scheduled(&self) -> bool {
+    pub fn transition_to_scheduled(&self) -> bool {
         self.state
             .fetch_update(Ordering::Release, Ordering::Relaxed, |state| match state {
                 TASK_IDLE => Some(TASK_SCHEDULED),
@@ -39,7 +39,7 @@ impl TaskState {
             .unwrap_or(false)
     }
 
-    fn transition_to_running(&self) -> bool {
+    pub fn transition_to_running(&self) -> bool {
         match self.state.load(Ordering::Acquire) {
             TASK_SCHEDULED => {}
             TASK_IDLE => return false,
@@ -50,7 +50,7 @@ impl TaskState {
         true
     }
 
-    fn transition_to_idle(&self) -> bool {
+    pub fn transition_to_idle(&self) -> bool {
         match self.state.compare_exchange(
             TASK_RUNNING,
             TASK_IDLE,
@@ -63,16 +63,18 @@ impl TaskState {
         }
     }
 
-    fn transition_to_scheduled_from_notified(&self) {
+    pub fn transition_to_scheduled_from_notified(&self) {
         assert_eq!(self.state.load(Ordering::Acquire), TASK_NOTIFIED);
         self.state.store(TASK_SCHEDULED, Ordering::Relaxed);
     }
 }
 
+pub type TaskError = Box<dyn Any + Send + 'static>;
+
 enum TaskData<F: Future> {
     Pending(Pin<Box<F>>),
     Polling,
-    Ready(Result<F::Output, Box<dyn Any + Send + 'static>>),
+    Ready(Result<F::Output, TaskError>),
     Joined,
 }
 
@@ -96,7 +98,7 @@ where
             executor: executor.clone(),
         });
 
-        executor.task_begin();
+        executor.thread_pool.task_begin();
         assert!(task.state.transition_to_scheduled());
         executor.schedule(task.clone(), context, false);
 
@@ -178,28 +180,27 @@ where
         drop(data);
 
         self.waker.wake();
-        context.executor.task_complete();
+        context.executor.thread_pool.task_complete();
     }
 }
 
 pub trait TaskJoinable<T> {
     fn poll_join(&self, ctx: &mut PollContext<'_>) -> Poll<T>;
-    fn join(&self) -> T;
 }
 
 impl<F: Future> TaskJoinable<F::Output> for Task<F> {
     fn poll_join(&self, ctx: &mut PollContext<'_>) -> Poll<F::Output> {
         match self.waker.poll(Some(ctx)) {
-            Poll::Ready(_) => Poll::Ready(self.join()),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(_) => {}
+            Poll::Pending => return Poll::Pending,
         }
-    }
 
-    fn join(&self) -> F::Output {
-        match replace(&mut *self.data.try_lock().unwrap(), TaskData::Joined) {
-            TaskData::Ready(Ok(result)) => result,
+        let result = match replace(&mut *self.data.try_lock().unwrap(), TaskData::Joined) {
             TaskData::Ready(Err(error)) => resume_unwind(error),
+            TaskData::Ready(Ok(result)) => result,
             _ => unreachable!(),
-        }
+        };
+
+        Poll::Ready(result)
     }
 }

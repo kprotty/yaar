@@ -2,7 +2,8 @@ use super::scheduler::{
     config::Config,
     context::{Context, ContextRef},
     executor::Executor,
-    task::{Task, TaskJoinable},
+    task::Task,
+    worker::WorkerContext,
 };
 use crate::task::JoinHandle;
 use std::{future::Future, io, sync::Arc};
@@ -52,13 +53,8 @@ impl Handle {
         }
     }
 
-    pub fn block_on<F>(&self, future: F) -> F::Output
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        let task = Task::spawn(future, &self.executor, None);
-        task.join()
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        WorkerContext::block_on(&self.executor, None, future)
     }
 
     pub fn enter(&self) -> EnterGuard<'_> {

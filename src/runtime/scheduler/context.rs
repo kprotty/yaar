@@ -1,13 +1,9 @@
-use super::{
-    executor::Executor,
-    queue::{Producer, Runnable},
-};
-use std::{cell::RefCell, collections::VecDeque, mem::replace, rc::Rc, sync::Arc};
+use super::{executor::Executor, queue::Producer};
+use std::{cell::RefCell, mem::replace, rc::Rc, sync::Arc};
 
 pub struct Context {
     pub executor: Arc<Executor>,
     pub producer: RefCell<Option<Producer>>,
-    pub intercept: RefCell<Option<VecDeque<Runnable>>>,
 }
 
 impl Context {
@@ -35,7 +31,6 @@ impl Context {
                 context: Rc::new(Context {
                     executor: executor.clone(),
                     producer: RefCell::new(None),
-                    intercept: RefCell::new(None),
                 }),
             };
 
