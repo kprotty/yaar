@@ -1,4 +1,4 @@
-use super::TcpStream;
+use super::stream::TcpStream;
 use crate::io::{pollable::Pollable, waker::WakerKind};
 use std::{
     io,
