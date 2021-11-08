@@ -180,6 +180,12 @@ impl WorkerContext {
                 Some(worker_index) => self.transition_to_running(context, worker_index),
                 None => {}
             }
+
+            if timeout.is_some() && self.worker_index.is_none() {
+                if let Some(worker_index) = context.executor.search_retry() {
+                    self.transition_to_running(context, worker_index);
+                }
+            }
         }
     }
 
