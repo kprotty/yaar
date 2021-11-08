@@ -122,7 +122,6 @@ impl ThreadPool {
             return worker_index;
         }
 
-        let idle_index = state.idle.len();
         state.idle.push(parker.clone());
         drop(state);
 
@@ -141,9 +140,10 @@ impl ThreadPool {
 
         if worker_index.is_none() {
             let mut state = self.state.lock();
-            if let Some(idle_parker) = state.idle.get(idle_index) {
-                if Arc::ptr_eq(idle_parker, parker) {
-                    drop(state.idle.swap_remove(idle_index));
+            for index in 0..state.idle.len() {
+                if Arc::ptr_eq(&state.idle[index], parker) {
+                    drop(state.idle.swap_remove(index));
+                    break;
                 }
             }
         }
