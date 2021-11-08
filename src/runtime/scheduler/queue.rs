@@ -81,8 +81,8 @@ impl Producer {
         loop {
             match self.stealer.steal() {
                 Steal::Success(runnable) => return Some(runnable),
-                Steal::Retry => spin_loop(),
                 Steal::Empty => return None,
+                Steal::Retry => spin_loop(),
             }
         }
     }

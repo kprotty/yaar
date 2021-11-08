@@ -1,5 +1,12 @@
 use super::stream::TcpStream;
-use std::{fmt, io, net, error, mem::drop, pin::Pin, task::{Context, Poll}, sync::Arc};
+use std::{
+    error, fmt, io,
+    mem::drop,
+    net,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 pub(super) fn split_owned(stream: TcpStream) -> (OwnedReadHalf, OwnedWriteHalf) {
     let stream = Arc::new(stream);

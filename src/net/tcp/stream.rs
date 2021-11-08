@@ -1,9 +1,9 @@
+use super::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
 use crate::io::{pollable::Pollable, waker::WakerKind};
-use super::{ReadHalf, WriteHalf, OwnedReadHalf, OwnedWriteHalf};
 use std::{
     fmt,
-    net,
     io::{self, Read, Write},
+    net,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -160,11 +160,11 @@ impl TcpStream {
         self.pollable.poll_io(WakerKind::Read, Some(ctx), || {
             const TLS_BUF_SIZE: usize = 64 * 1024;
             thread_local!(static TLS_BUF: RefCell<[u8; TLS_BUF_SIZE]> = RefCell::new([0; TLS_BUF_SIZE]));
-        
+
             TLS_BUF.with(|tls_buf| {
                 let mut tls_buf = tls_buf.borrow_mut();
                 let read_buf = &mut tls_buf[..buf.remaining()];
-        
+
                 self.pollable.as_ref().read(read_buf).map(|bytes| {
                     buf.put_slice(&mut read_buf[0..bytes]);
                 })

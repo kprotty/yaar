@@ -1,5 +1,9 @@
 use super::stream::TcpStream;
-use std::{fmt, io, pin::Pin, net, task::{Context, Poll}};
+use std::{
+    fmt, io, net,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 pub(super) fn split<'a>(stream: &'a TcpStream) -> (ReadHalf<'a>, WriteHalf<'a>) {
     let read_half = ReadHalf { stream };

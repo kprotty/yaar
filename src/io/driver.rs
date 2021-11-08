@@ -1,7 +1,12 @@
 use super::waker::{WakerEntry, WakerIndex, WakerKind, WakerStorage};
 use crate::runtime::scheduler::context::Context;
 use mio::event::Source;
-use std::{io, sync::Arc, time::Duration, sync::atomic::{AtomicUsize, Ordering}};
+use std::{
+    io,
+    sync::atomic::{AtomicUsize, Ordering},
+    sync::Arc,
+    time::Duration,
+};
 use try_lock::{Locked, TryLock};
 
 pub struct Driver {
