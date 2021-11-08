@@ -147,6 +147,12 @@ impl<S: Source> Drop for Pollable<S> {
             wakers[WakerKind::Write as usize].wake();
         });
 
+        for pending in self.pendings.iter() {
+            if pending.load(Ordering::Relaxed) {
+                self.driver.io_pending_complete();
+            }
+        }
+
         self.driver.deregister(&mut self.source, self.index);
     }
 }
