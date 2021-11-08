@@ -157,18 +157,19 @@ impl TcpStream {
         ctx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let polled = self.pollable.poll_io(WakerKind::Read, Some(ctx), || {
-            let buf = buf.initialize_unfilled();
-            self.pollable.as_ref().read(buf)
-        });
-
-        let bytes = match polled {
-            Poll::Ready(bytes) => bytes,
-            Poll::Pending => return Poll::Pending,
-        };
-
-        let result = bytes.map(|b| buf.advance(b));
-        Poll::Ready(result)
+        self.pollable.poll_io(WakerKind::Read, Some(ctx), || {
+            const TLS_BUF_SIZE: usize = 64 * 1024;
+            thread_local!(static TLS_BUF: RefCell<[u8; TLS_BUF_SIZE]> = RefCell::new([0; TLS_BUF_SIZE]));
+        
+            TLS_BUF.with(|tls_buf| {
+                let mut tls_buf = tls_buf.borrow_mut();
+                let read_buf = &mut tls_buf[..buf.remaining()];
+        
+                self.pollable.as_ref().read(read_buf).map(|bytes| {
+                    buf.put_slice(&mut read_buf[0..bytes]);
+                })
+            })
+        })
     }
 
     pub(super) fn poll_write_inner(
