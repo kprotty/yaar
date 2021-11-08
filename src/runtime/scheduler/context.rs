@@ -1,11 +1,20 @@
 use super::{
     executor::Executor,
     queue::{Producer, Runnable},
+    random::RandomGenerator,
 };
-use std::{cell::RefCell, collections::VecDeque, mem::replace, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    mem::replace,
+    rc::Rc,
+    sync::Arc,
+};
 
 pub struct Context {
     pub executor: Arc<Executor>,
+    pub rng: RefCell<RandomGenerator>,
+    pub worker_index: Cell<Option<usize>>,
     pub producer: RefCell<Option<Producer>>,
     pub intercept: RefCell<Option<VecDeque<Runnable>>>,
 }
@@ -34,6 +43,8 @@ impl Context {
                 owned: true,
                 context: Rc::new(Context {
                     executor: executor.clone(),
+                    rng: RefCell::new(RandomGenerator::new()),
+                    worker_index: Cell::new(None),
                     producer: RefCell::new(None),
                     intercept: RefCell::new(None),
                 }),

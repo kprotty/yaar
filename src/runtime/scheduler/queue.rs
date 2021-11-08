@@ -28,8 +28,8 @@ pub struct Queue {
     producer: TryLock<Option<Producer>>,
 }
 
-impl Default for Queue {
-    fn default() -> Self {
+impl Queue {
+    pub fn new() -> Self {
         let producer = Producer::new();
         let stealer = producer.stealer.clone();
 
@@ -38,9 +38,7 @@ impl Default for Queue {
             producer: TryLock::new(Some(producer)),
         }
     }
-}
 
-impl Queue {
     pub fn swap_producer(&self, new_producer: Option<Producer>) -> Option<Producer> {
         let mut producer = self.producer.try_lock().unwrap();
         replace(&mut *producer, new_producer)

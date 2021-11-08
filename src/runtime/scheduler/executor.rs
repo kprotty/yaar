@@ -2,11 +2,12 @@ use super::{
     config::Config,
     context::Context,
     pool::ThreadPool,
-    queue::{Injector, Runnable},
+    queue::{Injector, Queue as RunQueue, Runnable},
     random::RandomIterSource,
     worker::Worker,
 };
 use crate::io::driver::Driver as IoDriver;
+use crate::time::queue::DelayQueue;
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
@@ -14,6 +15,7 @@ use std::{
     num::NonZeroUsize,
     sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
+    time::Instant,
 };
 
 struct IdleQueue {
@@ -57,6 +59,7 @@ impl IdleQueue {
 pub struct Executor {
     idle: IdleQueue,
     searching: AtomicUsize,
+    pub time_started: Instant,
     pub io_driver: Arc<IoDriver>,
     pub thread_pool: ThreadPool,
     pub injector: Injector,
@@ -66,18 +69,23 @@ pub struct Executor {
 
 impl Executor {
     pub fn from(config: Config) -> io::Result<Self> {
+        let started = Instant::now();
         let io_driver = IoDriver::new()?;
         let worker_threads = config.worker_threads.unwrap();
 
         Ok(Self {
             idle: IdleQueue::from(worker_threads),
             searching: AtomicUsize::new(0),
+            time_started: started,
             io_driver: Arc::new(io_driver),
             thread_pool: ThreadPool::from(config),
             rng_iter_source: RandomIterSource::from(worker_threads),
             injector: Injector::default(),
             workers: (0..worker_threads.get())
-                .map(|_| Worker::default())
+                .map(|_| Worker {
+                    run_queue: RunQueue::new(),
+                    delay_queue: Arc::new(DelayQueue::new(started)),
+                })
                 .collect(),
         })
     }

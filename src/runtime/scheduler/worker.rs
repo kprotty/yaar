@@ -3,11 +3,12 @@ use super::{
     executor::Executor,
     parker::Parker,
     queue::{Queue, Runnable, Steal},
-    random::RandomGenerator,
     task::TaskError,
 };
+use crate::time::queue::{DelayQueue, Expired};
 use pin_utils::pin_mut;
 use std::{
+    collections::VecDeque,
     future::Future,
     hint::spin_loop,
     mem::replace,
@@ -15,7 +16,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context as PollContext, Poll, Wake, Waker},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 impl Wake for Parker {
@@ -30,17 +31,18 @@ impl Wake for Parker {
     }
 }
 
-#[derive(Default)]
 pub struct Worker {
     pub run_queue: Queue,
+    pub delay_queue: Arc<DelayQueue>,
 }
 
 pub struct WorkerContext {
     tick: usize,
     searching: bool,
-    rng: RandomGenerator,
     worker_index: Option<usize>,
     parker: Arc<Parker>,
+    expired: Expired,
+    ready: VecDeque<Runnable>,
 }
 
 impl WorkerContext {
@@ -55,15 +57,13 @@ impl WorkerContext {
         let context_ref = Context::enter(executor);
         let context = context_ref.as_ref();
 
-        let mut rng = RandomGenerator::new();
-        let tick = rng.gen();
-
         let mut worker_context = Self {
-            tick,
+            tick: context.rng.borrow_mut().gen(),
             searching: false,
-            rng,
             worker_index: None,
             parker: Arc::new(Parker::new(executor.clone())),
+            expired: Expired::default(),
+            ready: VecDeque::new(),
         };
 
         worker_index = worker_index.or_else(|| executor.search_retry());
@@ -114,6 +114,9 @@ impl WorkerContext {
         assert!(self.worker_index.is_none());
         self.worker_index = Some(worker_index);
 
+        assert!(context.worker_index.get().is_none());
+        context.worker_index.set(Some(worker_index));
+
         assert!(!self.searching);
         self.searching = true;
 
@@ -135,6 +138,9 @@ impl WorkerContext {
             .swap_producer(Some(producer))
             .map(|_| unreachable!());
 
+        assert_eq!(context.worker_index.get(), Some(worker_index));
+        context.worker_index.set(None);
+
         assert_eq!(self.worker_index, Some(worker_index));
         self.worker_index = None;
 
@@ -148,12 +154,17 @@ impl WorkerContext {
         mut future: Pin<&mut F>,
     ) -> Result<Result<F::Output, TaskError>, Runnable> {
         loop {
+            let mut now = None;
+            let mut timeout = None;
+
             if let Some(result) = self.poll_future(future.as_mut()) {
                 return Ok(result);
             }
 
             if let Some(worker_index) = self.worker_index {
-                if let Some(runnable) = self.poll_worker(context, worker_index) {
+                if let Some(runnable) =
+                    self.poll_worker(context, worker_index, &mut now, &mut timeout)
+                {
                     return Err(runnable);
                 }
 
@@ -165,7 +176,7 @@ impl WorkerContext {
                 }
             }
 
-            match context.executor.thread_pool.wait(&self.parker, None) {
+            match context.executor.thread_pool.wait(&self.parker, timeout) {
                 Some(worker_index) => self.transition_to_running(context, worker_index),
                 None => {}
             }
@@ -203,7 +214,13 @@ impl WorkerContext {
         Some(result)
     }
 
-    fn poll_worker(&mut self, context: &Context, worker_index: usize) -> Option<Runnable> {
+    fn poll_worker(
+        &mut self,
+        context: &Context,
+        worker_index: usize,
+        now: &mut Option<Instant>,
+        timeout: &mut Option<Duration>,
+    ) -> Option<Runnable> {
         let producer = context.producer.borrow();
         let producer = producer.as_ref().unwrap();
         let executor = &context.executor;
@@ -219,6 +236,10 @@ impl WorkerContext {
             }
         }
 
+        if let Some(runnable) = self.poll_timers(context, worker_index, now, timeout) {
+            return Some(runnable);
+        }
+
         if let Some(runnable) = producer.pop(be_fair) {
             return Some(runnable);
         }
@@ -229,15 +250,18 @@ impl WorkerContext {
                 return Some(runnable);
             }
 
-            let mut retries: usize = 4;
-            for _attempt in 0..32 {
+            const MAX_ATTEMPTS: usize = 32;
+            const MAX_RETRIES: usize = 4;
+
+            let mut retries = MAX_RETRIES;
+            for attempt in 0..MAX_ATTEMPTS {
                 let mut was_contended = match producer.consume(&executor.injector) {
                     Steal::Success(runnable) => return Some(runnable),
                     Steal::Empty => false,
                     Steal::Retry => true,
                 };
 
-                for steal_index in self.rng.gen_iter(executor.rng_iter_source) {
+                for steal_index in context.rng.borrow_mut().gen_iter(executor.rng_iter_source) {
                     if steal_index == worker_index {
                         continue;
                     }
@@ -246,6 +270,13 @@ impl WorkerContext {
                         Steal::Success(runnable) => return Some(runnable),
                         Steal::Retry => was_contended = true,
                         Steal::Empty => {}
+                    }
+
+                    if !was_contended && (retries == 1 || attempt == MAX_ATTEMPTS - 1) {
+                        if let Some(runnable) = self.poll_timers(context, steal_index, now, timeout)
+                        {
+                            return Some(runnable);
+                        }
                     }
                 }
 
@@ -277,5 +308,48 @@ impl WorkerContext {
             });
 
         runnable
+    }
+
+    fn poll_timers(
+        &mut self,
+        context: &Context,
+        worker_index: usize,
+        now: &mut Option<Instant>,
+        timeout: &mut Option<Duration>,
+    ) -> Option<Runnable> {
+        let delay_queue = &context.executor.workers[worker_index].delay_queue;
+        let expires = delay_queue.expires()?;
+
+        if now.is_none() {
+            *now = Some(Instant::now());
+        }
+
+        let current = delay_queue.since(now.unwrap());
+        if current < expires {
+            let duration = Duration::from_millis(expires - current);
+            *timeout = Some(timeout.map(|t| t.min(duration)).unwrap_or(duration));
+            return None;
+        }
+
+        delay_queue.poll(current, &mut self.expired);
+        if self.expired.is_empty() {
+            return None;
+        }
+
+        let ready = replace(&mut self.ready, VecDeque::new());
+        let intercept = context.intercept.borrow_mut().replace(ready);
+        assert!(intercept.is_none());
+
+        self.expired.process();
+
+        let intercept = context.intercept.borrow_mut().take();
+        self.ready = intercept.unwrap();
+
+        let runnable = self.ready.pop_front()?;
+        if self.ready.len() > 0 {
+            context.executor.inject(self.ready.drain(..));
+        }
+
+        Some(runnable)
     }
 }
