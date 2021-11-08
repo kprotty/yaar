@@ -1,6 +1,7 @@
 use super::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
 use crate::io::{pollable::Pollable, waker::WakerKind};
 use std::{
+    cell::RefCell,
     fmt,
     io::{self, Read, Write},
     net,
@@ -158,6 +159,24 @@ impl TcpStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         self.pollable.poll_io(WakerKind::Read, Some(ctx), || {
+            let filled = buf.filled().len();
+            let initialized = buf.initialized().len();
+
+            // Try to read into the buffer directly 
+            // if theres initialized but unfilled memory.
+            let writable = initialized - filled;
+            if writable > 0 {
+                let readable_buf = &mut buf.initialized_mut()[filled..];
+                let result = self.pollable.as_ref().read(readable_buf);
+                return result.map(|bytes| buf.advance(bytes));
+            }
+
+            // At this point we would need to initialize the unfilled memory.
+            // This zeroes it out when we use ReadBuff::initialized_unfilled().
+            // Zeroing out the buffer before reading appears decrease throughput a lot.
+            // So instead, we read directly to a TLS buffer, then copy that into the unfilled memory.
+            // This appears to be faster in benchmarks due to replacing the zero-ing with a copy.
+
             const TLS_BUF_SIZE: usize = 64 * 1024;
             thread_local!(static TLS_BUF: RefCell<[u8; TLS_BUF_SIZE]> = RefCell::new([0; TLS_BUF_SIZE]));
 
