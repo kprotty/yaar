@@ -1,16 +1,16 @@
+use super::queue::Queue as RunQueue;
 use super::{
     config::Config,
     context::Context,
-    pool::ThreadPool,
-    queue::{Injector, Queue as RunQueue, Runnable},
+    queue::{Injector, Runnable},
     random::RandomIterSource,
+    thread_pool::ThreadPool,
     worker::Worker,
 };
-use crate::io::driver::Driver as IoDriver;
-use crate::time::queue::DelayQueue;
+use crate::net::internal::poller::Poller as NetPoller;
+use crate::time::internal::queue::Queue as TimerQueue;
 use parking_lot::Mutex;
 use std::{
-    collections::VecDeque,
     io, iter,
     num::NonZeroUsize,
     sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering},
@@ -20,7 +20,7 @@ use std::{
 
 struct IdleQueue {
     pending: AtomicBool,
-    indices: Mutex<VecDeque<usize>>,
+    indices: Mutex<Vec<usize>>,
 }
 
 impl From<NonZeroUsize> for IdleQueue {
@@ -34,12 +34,12 @@ impl From<NonZeroUsize> for IdleQueue {
 
 impl IdleQueue {
     fn pending(&self) -> bool {
-        self.pending.load(Ordering::SeqCst)
+        self.pending.load(Ordering::Acquire)
     }
 
     fn push(&self, index: usize) {
         let mut indices = self.indices.lock();
-        indices.push_back(index);
+        indices.push(index);
         self.pending.store(true, Ordering::Relaxed);
     }
 
@@ -49,42 +49,43 @@ impl IdleQueue {
         }
 
         let mut indices = self.indices.lock();
-        indices.pop_back().map(|index| {
-            self.pending.store(indices.len() > 0, Ordering::Relaxed);
-            index
-        })
+
+        let index = indices.len().checked_sub(1)?;
+        if index == 0 {
+            self.pending.store(false, Ordering::Relaxed);
+        }
+
+        Some(indices.swap_remove(index))
     }
 }
 
 pub struct Executor {
     idle: IdleQueue,
     searching: AtomicUsize,
-    pub time_started: Instant,
-    pub io_driver: Arc<IoDriver>,
+    pub net_poller: Arc<NetPoller>,
     pub thread_pool: ThreadPool,
-    pub injector: Injector,
-    pub rng_iter_source: RandomIterSource,
+    pub(super) injector: Injector,
+    pub(super) rng_iter_source: RandomIterSource,
     pub workers: Box<[Worker]>,
 }
 
 impl Executor {
     pub fn from(config: Config) -> io::Result<Self> {
         let started = Instant::now();
-        let io_driver = IoDriver::new()?;
+        let net_poller = NetPoller::new()?;
         let worker_threads = config.worker_threads.unwrap();
 
         Ok(Self {
             idle: IdleQueue::from(worker_threads),
             searching: AtomicUsize::new(0),
-            time_started: started,
-            io_driver: Arc::new(io_driver),
+            net_poller: Arc::new(net_poller),
             thread_pool: ThreadPool::from(config),
             rng_iter_source: RandomIterSource::from(worker_threads),
             injector: Injector::default(),
             workers: (0..worker_threads.get())
                 .map(|_| Worker {
                     run_queue: RunQueue::new(),
-                    delay_queue: Arc::new(DelayQueue::new(started)),
+                    timer_queue: Arc::new(TimerQueue::new(started)),
                 })
                 .collect(),
         })

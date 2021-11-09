@@ -1,5 +1,5 @@
 use super::stream::TcpStream;
-use crate::io::{pollable::Pollable, waker::WakerKind};
+use crate::net::internal::{pollable::Pollable, wakers::WakerKind};
 use std::{
     io,
     net::SocketAddr,

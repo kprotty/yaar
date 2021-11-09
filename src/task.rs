@@ -1,4 +1,4 @@
-use crate::runtime::scheduler::{
+use crate::runtime::internal::{
     context::Context,
     task::{Task, TaskJoinable},
 };

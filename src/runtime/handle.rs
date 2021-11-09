@@ -1,4 +1,4 @@
-use super::scheduler::{
+use super::internal::{
     config::Config,
     context::{Context, ContextRef},
     executor::Executor,

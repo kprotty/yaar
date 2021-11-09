@@ -1,5 +1,5 @@
 use super::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
-use crate::io::{pollable::Pollable, waker::WakerKind};
+use crate::net::internal::{pollable::Pollable, wakers::WakerKind};
 use std::{
     cell::RefCell,
     fmt,

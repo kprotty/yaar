@@ -1,5 +1,5 @@
-use super::waker::{WakerEntry, WakerIndex, WakerKind, WakerStorage};
-use crate::runtime::scheduler::context::Context;
+use super::wakers::{WakerEntry, WakerIndex, WakerKind, WakerStorage};
+use crate::runtime::internal::context::Context;
 use mio::event::Source;
 use std::{
     io,
@@ -9,7 +9,7 @@ use std::{
 };
 use try_lock::{Locked, TryLock};
 
-pub struct Driver {
+pub struct Poller {
     pending: AtomicUsize,
     waker_storage: WakerStorage,
     registry: mio::Registry,
@@ -17,7 +17,7 @@ pub struct Driver {
     signal: mio::Waker,
 }
 
-impl Driver {
+impl Poller {
     pub fn new() -> io::Result<Self> {
         let selector = mio::Poll::new()?;
         let registry = selector.registry().try_clone()?;
@@ -32,27 +32,8 @@ impl Driver {
         })
     }
 
-    pub fn notify(&self) {
-        if self.pending.load(Ordering::Acquire) == 0 {
-            return;
-        }
-
-        self.signal.wake().expect("failed to notify the I/O driver");
-    }
-
-    pub fn try_poll(&self) -> Option<PollGuard<'_>> {
-        if self.pending.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-
-        self.selector
-            .try_lock()
-            .map(|selector| PollGuard { selector })
-    }
-
-    pub(super) fn with<F>(f: impl FnOnce(&Arc<Self>) -> F) -> F {
-        let context_ref = Context::current();
-        f(&context_ref.as_ref().executor.io_driver)
+    pub fn with<F>(f: impl FnOnce(&Arc<Self>) -> F) -> F {
+        Context::with(|context| f(&context.executor.net_poller))
     }
 
     pub(super) fn register<S: Source>(&self, source: &mut S) -> io::Result<WakerIndex> {
@@ -93,6 +74,20 @@ impl Driver {
         let pending = self.pending.fetch_sub(1, Ordering::Relaxed);
         assert_ne!(pending, 0);
     }
+
+    pub fn notify(&self) {
+        self.signal.wake().expect("failed to notify the net poller");
+    }
+
+    pub fn try_poll(&self) -> Option<PollGuard<'_>> {
+        if self.pending.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+
+        self.selector
+            .try_lock()
+            .map(|selector| PollGuard { selector })
+    }
 }
 
 pub struct PollGuard<'a> {
@@ -100,8 +95,13 @@ pub struct PollGuard<'a> {
 }
 
 impl<'a> PollGuard<'a> {
-    pub fn poll(&mut self, events: &mut PollEvents, timeout: Option<Duration>) {
-        let _ = self.selector.poll(&mut events.events, timeout);
+    pub fn poll(mut self, poll_events: &mut PollEvents, timeout: Option<Duration>) {
+        loop {
+            match self.selector.poll(&mut poll_events.events, timeout) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                _ => break,
+            }
+        }
     }
 }
 
@@ -109,21 +109,23 @@ pub struct PollEvents {
     events: mio::event::Events,
 }
 
-impl PollEvents {
-    pub fn new() -> Self {
+impl Default for PollEvents {
+    fn default() -> Self {
         Self {
-            events: mio::event::Events::with_capacity(1024),
+            events: mio::event::Events::with_capacity(256),
         }
     }
+}
 
-    pub fn process(&self, driver: &Driver) {
+impl PollEvents {
+    pub fn process(&self, poller: &Poller) {
         for event in self.events.iter() {
             let index = match event.token() {
                 mio::Token(usize::MAX) => continue,
                 mio::Token(token) => WakerIndex::from(token),
             };
 
-            driver.with_wakers(index, |wakers| {
+            poller.with_wakers(index, |wakers| {
                 if event.is_readable() {
                     wakers[WakerKind::Read as usize].wake();
                 }

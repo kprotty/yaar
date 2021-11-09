@@ -1,5 +1,5 @@
 use super::{
-    queue::{Delay, DelayQueue},
+    internal::queue::{Delay, Queue as TimerQueue},
     Duration, Instant,
 };
 use std::{
@@ -20,7 +20,7 @@ pub fn sleep_until(instant: Instant) -> Sleep {
 
 enum State {
     Start(Result<Duration, Instant>),
-    Polling((Arc<DelayQueue>, Delay)),
+    Polling((Arc<TimerQueue>, Delay)),
     Polled,
 }
 
@@ -42,12 +42,12 @@ impl Future for Sleep {
     fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<()> {
         match replace(&mut self.state, State::Polled) {
             State::Start(delay) => {
-                let delay_queue = DelayQueue::with(|queue| queue.clone());
+                let timer_queue = TimerQueue::with(|queue| queue.clone());
 
                 // A failed schedule means the delay has already expired.
                 // Instead of returning immediately, do a yield.
                 // The next poll with see State::Polled and return Poll::Ready.
-                let delay = match delay_queue.schedule(delay) {
+                let delay = match timer_queue.schedule(delay) {
                     Some(delay) => delay,
                     None => {
                         ctx.waker().wake_by_ref();
@@ -55,24 +55,24 @@ impl Future for Sleep {
                     }
                 };
 
-                // Poll the AtomicWaker to see if we we're notified by DelayQueue::Entries::process().
+                // Poll the AtomicWaker to see if we we're notified by TimerQueue::Entries::process().
                 if delay.entry.waker.poll(Some(ctx)).is_ready() {
-                    delay_queue.complete(delay);
+                    timer_queue.complete(delay);
                     return Poll::Ready(());
                 }
 
-                self.state = State::Polling((delay_queue, delay));
+                self.state = State::Polling((timer_queue, delay));
                 Poll::Pending
             }
-            State::Polling((delay_queue, delay)) => {
-                // Poll the AtomicWaker to see if we we're notified by DelayQueue::Entries::process().
+            State::Polling((timer_queue, delay)) => {
+                // Poll the AtomicWaker to see if we we're notified by TimerQueue::Entries::process().
                 if delay.entry.waker.poll(Some(ctx)).is_ready() {
-                    delay_queue.complete(delay);
+                    timer_queue.complete(delay);
                     return Poll::Ready(());
                 }
 
                 // We weren't, go back to sleeping (waker was regitered above)
-                self.state = State::Polling((delay_queue, delay));
+                self.state = State::Polling((timer_queue, delay));
                 Poll::Pending
             }
             State::Polled => {
@@ -85,9 +85,9 @@ impl Future for Sleep {
 
 impl Drop for Sleep {
     fn drop(&mut self) {
-        if let State::Polling((delay_queue, delay)) = replace(&mut self.state, State::Polled) {
+        if let State::Polling((timer_queue, delay)) = replace(&mut self.state, State::Polled) {
             // Still need to complete (cancel) the delay if we started but never polled to completion
-            delay_queue.complete(delay);
+            timer_queue.complete(delay);
         }
     }
 }

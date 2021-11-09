@@ -1,5 +1,5 @@
 pub mod error;
-pub(crate) mod queue;
+pub(crate) mod internal;
 mod sleeps;
 mod timeouts;
 

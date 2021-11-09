@@ -1,10 +1,13 @@
-use super::{config::Config, executor::Executor, parker::Parker, worker::WorkerContext};
+use super::{
+    config::Config, context::Context, executor::Executor, parker::Parker, poller::Poller,
+    worker::WorkerContext,
+};
 use parking_lot::Mutex;
 use std::{
     future::Future,
     mem::replace,
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
     task::{Context as PollContext, Poll},
     thread,
@@ -18,6 +21,7 @@ struct PoolState {
 
 pub struct ThreadPool {
     pub config: Config,
+    running: AtomicBool,
     pending: AtomicUsize,
     state: Mutex<PoolState>,
 }
@@ -27,6 +31,7 @@ impl ThreadPool {
         let max_threads = config.max_threads().unwrap().get();
         Self {
             config,
+            running: AtomicBool::new(true),
             pending: AtomicUsize::new(0),
             state: Mutex::new(PoolState {
                 spawned: 0,
@@ -37,7 +42,15 @@ impl ThreadPool {
 
     pub fn spawn(&self, executor: &Arc<Executor>, worker_index: usize) -> Result<(), ()> {
         loop {
+            if !self.running.load(Ordering::Acquire) {
+                return Err(());
+            }
+
             let mut state = self.state.lock();
+            if !self.running.load(Ordering::Relaxed) {
+                return Err(());
+            }
+
             if state.idle.len() > 0 {
                 let parker = state.idle.swap_remove(0);
                 drop(state);
@@ -112,13 +125,19 @@ impl ThreadPool {
         state.spawned -= 1;
     }
 
-    pub fn wait(&self, parker: &Arc<Parker>, timeout: Option<Duration>) -> Option<usize> {
-        if let Some(worker_index) = parker.poll() {
+    pub fn wait(
+        &self,
+        parker: &Arc<Parker>,
+        poller: &mut Poller,
+        context: &Context,
+        timeout: Option<Duration>,
+    ) -> Option<usize> {
+        if let Some(worker_index) = parker.poll_unparked() {
             return worker_index;
         }
 
         let mut state = self.state.lock();
-        if let Some(worker_index) = parker.poll() {
+        if let Some(worker_index) = parker.poll_unparked() {
             return worker_index;
         }
 
@@ -129,10 +148,9 @@ impl ThreadPool {
             (on_thread_park)();
         }
 
-        let worker_index = parker.poll().unwrap_or_else(|| {
-            // slow path: actually block on the parker
-            parker.park(timeout)
-        });
+        let worker_index = parker
+            .poll_unparked()
+            .unwrap_or_else(|| parker.park(poller, context, timeout));
 
         if let Some(on_thread_unpark) = self.config.on_thread_unpark.as_ref() {
             (on_thread_unpark)();
@@ -152,8 +170,17 @@ impl ThreadPool {
     }
 
     pub fn shutdown(&self) {
+        if !self.running.load(Ordering::Acquire) {
+            return;
+        }
+
         let mut state = self.state.lock();
+        if !self.running.load(Ordering::Relaxed) {
+            return;
+        }
+
         let idle = replace(&mut state.idle, Vec::new());
+        self.running.store(false, Ordering::Relaxed);
         drop(state);
 
         for parker in idle.into_iter() {

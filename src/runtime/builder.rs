@@ -1,4 +1,4 @@
-use super::{scheduler::config::Config, Runtime};
+use super::{internal::config::Config, Runtime};
 use std::{io, num::NonZeroUsize, sync::Arc, time::Duration};
 
 #[derive(Default)]

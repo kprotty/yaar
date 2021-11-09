@@ -1,6 +1,6 @@
 use super::{
-    driver::Driver,
-    waker::{WakerIndex, WakerKind},
+    poller::Poller,
+    wakers::{WakerIndex, WakerKind},
 };
 use mio::event::Source;
 use std::{
@@ -18,19 +18,21 @@ const BUDGET: u8 = 128;
 pub struct Pollable<S: Source> {
     source: S,
     index: WakerIndex,
-    driver: Arc<Driver>,
+    poller: Arc<Poller>,
     budgets: [AtomicU8; 2],
     pendings: [AtomicBool; 2],
 }
 
 impl<S: Source> Pollable<S> {
     pub fn new(mut source: S) -> io::Result<Self> {
-        Driver::with(|driver| {
-            let index = driver.register(&mut source)?;
+        Poller::with(|poller| {
+            let poller = poller.clone();
+            let index = poller.register(&mut source)?;
+
             Ok(Self {
                 source,
                 index,
-                driver: driver.clone(),
+                poller,
                 budgets: [AtomicU8::new(BUDGET), AtomicU8::new(BUDGET)],
                 pendings: [AtomicBool::new(false), AtomicBool::new(false)],
             })
@@ -54,20 +56,20 @@ impl<S: Source> Pollable<S> {
         mut ctx: Option<&mut Context<'_>>,
         mut do_io: impl FnMut() -> io::Result<T>,
     ) -> Poll<io::Result<T>> {
-        self.driver.with_wakers(self.index, |wakers| loop {
+        self.poller.with_wakers(self.index, |wakers| loop {
             let pending = &self.pendings[kind as usize];
             let is_pending = pending.load(Ordering::Relaxed);
 
             if wakers[kind as usize].poll(ctx.as_deref_mut()).is_pending() {
                 if !is_pending {
-                    self.driver.io_pending_begin();
+                    self.poller.io_pending_begin();
                     pending.store(true, Ordering::Relaxed);
                 }
                 return Poll::Pending;
             }
 
             if is_pending {
-                self.driver.io_pending_complete();
+                self.poller.io_pending_complete();
                 pending.store(false, Ordering::Relaxed);
             }
 
@@ -142,17 +144,17 @@ impl<S: Source> AsRef<S> for Pollable<S> {
 
 impl<S: Source> Drop for Pollable<S> {
     fn drop(&mut self) {
-        self.driver.with_wakers(self.index, |wakers| {
+        self.poller.with_wakers(self.index, |wakers| {
             wakers[WakerKind::Read as usize].wake();
             wakers[WakerKind::Write as usize].wake();
         });
 
         for pending in self.pendings.iter() {
             if pending.load(Ordering::Relaxed) {
-                self.driver.io_pending_complete();
+                self.poller.io_pending_complete();
             }
         }
 
-        self.driver.deregister(&mut self.source, self.index);
+        self.poller.deregister(&mut self.source, self.index);
     }
 }

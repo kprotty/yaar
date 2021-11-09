@@ -1,5 +1,5 @@
 use super::{context::Context, executor::Executor};
-use crate::internal::waker::AtomicWaker;
+use crate::sync::internal::waker::AtomicWaker;
 use std::{
     any::Any,
     future::Future,

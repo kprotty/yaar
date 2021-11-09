@@ -1,12 +1,12 @@
 mod builder;
 mod handle;
-pub(crate) mod scheduler;
+pub(crate) mod internal;
 
 pub use builder::Builder;
 pub use handle::{EnterGuard, Handle};
 
 use crate::task::JoinHandle;
-use scheduler::config::Config;
+use internal::config::Config;
 use std::{future::Future, io};
 
 pub struct Runtime {

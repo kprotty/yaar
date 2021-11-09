@@ -2,13 +2,14 @@ use super::{
     context::Context,
     executor::Executor,
     parker::Parker,
-    queue::{Queue, Runnable, Steal},
+    poller::Poller,
+    queue::{Queue as RunQueue, Runnable, Steal},
     task::TaskError,
 };
-use crate::time::queue::{DelayQueue, Expired};
+use crate::time::internal::queue::Queue as TimerQueue;
 use pin_utils::pin_mut;
 use std::{
-    collections::VecDeque,
+    cell::RefCell,
     future::Future,
     hint::spin_loop,
     mem::replace,
@@ -32,17 +33,15 @@ impl Wake for Parker {
 }
 
 pub struct Worker {
-    pub run_queue: Queue,
-    pub delay_queue: Arc<DelayQueue>,
+    pub run_queue: RunQueue,
+    pub timer_queue: Arc<TimerQueue>,
 }
 
 pub struct WorkerContext {
     tick: usize,
     searching: bool,
-    worker_index: Option<usize>,
     parker: Arc<Parker>,
-    expired: Expired,
-    ready: VecDeque<Runnable>,
+    poller: RefCell<Poller>,
 }
 
 impl WorkerContext {
@@ -60,10 +59,8 @@ impl WorkerContext {
         let mut worker_context = Self {
             tick: context.rng.borrow_mut().gen(),
             searching: false,
-            worker_index: None,
             parker: Arc::new(Parker::new(executor.clone())),
-            expired: Expired::default(),
-            ready: VecDeque::new(),
+            poller: RefCell::new(Poller::default()),
         };
 
         worker_index = worker_index.or_else(|| executor.search_retry());
@@ -75,7 +72,7 @@ impl WorkerContext {
         let result = worker_context.run(context, future);
         executor.thread_pool.task_complete();
 
-        if let Some(worker_index) = worker_context.worker_index {
+        if let Some(worker_index) = context.worker_index.get() {
             if worker_context.transition_to_idle(context, worker_index) {
                 executor.notify();
             }
@@ -111,9 +108,6 @@ impl WorkerContext {
     }
 
     fn transition_to_running(&mut self, context: &Context, worker_index: usize) {
-        assert!(self.worker_index.is_none());
-        self.worker_index = Some(worker_index);
-
         assert!(context.worker_index.get().is_none());
         context.worker_index.set(Some(worker_index));
 
@@ -141,9 +135,6 @@ impl WorkerContext {
         assert_eq!(context.worker_index.get(), Some(worker_index));
         context.worker_index.set(None);
 
-        assert_eq!(self.worker_index, Some(worker_index));
-        self.worker_index = None;
-
         let was_searching = replace(&mut self.searching, false);
         context.executor.search_failed(worker_index, was_searching)
     }
@@ -161,7 +152,7 @@ impl WorkerContext {
                 return Ok(result);
             }
 
-            if let Some(worker_index) = self.worker_index {
+            if let Some(worker_index) = context.worker_index.get() {
                 if let Some(runnable) =
                     self.poll_worker(context, worker_index, &mut now, &mut timeout)
                 {
@@ -176,15 +167,32 @@ impl WorkerContext {
                 }
             }
 
-            match context.executor.thread_pool.wait(&self.parker, timeout) {
-                Some(worker_index) => self.transition_to_running(context, worker_index),
-                None => {}
+            let mut poller = self.poller.borrow_mut();
+            let mut worker_index =
+                context
+                    .executor
+                    .thread_pool
+                    .wait(&self.parker, &mut *poller, context, timeout);
+
+            let notified = poller.pending() || timeout.is_some();
+            if notified && worker_index.is_none() {
+                worker_index = context.executor.search_retry();
             }
 
-            if timeout.is_some() && self.worker_index.is_none() {
-                if let Some(worker_index) = context.executor.search_retry() {
-                    self.transition_to_running(context, worker_index);
+            if let Some(worker_index) = worker_index {
+                let runnable = poller.pop_and_inject(context);
+                drop(poller);
+
+                self.transition_to_running(context, worker_index);
+                match runnable {
+                    Some(runnable) => return Err(runnable),
+                    None => continue,
                 }
+            }
+
+            poller.inject(context);
+            if !notified {
+                let _ = self.parker.task_state.transition_to_scheduled();
             }
         }
     }
@@ -286,12 +294,13 @@ impl WorkerContext {
                     }
                 }
 
-                retries -= !was_contended as usize;
                 if was_contended || retries > 0 {
+                    retries -= !was_contended as usize;
                     spin_loop();
-                } else {
-                    break;
+                    continue;
                 }
+
+                break;
             }
         }
 
@@ -299,21 +308,12 @@ impl WorkerContext {
     }
 
     fn poll_io(&mut self, context: &Context) -> Option<Runnable> {
-        let poll_guard = match context.executor.io_driver.try_poll() {
-            Some(guard) => guard,
-            None => return None,
-        };
+        let mut poller = self.poller.borrow_mut();
 
-        let mut runnable = None;
-        self.parker
-            .park_polling(poll_guard, Some(Duration::ZERO), |ready| {
-                runnable = ready.pop_front();
-                if ready.len() > 0 {
-                    context.executor.inject(ready.drain(..));
-                }
-            });
+        let poll_network_guard = poller.try_poll_network(context, &context.executor.net_poller)?;
+        poll_network_guard.poll(Some(Duration::ZERO));
 
-        runnable
+        poller.pop_and_inject(context)
     }
 
     fn poll_timers(
@@ -323,50 +323,11 @@ impl WorkerContext {
         now: &mut Option<Instant>,
         timeout: &mut Option<Duration>,
     ) -> Option<Runnable> {
-        // Get the DelayQueue and check if there's pending entries to expire (fast)
-        let delay_queue = &context.executor.workers[worker_index].delay_queue;
-        let expires = delay_queue.expires()?;
+        let mut poller = self.poller.borrow_mut();
 
-        // Get the current time if not already known
-        if now.is_none() {
-            *now = Some(Instant::now());
-        }
+        let timer_queue = &context.executor.workers[worker_index].timer_queue;
+        poller.poll_timers(context, timer_queue, now, timeout);
 
-        // Convert the current time into a DelayQueue deadline for polling/comparison.
-        let current = delay_queue.since(now.unwrap());
-
-        // Update the timeout if there's nothing to currently expire.
-        if current < expires {
-            let duration = Duration::from_millis(expires - current);
-            *timeout = Some(timeout.map(|t| t.min(duration)).unwrap_or(duration));
-            return None;
-        }
-
-        // There's entries to expire, try polling for them from the DelayQueue
-        delay_queue.poll(current, &mut self.expired);
-        if self.expired.is_empty() {
-            return None;
-        }
-
-        // We have entries to wake.
-        // Setup the Context::intercept queue to grab any scheduled runnables
-        let ready = replace(&mut self.ready, VecDeque::new());
-        let intercept = context.intercept.borrow_mut().replace(ready);
-        assert!(intercept.is_none());
-
-        // Waker::wake() all of the expired timers we polled for.
-        self.expired.process();
-
-        // Take back the Context::intercept queue to collect scheduled runnables
-        let intercept = context.intercept.borrow_mut().take();
-        self.ready = intercept.unwrap();
-
-        // Pop one to return and inject the rest into the runtime
-        let runnable = self.ready.pop_front()?;
-        if self.ready.len() > 0 {
-            context.executor.inject(self.ready.drain(..));
-        }
-
-        Some(runnable)
+        poller.pop_and_inject(context)
     }
 }

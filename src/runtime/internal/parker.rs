@@ -1,14 +1,11 @@
-use super::{context::Context, executor::Executor, queue::Runnable, task::TaskState};
-use crate::io::driver::{PollEvents, PollGuard};
+use super::{context::Context, executor::Executor, poller::Poller, task::TaskState};
 use parking_lot::{Condvar, Mutex};
 use std::{
-    collections::VecDeque,
-    mem::{drop, replace},
+    mem::drop,
     sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
     time::Duration,
 };
-use try_lock::TryLock;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum ParkState {
@@ -45,18 +42,12 @@ impl Into<usize> for ParkState {
     }
 }
 
-struct PollState {
-    poll_events: PollEvents,
-    poll_ready: VecDeque<Runnable>,
-}
-
 pub struct Parker {
     executor: Arc<Executor>,
     pub task_state: TaskState,
     state: AtomicUsize,
     mutex: Mutex<()>,
     condvar: Condvar,
-    poll_state: TryLock<PollState>,
 }
 
 impl Parker {
@@ -67,14 +58,10 @@ impl Parker {
             state: AtomicUsize::new(0),
             mutex: Mutex::new(()),
             condvar: Condvar::new(),
-            poll_state: TryLock::new(PollState {
-                poll_events: PollEvents::new(),
-                poll_ready: VecDeque::new(),
-            }),
         }
     }
 
-    pub fn poll(&self) -> Option<Option<usize>> {
+    pub fn poll_unparked(&self) -> Option<Option<usize>> {
         let worker_index = match ParkState::from(self.state.load(Ordering::Acquire)) {
             ParkState::Notified(worker_index) => worker_index,
             _ => return None,
@@ -85,9 +72,16 @@ impl Parker {
     }
 
     #[cold]
-    pub fn park(&self, timeout: Option<Duration>) -> Option<usize> {
-        let poll_guard = self.executor.io_driver.try_poll();
-        let wait_state = [ParkState::Waiting, ParkState::Polling][poll_guard.is_some() as usize];
+    pub fn park(
+        &self,
+        poller: &mut Poller,
+        context: &Context,
+        timeout: Option<Duration>,
+    ) -> Option<usize> {
+        let poll_network_guard = poller.try_poll_network(context, &self.executor.net_poller);
+
+        let is_polling = poll_network_guard.is_some();
+        let wait_state = [ParkState::Waiting, ParkState::Polling][is_polling as usize];
 
         if let Err(_) = self.state.compare_exchange(
             ParkState::Empty.into(),
@@ -95,14 +89,12 @@ impl Parker {
             Ordering::Acquire,
             Ordering::Relaxed,
         ) {
-            return self.poll().unwrap();
+            return self.poll_unparked().unwrap();
         }
 
-        match poll_guard {
+        match poll_network_guard {
+            Some(park_polling) => park_polling.poll(timeout),
             None => self.park_waiting(timeout),
-            Some(guard) => self.park_polling(guard, timeout, |ready| {
-                self.executor.inject(ready.drain(..));
-            }),
         }
 
         if let Err(_) = self.state.compare_exchange(
@@ -111,7 +103,7 @@ impl Parker {
             Ordering::Release,
             Ordering::Relaxed,
         ) {
-            return self.poll().unwrap();
+            return self.poll_unparked().unwrap();
         }
 
         None
@@ -128,50 +120,16 @@ impl Parker {
                     _ => Some(ParkState::Notified(worker_index).into()),
                 },
             )
-            .map(|state| match ParkState::from(state) {
-                ParkState::Polling => {
-                    self.unpark_polling();
-                    true
+            .map(|state| {
+                match ParkState::from(state) {
+                    ParkState::Polling => self.executor.net_poller.notify(),
+                    ParkState::Waiting => self.unpark_waiting(),
+                    _ => return false,
                 }
-                ParkState::Waiting => {
-                    self.unpark_waiting();
-                    true
-                }
-                _ => false,
+                true
             })
             .ok()
             .unwrap_or(false)
-    }
-
-    #[cold]
-    pub fn park_polling(
-        &self,
-        mut poll_guard: PollGuard<'_>,
-        timeout: Option<Duration>,
-        f: impl FnOnce(&mut VecDeque<Runnable>),
-    ) {
-        let context_ref = Context::current();
-        let context = context_ref.as_ref();
-
-        let mut poll_state = self.poll_state.try_lock().unwrap();
-
-        let poll_ready = replace(&mut poll_state.poll_ready, VecDeque::new());
-        let intercept = context.intercept.borrow_mut().replace(poll_ready);
-        assert!(intercept.is_none());
-
-        poll_guard.poll(&mut poll_state.poll_events, timeout);
-        drop(poll_guard);
-
-        let intercept = context.intercept.borrow_mut().take();
-        poll_state.poll_ready = intercept.unwrap();
-
-        poll_state.poll_events.process(&self.executor.io_driver);
-        f(&mut poll_state.poll_ready);
-    }
-
-    #[cold]
-    fn unpark_polling(&self) {
-        self.executor.io_driver.notify();
     }
 
     #[cold]
@@ -188,15 +146,11 @@ impl Parker {
             _ => unreachable!("Parker waiting on condvar with invalid state"),
         }
 
-        let timed_out = self.condvar.wait_for(&mut mutex, timeout).timed_out();
+        let _ = self.condvar.wait_for(&mut mutex, timeout);
         match ParkState::from(self.state.load(Ordering::Relaxed)) {
             ParkState::Waiting => {}
             ParkState::Notified(_) => return,
             _ => unreachable!("Parker waiting on condvar with invalid state"),
-        }
-
-        if timed_out {
-            let _ = self.task_state.transition_to_scheduled();
         }
     }
 

@@ -25,6 +25,10 @@ impl Context {
         TLS.with(|ref_cell| f(&mut *ref_cell.borrow_mut()))
     }
 
+    pub fn with<F>(f: impl FnOnce(&Context) -> F) -> F {
+        f(Self::current().as_ref())
+    }
+
     pub fn current() -> ContextRef {
         Self::try_current().expect("Called runtime-specific function outside of a runtime context")
     }

@@ -1,4 +1,4 @@
-use crate::internal::waker::AtomicWaker;
+use crate::sync::internal::waker::AtomicWaker;
 use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use std::{collections::VecDeque, convert::TryInto, mem::size_of, sync::Arc};

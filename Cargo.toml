@@ -6,16 +6,21 @@ edition = "2021"
 authors = ["kprotty"]
 
 [dependencies]
-gcd = "2"
+# Necessary (to avoid unsafe)
 num_cpus = "1"
+pin-project-lite = "0.2"
+mio = { version = "0.7", features = ["net", "os-poll"] }
+
+# Convenience
+gcd = "2"
 pin-utils = "0.1"
+tokio = { version = "1", features = ["io-util"] }
+
+# Optimizations
 arc-swap = "1"
 try-lock = "0.2"
 parking_lot = "0.11"
 crossbeam-deque = "0.8"
-pin-project-lite = "0.2"
-tokio = { version = "1", features = ["io-util"] }
-mio = { version = "0.7", features = ["net", "os-poll"] }
 
 [[example]]
 name = "yaar_qsort"
