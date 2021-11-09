@@ -6,9 +6,9 @@ use std::{
     collections::BTreeMap,
     mem::drop,
     num::NonZeroU64,
+    sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     time::{Duration, Instant},
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 pub type Entry = Arc<RawEntry>;
@@ -38,7 +38,9 @@ impl<T: Default> Cache<T> {
 
     fn alloc(&mut self) -> T {
         let index = self.cached.len().checked_sub(1);
-        index.map(|i| self.cached.swap_remove(i)).unwrap_or_else(|| T::default())
+        index
+            .map(|i| self.cached.swap_remove(i))
+            .unwrap_or_else(|| T::default())
     }
 
     fn free(&mut self, value: T) {
@@ -214,7 +216,7 @@ impl DelayQueue {
                             break;
                         }
                     }
-                    
+
                     // This was the last entry in the queue for the deadline, remove it
                     if occupied.get().len() == 0 {
                         queue = Some(occupied.remove());
@@ -224,7 +226,7 @@ impl DelayQueue {
 
             if let Some(queue) = queue {
                 state.queue_cache.free(queue);
-                
+
                 // There's no longer a queue for our deadline.
                 // If `expires` was our deadline, find the next smallest deadline to expire at.
                 let next_expire = NonZeroU64::new(self.expires.get()).unwrap();

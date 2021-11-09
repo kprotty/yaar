@@ -18,18 +18,6 @@ tokio = { version = "1", features = ["io-util"] }
 mio = { version = "0.7", features = ["net", "os-poll"] }
 
 [[example]]
-name = "yaar_qsort"
-path = "examples/qsort/yaar.rs"
-
-[[example]]
-name = "rayon_qsort"
-path = "examples/qsort/rayon.rs"
-
-[[example]]
-name = "tokio_qsort"
-path = "examples/qsort/tokio.rs"
-
-[[example]]
 name = "yaar_http"
 path = "examples/http/yaar.rs"
 
@@ -37,7 +25,12 @@ path = "examples/http/yaar.rs"
 name = "tokio_http"
 path = "examples/http/tokio.rs"
 
+[[bench]]
+name = "qsort"
+harness = false
+
 [dev-dependencies]
+criterion = "0.3"
 rayon = "1.5"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
