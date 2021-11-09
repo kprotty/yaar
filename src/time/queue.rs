@@ -8,11 +8,18 @@ use std::{
     num::NonZeroU64,
     sync::Arc,
     time::{Duration, Instant},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
-pub type Millis = u64;
+pub type Entry = Arc<RawEntry>;
 
-pub type Entry = Arc<AtomicWaker>;
+#[derive(Default)]
+pub struct RawEntry {
+    pub waker: AtomicWaker,
+    queued: AtomicBool,
+}
+
+pub type Millis = u64;
 
 pub struct Delay {
     pub deadline: Millis,
@@ -22,20 +29,24 @@ pub struct Delay {
 type Queue = Vec<Entry>;
 
 #[derive(Default)]
-struct Cache<T>(Vec<T>);
+struct Cache<T> {
+    cached: Vec<T>,
+}
 
-impl<T> Cache<T> {
-    fn len(&self) -> usize {
-        self.0.len()
+impl<T: Default> Cache<T> {
+    const MAX_CACHED: usize = 64;
+
+    fn alloc(&mut self) -> T {
+        let index = self.cached.len().checked_sub(1);
+        index.map(|i| self.cached.swap_remove(i)).unwrap_or_else(|| T::default())
     }
 
-    fn push(&mut self, item: T) {
-        self.0.push(item)
-    }
-
-    fn pop(&mut self) -> Option<T> {
-        let index = self.len().checked_sub(1);
-        index.map(|i| self.0.swap_remove(i))
+    fn free(&mut self, value: T) {
+        if self.cached.len() < Self::MAX_CACHED {
+            self.cached.push(value)
+        } else {
+            drop(value);
+        }
     }
 }
 
@@ -48,7 +59,7 @@ impl Expired {
     }
 
     pub fn process(&mut self) {
-        self.0.drain(..).for_each(|entry| entry.wake());
+        self.0.drain(..).for_each(|entry| entry.waker.wake());
     }
 }
 
@@ -75,6 +86,7 @@ impl DelayQueue {
         }
     }
 
+    /// Get a reference to the current DelayQueue when running inside a runtime context
     pub fn with<F>(f: impl FnOnce(&Arc<Self>) -> F) -> F {
         let context_ref = Context::current();
         let context = context_ref.as_ref();
@@ -87,6 +99,7 @@ impl DelayQueue {
         f(&context.executor.workers[worker_index].delay_queue)
     }
 
+    /// Convert an Instant into u64 millis using the Delay's Instant as the starting epoch
     pub fn since(&self, instant: Instant) -> Millis {
         instant
             .checked_duration_since(self.started)
@@ -94,10 +107,12 @@ impl DelayQueue {
             .unwrap_or(0)
     }
 
+    /// Peek the next millis deadline that the DelayQueue will expire at
     pub fn expires(&self) -> Option<Millis> {
         NonZeroU64::new(self.expires.load()).map(|e| e.get())
     }
 
+    /// Update the DelayQueue to the `current` time and expire any timer Entries into `expired`.
     pub fn poll(&self, current: Millis, expired: &mut Expired) {
         let mut state = self.state.lock();
         state.current = state.current.max(current);
@@ -109,16 +124,24 @@ impl DelayQueue {
             }
 
             let mut queue = state.tree.remove(&deadline).unwrap();
-            expired.0.extend(queue.drain(..));
+            let entries = queue.drain(..).map(|entry| {
+                assert!(entry.queued.load(Ordering::Relaxed));
+                entry.queued.store(false, Ordering::Relaxed);
+                entry
+            });
 
-            if state.queue_cache.len() < 64 {
-                state.queue_cache.push(queue);
-            }
+            expired.0.extend(entries);
+            state.queue_cache.free(queue);
         }
 
         self.expires.store(0);
     }
 
+    /// Schedule an Entry to expire at the given `delay`.
+    /// Returns `None` if the delay has already expired.
+    ///
+    /// NOTE: allocates a resource that must be freed with `complete()`.
+    #[cold]
     pub fn schedule(&self, delay: Result<Duration, Instant>) -> Option<Delay> {
         if matches!(delay, Ok(Duration::ZERO)) {
             return None;
@@ -143,22 +166,15 @@ impl DelayQueue {
             return None;
         }
 
+        // expires = expires.map(|e| e.min(deadline)).unwrap_or(deadline)
         match NonZeroU64::new(self.expires.get()) {
             Some(e) if deadline < e.get() => self.expires.store(deadline),
             Some(_) => {}
             None => self.expires.store(deadline),
         }
 
-        let entry = state
-            .entry_cache
-            .pop()
-            .unwrap_or_else(|| Entry::new(AtomicWaker::new()));
-
-        let mut queue_cached = true;
-        let mut queue = state.queue_cache.pop().or_else(|| {
-            queue_cached = false;
-            Some(Queue::new())
-        });
+        let entry = state.entry_cache.alloc();
+        let mut queue = Some(state.queue_cache.alloc());
 
         match state.tree.entry(deadline) {
             TreeEntry::Occupied(ref mut occupied) => occupied.get_mut().push(entry.clone()),
@@ -168,63 +184,69 @@ impl DelayQueue {
             }
         }
 
+        // A new Queue wasn't needed so free it.
+        // We can't allocate a Queue when we need it while looking at the entry
+        // because the borrowck sees two mutable refs (queue_cache, tree.entry).
         if let Some(queue) = queue.take() {
-            if queue_cached {
-                state.queue_cache.push(queue);
-            }
+            state.queue_cache.free(queue);
         }
 
+        entry.queued.store(true, Ordering::Relaxed);
         Some(Delay { deadline, entry })
     }
 
+    /// Complete a scheduled Delay by removing it from any Queues and freeing it.
+    /// `cancelled` is used as a hint to remove from queues if necessary.
     #[cold]
-    pub fn complete(&self, delay: Delay, cancelled: bool) {
+    pub fn complete(&self, delay: Delay) {
+        let mut state = self.state.lock();
         let Delay { deadline, entry } = delay;
 
-        let mut state = self.state.lock();
-        if entry.poll(None).is_ready() {
-            return;
-        }
-
-        let mut removed = None;
-        if cancelled {
-            if let TreeEntry::Occupied(mut occupied) = state.tree.entry(deadline) {
-                for index in 0..occupied.get().len() {
-                    if Arc::ptr_eq(&occupied.get()[index], &entry) {
-                        drop(occupied.get_mut().swap_remove(index));
-                        break;
+        // Remove the entry from any queues if its still scheduled
+        if entry.queued.load(Ordering::Relaxed) {
+            let mut queue = None;
+            match state.tree.entry(deadline) {
+                TreeEntry::Vacant(_) => unreachable!("Delay entry queued without a queue"),
+                TreeEntry::Occupied(mut occupied) => {
+                    for index in 0..occupied.get().len() {
+                        if Arc::ptr_eq(&occupied.get()[index], &entry) {
+                            drop(occupied.get_mut().swap_remove(index));
+                            break;
+                        }
+                    }
+                    
+                    // This was the last entry in the queue for the deadline, remove it
+                    if occupied.get().len() == 0 {
+                        queue = Some(occupied.remove());
                     }
                 }
+            }
 
-                if occupied.get().len() == 0 {
-                    removed = Some(occupied.remove());
+            if let Some(queue) = queue {
+                state.queue_cache.free(queue);
+                
+                // There's no longer a queue for our deadline.
+                // If `expires` was our deadline, find the next smallest deadline to expire at.
+                let next_expire = NonZeroU64::new(self.expires.get()).unwrap();
+                if next_expire.get() == deadline {
+                    let next_deadline = state.tree.iter().next().map(|(deadline, _)| *deadline);
+                    self.expires.store(next_deadline.unwrap_or(0));
                 }
             }
         }
 
-        if let Some(queue) = removed {
-            if state.queue_cache.len() < 64 {
-                state.queue_cache.push(queue);
-            }
-
-            let next_expire = NonZeroU64::new(self.expires.get()).unwrap();
-            if next_expire.get() == deadline {
-                let next_deadline = state.tree.iter().next().map(|(deadline, _)| *deadline);
-                self.expires.store(next_deadline.unwrap_or(0));
-            }
-        }
-
-        if state.entry_cache.len() < 64 {
-            return state.entry_cache.push(entry);
-        }
-
-        drop(state);
-        drop(entry);
+        // Finally, free the entry
+        entry.queued.store(false, Ordering::Relaxed);
+        state.entry_cache.free(entry);
     }
 }
 
+/// A SharedU64 is an AtomicU64 that only supports load() and store().
+/// Many threads can call load() but only a single thread may call store() and get().
+/// It's meant to be fast to access on all platforms given its simple requirements.
 use shared_u64::SharedU64;
 
+// On 64bit platforms, use a regular AtomicU64.
 #[cfg(target_pointer_width = "64")]
 mod shared_u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -247,6 +269,14 @@ mod shared_u64 {
     }
 }
 
+/// On 32bit platforms, use a trick also found in windows KSYSTEM_TIME accesses.
+///
+/// It works by using AtomicU32s which are native and having a copy of the u64 high bits.
+/// It must write the high bits copy first, then low bits, then real high bits in that order.
+/// Readers must read them in strictly reverse order: real high bits, low bits, high bits copy.
+/// If the high bits copy matches the real high bits, then the Reader read a valid u64.
+///
+/// https://wrkhpi.wordpress.com/2007/08/09/getting-os-information-the-kuser_shared_data-structure/
 #[cfg(target_pointer_width = "32")]
 mod shared_u64 {
     use std::{

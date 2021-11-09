@@ -323,34 +323,45 @@ impl WorkerContext {
         now: &mut Option<Instant>,
         timeout: &mut Option<Duration>,
     ) -> Option<Runnable> {
+        // Get the DelayQueue and check if there's pending entries to expire (fast)
         let delay_queue = &context.executor.workers[worker_index].delay_queue;
         let expires = delay_queue.expires()?;
 
+        // Get the current time if not already known
         if now.is_none() {
             *now = Some(Instant::now());
         }
 
+        // Convert the current time into a DelayQueue deadline for polling/comparison.
         let current = delay_queue.since(now.unwrap());
+
+        // Update the timeout if there's nothing to currently expire.
         if current < expires {
             let duration = Duration::from_millis(expires - current);
             *timeout = Some(timeout.map(|t| t.min(duration)).unwrap_or(duration));
             return None;
         }
 
+        // There's entries to expire, try polling for them from the DelayQueue
         delay_queue.poll(current, &mut self.expired);
         if self.expired.is_empty() {
             return None;
         }
 
+        // We have entries to wake.
+        // Setup the Context::intercept queue to grab any scheduled runnables
         let ready = replace(&mut self.ready, VecDeque::new());
         let intercept = context.intercept.borrow_mut().replace(ready);
         assert!(intercept.is_none());
 
+        // Waker::wake() all of the expired timers we polled for.
         self.expired.process();
 
+        // Take back the Context::intercept queue to collect scheduled runnables
         let intercept = context.intercept.borrow_mut().take();
         self.ready = intercept.unwrap();
 
+        // Pop one to return and inject the rest into the runtime
         let runnable = self.ready.pop_front()?;
         if self.ready.len() > 0 {
             context.executor.inject(self.ready.drain(..));

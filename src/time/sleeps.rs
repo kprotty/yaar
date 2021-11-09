@@ -43,13 +43,21 @@ impl Future for Sleep {
         match replace(&mut self.state, State::Polled) {
             State::Start(delay) => {
                 let delay_queue = DelayQueue::with(|queue| queue.clone());
+
+                // A failed schedule means the delay has already expired.
+                // Instead of returning immediately, do a yield.
+                // The next poll with see State::Polled and return Poll::Ready.
                 let delay = match delay_queue.schedule(delay) {
                     Some(delay) => delay,
-                    None => return Poll::Ready(()),
+                    None => {
+                        ctx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
                 };
 
-                if delay.entry.poll(Some(ctx)).is_ready() {
-                    delay_queue.complete(delay, false);
+                // Poll the AtomicWaker to see if we we're notified by DelayQueue::Entries::process().
+                if delay.entry.waker.poll(Some(ctx)).is_ready() {
+                    delay_queue.complete(delay);
                     return Poll::Ready(());
                 }
 
@@ -57,15 +65,20 @@ impl Future for Sleep {
                 Poll::Pending
             }
             State::Polling((delay_queue, delay)) => {
-                if delay.entry.poll(Some(ctx)).is_ready() {
-                    delay_queue.complete(delay, false);
+                // Poll the AtomicWaker to see if we we're notified by DelayQueue::Entries::process().
+                if delay.entry.waker.poll(Some(ctx)).is_ready() {
+                    delay_queue.complete(delay);
                     return Poll::Ready(());
                 }
 
+                // We weren't, go back to sleeping (waker was regitered above)
                 self.state = State::Polling((delay_queue, delay));
                 Poll::Pending
             }
-            State::Polled => unreachable!("Sleep future polled after completion"),
+            State::Polled => {
+                // The future was polled to completion
+                Poll::Ready(())
+            }
         }
     }
 }
@@ -73,7 +86,8 @@ impl Future for Sleep {
 impl Drop for Sleep {
     fn drop(&mut self) {
         if let State::Polling((delay_queue, delay)) = replace(&mut self.state, State::Polled) {
-            delay_queue.complete(delay, true);
+            // Still need to complete (cancel) the delay if we started but never polled to completion
+            delay_queue.complete(delay);
         }
     }
 }
