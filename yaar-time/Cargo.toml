@@ -1,0 +1,8 @@
+[package]
+name = "yaar-time"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pin-project-lite = "0.2"
+parking_lot = "0.11"

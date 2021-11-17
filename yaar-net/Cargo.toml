@@ -1,0 +1,9 @@
+[package]
+name = "yaar-net"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arc-swap = "1"
+mio = { version = "0.7", features = ["net", "os-poll"] }
+

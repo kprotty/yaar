@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
-pub mod runtime;
-pub mod task;
-pub use task::spawn;
-pub mod io;
-pub mod net;
-pub mod sync;
-pub mod time;
+#[cfg(feature = "io")]
+pub use yaar_io as io;
+
+#[cfg(feature = "net")]
+pub use yaar_net as net;
+
+#[cfg(feature = "time")]
+pub use yaar_time as time;
+
+#[cfg(feature = "rt")]
+pub use yaar_runtime as runtime;
