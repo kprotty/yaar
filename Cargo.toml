@@ -6,15 +6,28 @@ edition = "2021"
 
 [features]
 default = []
-full = ["io", "net", "time", "rt"]
+full = ["io-util", "net", "time", "sync", "rt"]
 
-io = ["yaar-io"]
-net = ["yaar-net"]
-time = ["yaar-time"]
-rt = ["yaar-runtime"]
+io-util = ["tokio/io-util"]
+sync = []
+time = ["pin-project-lite"]
+net = [
+    "arc-swap",
+    "mio/net",
+    "mio/os-poll",
+]
+rt = [
+    "gcd",
+    "pin-utils",
+    "crossbeam-deque"
+]
 
 [dependencies]
-yaar-io = { path = "./yaar-io", optional = true }
-yaar-net = { path = "./yaar-net", optional = true }
-yaar-time = { path = "./yaar-time", optional = true }
-yaar-runtime = { path = "./yaar-runtime", optional = true }
+tokio = "1"
+mio = { version = "0.8", optional = true }
+gcd = { version = "2", optional = true }
+arc-swap = { version = "1", optional = true }
+num_cpus = { version = "1", optional = true }
+pin-utils = { version = "0.1", optional = true }
+pin-project-lite = { version = "0.2", optional = true }
+crossbeam-deque = { version = "0.8", optional = true }

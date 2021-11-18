@@ -1,13 +1,17 @@
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "io")]
-pub use yaar_io as io;
+mod waker;
+
+pub use tokio::io;
 
 #[cfg(feature = "net")]
-pub use yaar_net as net;
+pub mod net;
 
 #[cfg(feature = "time")]
-pub use yaar_time as time;
+pub mod time;
 
 #[cfg(feature = "rt")]
-pub use yaar_runtime as runtime;
+pub mod runtime;
+
+#[cfg(feature = "sync")]
+pub mod sync;
