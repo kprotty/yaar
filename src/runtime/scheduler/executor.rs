@@ -1,119 +1,88 @@
 use super::{
     config::Config,
     context::Context,
-    pool::ThreadPool,
-    queue::{Injector, Runnable},
-    random::RandomIterSource,
     worker::Worker,
+    thread_pool::ThreadPool,
+    queue::{Injector, Runnable},
 };
-use crate::io::driver::Driver as IoDriver;
-use parking_lot::Mutex;
 use std::{
-    collections::VecDeque,
-    io, iter,
-    num::NonZeroUsize,
-    sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    sync::atomic::{fence, AtomicUsize, AtomicBool, Ordering},
 };
 
-struct IdleQueue {
+struct Idle {
     pending: AtomicBool,
-    indices: Mutex<VecDeque<usize>>,
+    indices: Mutex<Vec<usize>>,
 }
 
-impl From<NonZeroUsize> for IdleQueue {
-    fn from(count: NonZeroUsize) -> Self {
+impl From<Vec<usize>> for Idle {
+    fn from(indices: Vec<usize>) -> Self {
         Self {
-            pending: AtomicBool::new(true),
-            indices: Mutex::new((0..count.get()).collect()),
+            pending: AtomicBool::new(indices.len() > 0),
+            indices: Mutex::new(indices),
         }
     }
 }
 
-impl IdleQueue {
-    fn pending(&self) -> bool {
-        self.pending.load(Ordering::SeqCst)
-    }
-
+impl Idle {
     fn push(&self, index: usize) {
-        let mut indices = self.indices.lock();
-        indices.push_back(index);
+        let mut indices = self.indices.lock().unwrap();
         self.pending.store(true, Ordering::Relaxed);
+        indices.push(index);
     }
 
     fn pop(&self) -> Option<usize> {
-        if !self.pending() {
+        if !self.pending.load(Ordering::Acquire) {
             return None;
         }
 
-        let mut indices = self.indices.lock();
-        indices.pop_back().map(|index| {
-            self.pending.store(indices.len() > 0, Ordering::Relaxed);
-            index
-        })
+        let mut indices = self.indices.lock().unwrap();
+        let index = indices.len().checked_sub(1);
+        let index = index.map(|i| indices.swap_remove(i));
+
+        self.pending.store(indices.len() > 0, Ordering::Relaxed);
+        index
     }
 }
 
 pub struct Executor {
-    idle: IdleQueue,
+    idle: Idle,
     searching: AtomicUsize,
-    pub io_driver: Arc<IoDriver>,
-    pub thread_pool: ThreadPool,
     pub injector: Injector,
-    pub rng_iter_source: RandomIterSource,
+    pub thread_pool: ThreadPool,
     pub workers: Box<[Worker]>,
 }
 
-impl Executor {
-    pub fn from(config: Config) -> io::Result<Self> {
-        let io_driver = IoDriver::new()?;
-        let worker_threads = config.worker_threads.unwrap();
+impl From<Config> for Executor {
+    fn from(config: Config) -> Self {
+        let num_workers = config.worker_threads.get();
 
-        Ok(Self {
-            idle: IdleQueue::from(worker_threads),
+        Self {
+            idle: Idle::from((0..num_workers).collect()),
             searching: AtomicUsize::new(0),
-            io_driver: Arc::new(io_driver),
-            thread_pool: ThreadPool::from(config),
-            rng_iter_source: RandomIterSource::from(worker_threads),
             injector: Injector::default(),
-            workers: (0..worker_threads.get())
-                .map(|_| Worker::default())
-                .collect(),
-        })
+            thread_pool: ThreadPool::from(config),
+            workers: (0..num_workers).map(|_| Worker::default()).collect(),
+        }
     }
+}
 
-    pub fn schedule(
-        self: &Arc<Self>,
-        runnable: Runnable,
-        context: Option<&Context>,
-        be_fair: bool,
-    ) {
+impl Executor {
+    pub fn schedule(self: &Arc<Self>, context: Option<&Context>, runnable: Runnable) {
         if let Some(context) = context {
-            assert!(Arc::ptr_eq(self, &context.executor));
-
-            if let Some(intercept) = context.intercept.borrow_mut().as_mut() {
-                intercept.push_back(runnable);
-                return;
-            }
-
             if let Some(producer) = context.producer.borrow().as_ref() {
-                producer.push(runnable, be_fair);
-                self.notify();
-                return;
+                producer.push(runnable);
+                return self.notify();
             }
         }
 
-        self.inject(iter::once(runnable))
-    }
-
-    pub fn inject(self: &Arc<Self>, runnables: impl Iterator<Item = Runnable>) {
-        runnables.for_each(|runnable| self.injector.push(runnable));
+        self.injector.push(runnable);
         fence(Ordering::SeqCst);
         self.notify();
     }
 
-    pub fn notify(self: &Arc<Self>) {
-        if !self.idle.pending() {
+    fn notify(self: &Arc<Self>) {
+        if !self.idle.pending.load(Ordering::Relaxed) {
             return;
         }
 
@@ -123,11 +92,10 @@ impl Executor {
             return;
         }
 
-        if let Err(searching) =
-            self.searching
-                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed)
+        if self.searching
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
         {
-            assert!(searching <= self.workers.len());
             return;
         }
 
@@ -143,7 +111,7 @@ impl Executor {
         assert_ne!(searching, 0);
     }
 
-    pub fn search_begin(&self) -> bool {
+    pub(super) fn search_begin(&self) -> bool {
         let searching = self.searching.load(Ordering::Relaxed);
         assert!(searching <= self.workers.len());
 
@@ -151,13 +119,13 @@ impl Executor {
             return false;
         }
 
-        let searching = self.searching.fetch_add(1, Ordering::Relaxed);
+        let searching = self.searching.fetch_add(1, Ordering::Acquire);
         assert!(searching < self.workers.len());
         true
     }
 
-    pub fn search_discovered(self: &Arc<Self>) {
-        let searching = self.searching.fetch_sub(1, Ordering::SeqCst);
+    pub(super) fn search_discovered(&self) {
+        let searching = self.searching.fetch_sub(1, Ordering::Relaxed);
         assert!(searching <= self.workers.len());
         assert_ne!(searching, 0);
 
@@ -166,22 +134,26 @@ impl Executor {
         }
     }
 
-    pub fn search_failed(&self, worker_index: usize, was_searching: bool) -> bool {
-        assert!(worker_index <= self.workers.len());
+    pub(super) fn search_failed(&self, was_searching: bool, worker_index: usize) -> Option<usize> {
+        assert!(worker_index < self.workers.len());
         self.idle.push(worker_index);
 
-        was_searching && {
+        if was_searching {
             let searching = self.searching.fetch_sub(1, Ordering::SeqCst);
             assert!(searching <= self.workers.len());
             assert_ne!(searching, 0);
 
-            searching == 1 && self.injector.pending()
+            if searching == 1 && self.injector.pending() {
+                return self.search_retry();
+            }
         }
+
+        None
     }
 
-    pub fn search_retry(&self) -> Option<usize> {
+    pub(super) fn search_retry(&self) -> Option<usize> {
         self.idle.pop().map(|worker_index| {
-            let searching = self.searching.fetch_add(1, Ordering::Relaxed);
+            let searching = self.searching.fetch_add(1, Ordering::Acquire);
             assert!(searching < self.workers.len());
             worker_index
         })

@@ -1,97 +1,66 @@
 use super::task::TaskRunnable;
-use crossbeam_deque::{
-    Injector as QueueInjector, Steal as QueueSteal, Stealer as QueueStealer, Worker as QueueWorker,
-};
-use std::{cell::Cell, hint::spin_loop, mem::replace, sync::Arc};
+use std::{mem::replace, sync::Arc};
 use try_lock::TryLock;
 
 pub type Runnable = Arc<dyn TaskRunnable>;
-pub type Steal = QueueSteal<Runnable>;
+
+pub type Steal = crossbeam_deque::Steal<Runnable>;
 
 #[derive(Default)]
 pub struct Injector {
-    injector: QueueInjector<Runnable>,
+    inner: crossbeam_deque::Injector<Runnable>
 }
 
 impl Injector {
     pub fn push(&self, runnable: Runnable) {
-        self.injector.push(runnable);
+        self.inner.push(runnable);
     }
 
     pub fn pending(&self) -> bool {
-        !self.injector.is_empty()
+        !self.inner.is_empty()
     }
 }
 
 pub struct Queue {
-    stealer: QueueStealer<Runnable>,
+    inner: crossbeam_deque::Stealer<Runnable>,
     producer: TryLock<Option<Producer>>,
 }
 
 impl Default for Queue {
     fn default() -> Self {
-        let producer = Producer::new();
-        let stealer = producer.stealer.clone();
-
+        let worker = crossbeam_deque::Worker::new_lifo();
+        let stealer = worker.stealer();
         Self {
-            stealer,
-            producer: TryLock::new(Some(producer)),
+            inner: stealer,
+            producer: TryLock::new(Some(Producer { inner: worker })),
         }
     }
 }
 
 impl Queue {
-    pub fn swap_producer(&self, new_producer: Option<Producer>) -> Option<Producer> {
-        let mut producer = self.producer.try_lock().unwrap();
-        replace(&mut *producer, new_producer)
+    pub fn swap_producer(&self, old_value: Option<Producer>) -> Option<Producer> {
+        replace(&mut *self.producer.try_lock(), old_value)
     }
 }
 
 pub struct Producer {
-    be_fair: Cell<bool>,
-    worker: QueueWorker<Runnable>,
-    stealer: QueueStealer<Runnable>,
+    inner: crossbeam_deque::Worker<Runnable>,
 }
 
 impl Producer {
-    fn new() -> Self {
-        let worker = QueueWorker::new_lifo();
-        let stealer = worker.stealer();
-
-        Self {
-            be_fair: Cell::new(false),
-            worker,
-            stealer,
-        }
+    pub fn push(&self, runnable: Runnable) {
+        self.inner.push(runnable);
     }
 
-    pub fn push(&self, runnable: Runnable, be_fair: bool) {
-        self.worker.push(runnable);
-        if be_fair {
-            self.be_fair.set(true);
-        }
-    }
-
-    pub fn pop(&self, be_fair: bool) -> Option<Runnable> {
-        let be_fair = be_fair || self.be_fair.replace(false);
-        if !be_fair {
-            return self.worker.pop();
-        }
-
-        loop {
-            match self.stealer.steal() {
-                Steal::Success(runnable) => return Some(runnable),
-                Steal::Empty => return None,
-                Steal::Retry => spin_loop(),
-            }
-        }
+    pub fn pop(&self) -> Option<Runnable> {
+        self.inner.pop();
     }
 
     pub fn steal(&self, queue: &Queue) -> Steal {
-        queue.stealer.steal_batch_and_pop(&self.worker)
+        queue.inner.steal_batch_and_pop(&self.inner)
     }
 
     pub fn consume(&self, injector: &Injector) -> Steal {
-        injector.injector.steal_batch_and_pop(&self.worker)
+        injector.inner.steal_batch_and_pop(&self.inner)
     }
 }
