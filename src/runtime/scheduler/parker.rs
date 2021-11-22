@@ -1,17 +1,26 @@
-use super::{
-    executor::Executor,
-    task::TaskState,
-};
+use super::{context::Context, task::TaskState};
 use std::{
-    thread::{self, Thread},
-    task::{Wake},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
-    sync::atomic::{AtomicUsize, AtomicBool, Ordering},
+    task::Wake,
+    thread::{self, Thread},
 };
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ParkState {
+    Empty,
+    Waiting,
+    Polling,
+    Notified(Option<usize>),
+}
+
+impl From<usize> for ParkState {
+    fn from(value: usize) -> Self {}
+}
 
 pub struct Parker {
     pub task_state: TaskState,
-    pub executor: Mutex<Option<Arc<Executor>>>,
+    pub context: Mutex<Option<Context>>,
     thread: Thread,
     notified: AtomicBool,
     state: AtomicUsize,
@@ -45,6 +54,7 @@ impl Wake for Parker {
 
 impl Parker {
     pub fn unpark(&self, worker_index: Option<usize>) -> bool {
-
+        let context = self.context.try_lock().unwrap().map(|c| c.clone());
+        let context = context.expect("Parker unparked when not running in runtime");
     }
 }

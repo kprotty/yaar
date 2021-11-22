@@ -1,10 +1,15 @@
-use super::{executor::Executor, random::Rng, queue::Producer};
-use std::{ops::Deref, cell::{Cell, RefCell}, rc::Rc, sync::Arc};
+use super::{executor::Executor, queue::Producer, random::Rng};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Deref,
+    rc::Rc,
+    sync::Arc,
+};
 
 pub struct Inner {
     pub rng: RefCell<Rng>,
     pub executor: Arc<Executor>,
-    pub worker_index: Cell<Option<usize>,
+    pub worker_index: Cell<Option<usize>>,
     pub producer: RefCell<Option<Producer>>,
 }
 
@@ -21,13 +26,11 @@ pub struct Context {
 
 impl Context {
     pub fn current() -> Self {
-        Self::try_current()
-            .expect("Called runtime-specific function outside of a runtime context")
+        Self::try_current().expect("Called runtime-specific function outside of a runtime context")
     }
 
     pub fn try_current() -> Option<Rc<Self>> {
-        Inner::with_tls(|tls| tls.as_ref().map(Rc::clone))
-            .map(|inner| Self { inner })
+        Inner::with_tls(|tls| tls.as_ref().map(Rc::clone)).map(|inner| Self { inner })
     }
 
     pub fn enter(executor: &Arc<Executor>) -> Self {
@@ -45,7 +48,7 @@ impl Context {
 
             let old_tls = replace(tls, Some(inner.clone()));
             assert!(old_tls.is_none(), "Nested block_on is not supported");
-            
+
             Self { inner }
         })
     }
@@ -61,7 +64,9 @@ impl Deref for Context {
 
 impl Clone for Context {
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone() }
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 

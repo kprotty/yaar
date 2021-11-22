@@ -1,9 +1,9 @@
-mod context;
-mod executor;
+pub mod config;
+pub mod context;
+pub mod executor;
+mod parker;
 mod queue;
 mod random;
-mod task;
-mod worker;
-mod config;
+pub mod task;
 mod thread_pool;
-mod parker;
+pub mod worker;

@@ -1,19 +1,21 @@
+use super::{context::Context, executor::Executor};
 use std::{
+    any::Any,
+    fmt,
+    future::Future,
+    io,
+    pin::Pin,
     sync::atomic::{AtomicU8, Ordering},
     sync::Arc,
-    any::Any,
-    future::Future,
-    pin::Pin,
-    task::{Poll, Context as PollContext, Wake, Waker},
+    task::{Context as PollContext, Poll, Wake, Waker},
 };
-
-pub type TaskError = Box<dyn Any + Send + 'static>;
 
 pub enum TaskPoll<T> {
     Retry,
     Pending,
     Ready(T),
-    Error(TaskError),
+    Shutdown,
+    Panic(Box<dyn Any + Send + 'static>),
 }
 
 const TASK_IDLE: u8 = 0;
@@ -29,13 +31,11 @@ pub struct TaskState {
 impl TaskState {
     pub fn transition_to_scheduled(&self) -> bool {
         self.state
-            .fetch_udpate(Ordering::Release, Ordering::Relaxed, |state| {
-                match state {
-                    TASK_IDLE => Some(TASK_SCHEDULED),
-                    TASK_RUNNING => Some(TASK_NOTIFIED),
-                    TASK_SCHEDULED | TASK_NOTIFIED => None,
-                    _ => unreachable!("invalid TaskState when transitioning to scheduled"),
-                }
+            .fetch_udpate(Ordering::Release, Ordering::Relaxed, |state| match state {
+                TASK_IDLE => Some(TASK_SCHEDULED),
+                TASK_RUNNING => Some(TASK_NOTIFIED),
+                TASK_SCHEDULED | TASK_NOTIFIED => None,
+                _ => unreachable!("invalid TaskState when transitioning to scheduled"),
             })
             .ok()
             .map(|state| state == TASK_IDLE)
@@ -65,19 +65,36 @@ impl TaskState {
         }
     }
 
-    pub fn poll<F: Future>(&self, waker: impl Wake, future: Pin<&mut F>) -> Option<TaskPoll<F::Output>> {
+    pub fn poll<W, P, T>(
+        &self,
+        context: &Context,
+        arc_waker: &Arc<W>,
+        poll_fn: P,
+    ) -> Option<TaskPoll<T>>
+    where
+        W: Wake,
+        P: FnOnce(&mut PollContext<'_>) -> Result<Poll<T>, Box<dyn Any + Send + 'static>>,
+    {
+        if context.executor.thread_pool.is_shutdown() {
+            return Some(TaskPoll::Shutdown);
+        }
+
         if !self.transition_to_running_from(TASK_SCHEDULED) {
             return None;
         }
 
-        let waker = Waker::from(waker);
+        let waker = Waker::from(arc_waker.clone());
         let mut ctx = PollContext::from(&waker);
-        let result = catch_unwind(AssertUnwindSafe(|| future.poll(&mut ctx)));
-        
+        let result = poll_fn(&mut ctx);
+
         match result {
-            Err(error) => Some(TaskPoll::Error(error)),
+            Err(error) => Some(TaskPoll::Panic(error)),
             Ok(Poll::Ready(output)) => Some(TaskPoll::Ready(output)),
             Ok(Poll::Pending) => {
+                if context.executor.thread_pool.is_shutdown() {
+                    return Some(TaskPoll::Shutdown);
+                }
+
                 if self.transition_to_idle() {
                     return Some(TaskPoll::Pending);
                 }
@@ -91,4 +108,89 @@ impl TaskState {
 
 pub trait TaskRunnable: Send + Sync {
     fn run(self: Arc<Self>, context: &Context);
+}
+
+pub trait TaskJoinable<T> {
+    fn poll_join(&self, ctx: &mut PollContext<'_>) -> Poll<Result<T, JoinError>>;
+}
+
+pub struct JoinHandle<T>(Option<Arc<dyn TaskJoinable<T>>>);
+
+impl<T> fmt::Debug for JoinHandle<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JoinHandle").finish()
+    }
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = Result<T, JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut PollContext<'_>) -> Poll<Self::Output> {
+        let joinable = self
+            .joinable
+            .take()
+            .expect("JoinHandle polled after completion");
+
+        if let Poll::Ready(result) = joinable.poll_join(ctx) {
+            return Poll::Ready(result);
+        }
+
+        self.joinable = Some(joinable);
+        Poll::Pending
+    }
+}
+
+pub struct JoinError(pub(super) Option<Box<dyn Any + Send + 'static>>);
+
+impl JoinError {
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn is_panic(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub fn into_panic(self) -> Box<dyn Any + Send + 'static> {
+        self.try_into_panic().unwrap()
+    }
+
+    pub fn try_into_panic(self) -> Result<Box<dyn Any + Send + 'static>, Self> {
+        match self.0 {
+            Some(error) => Ok(error),
+            None => Err(self),
+        }
+    }
+}
+
+impl fmt::Display for JoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(_) => write!(f, "panic"),
+            None => write!(f, "cancelled"),
+        }
+    }
+}
+
+impl fmt::Debug for JoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(_) => write!(f, "JoinError::Panic(...)"),
+            None => write!(f, "JoinError::Cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for JoinError {}
+
+impl From<JoinError> for io::Error {
+    fn from(self: JoinError) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Other,
+            match self.0 {
+                Some(_) => "task panicked",
+                None => "task was cancelled",
+            },
+        )
+    }
 }

@@ -1,13 +1,13 @@
 use super::{
     config::Config,
     context::Context,
-    worker::Worker,
-    thread_pool::ThreadPool,
     queue::{Injector, Runnable},
+    thread_pool::ThreadPool,
+    worker::Worker,
 };
 use std::{
+    sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
-    sync::atomic::{fence, AtomicUsize, AtomicBool, Ordering},
 };
 
 struct Idle {
@@ -92,7 +92,8 @@ impl Executor {
             return;
         }
 
-        if self.searching
+        if self
+            .searching
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {

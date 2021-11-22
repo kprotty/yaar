@@ -8,7 +8,7 @@ pub type Steal = crossbeam_deque::Steal<Runnable>;
 
 #[derive(Default)]
 pub struct Injector {
-    inner: crossbeam_deque::Injector<Runnable>
+    inner: crossbeam_deque::Injector<Runnable>,
 }
 
 impl Injector {
