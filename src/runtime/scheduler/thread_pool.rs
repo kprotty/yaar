@@ -66,7 +66,8 @@ impl ThreadPool {
 
     fn run(&self, executor: &Arc<Executor>, worker_index: usize) {
         (self.config.on_thread_start)();
-        let _guard = defer(|| (self.config.on_thread_stop)());
+        
+        (self.config.on_thread_stop)();
     }
 
     fn max_threads(&self) -> usize {

@@ -15,7 +15,29 @@ enum ParkState {
 }
 
 impl From<usize> for ParkState {
-    fn from(value: usize) -> Self {}
+    fn from(value: usize) -> Self {
+        match value & 0b11 {
+            0 => Self::Empty,
+            1 => Self::Waiting,
+            2 => Self::Polling,
+            3 => Self::Notified((value >> 2).checked_sub(1)),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Into<usize> for ParkState {
+    fn into(self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Waiting => 1,
+            Self::Polling => 2,
+            Self::Notified(index) => {
+                let index = index.map(|i| i + 1).unwrap_or(0);
+                3 | (index << 2)
+            }
+        }
+    }
 }
 
 pub struct Parker {
@@ -54,7 +76,25 @@ impl Wake for Parker {
 
 impl Parker {
     pub fn unpark(&self, worker_index: Option<usize>) -> bool {
-        let context = self.context.try_lock().unwrap().map(|c| c.clone());
-        let context = context.expect("Parker unparked when not running in runtime");
+        self.state
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
+                match ParkState::from(state) {
+                    ParkState::Notified(_) => None,
+                    _ => Some(ParkState::Notified(worker_index).into()),
+                }
+            })
+            .ok()
+            .and_then(|state| match ParkState::from(state) {
+                ParkState::Empty => None,
+                ParkState::Waiting => Some(true),
+                ParkState::Polling => Some(false),
+                _ => unreachable!(),
+            })
+            .map(|waiting| {
+                let context = self.context.try_lock().unwrap().map(|c| c.clone());
+                let context = context.expect("Parker unparked when not running in runtime");
+                
+            })
+            .is_some()
     }
 }
