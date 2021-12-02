@@ -1,4 +1,5 @@
 use super::{context::Context, executor::Executor, waker::AtomicWaker};
+use crate::dependencies::parking_lot::Mutex;
 use std::{
     any::Any,
     future::Future,
@@ -6,7 +7,7 @@ use std::{
     panic,
     pin::Pin,
     sync::atomic::{AtomicU8, Ordering},
-    sync::{Arc, Mutex},
+    sync::{Arc},
     task::{Context as PollContext, Poll, Wake, Waker},
 };
 
@@ -125,7 +126,7 @@ where
 {
     fn run(self: Arc<Self>, context: &Context) {
         assert!(self.state.transition_to_running_from_scheduled());
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
 
         let poll_result = match &mut *data {
             TaskData::Polling(future) => {
@@ -167,7 +168,7 @@ impl<F: Future> TaskJoinable<F::Output> for Task<F> {
             return Poll::Pending;
         }
 
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         match replace(&mut *data, TaskData::Joined) {
             TaskData::Ready(output) => Poll::Ready(output),
             TaskData::Error(error) => panic::resume_unwind(error),

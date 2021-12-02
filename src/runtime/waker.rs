@@ -1,7 +1,7 @@
+use crate::dependencies::parking_lot::Mutex;
 use std::{
     mem::replace,
     sync::atomic::{AtomicU8, Ordering},
-    sync::Mutex,
     task::{Context as PollContext, Poll, Waker},
 };
 
@@ -35,7 +35,7 @@ impl AtomicWaker {
         }
 
         {
-            let mut waker = self.waker.lock().unwrap();
+            let mut waker = self.waker.try_lock().unwrap();
             let will_wake = waker
                 .as_ref()
                 .map(|waker| ctx.waker().will_wake(waker))

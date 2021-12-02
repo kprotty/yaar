@@ -7,13 +7,14 @@ use super::{
     worker::Worker,
 };
 use once_cell::sync::OnceCell;
+use crate::dependencies::parking_lot::Mutex;
 use std::{
     future,
     mem::drop,
     num::NonZeroUsize,
     pin::Pin,
     sync::atomic::{fence, AtomicUsize, Ordering},
-    sync::{Arc, Mutex},
+    sync::{Arc},
     thread,
 };
 
@@ -118,7 +119,7 @@ impl Executor {
             return worker_index;
         }
 
-        let mut parked = self.parked.lock().unwrap();
+        let mut parked = self.parked.lock();
         if let Some(worker_index) = parker.poll() {
             return worker_index;
         }
@@ -130,7 +131,7 @@ impl Executor {
             return Some(worker_index);
         }
 
-        let mut parked = self.parked.lock().unwrap();
+        let mut parked = self.parked.lock();
         for index in 0..parked.len() {
             if Arc::ptr_eq(&parked[index], parker) {
                 drop(parked.swap_remove(index));
@@ -144,7 +145,7 @@ impl Executor {
 
     fn unpark(&self, worker_index: Option<usize>) -> Result<(), ()> {
         {
-            let mut parked = self.parked.lock().unwrap();
+            let mut parked = self.parked.lock();
             while let Some(index) = parked.len().checked_sub(1) {
                 let parker = parked.swap_remove(index);
                 drop(parked);
@@ -152,7 +153,7 @@ impl Executor {
                 if parker.unpark(worker_index) {
                     return Ok(());
                 } else {
-                    parked = self.parked.lock().unwrap();
+                    parked = self.parked.lock();
                 }
             }
         }

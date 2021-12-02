@@ -5,6 +5,7 @@ use super::{
     queue::{Runnable, Steal, Stealer as QueueStealer, Worker as QueueWorker},
     random::Rng,
 };
+use crate::dependencies::parking_lot::Mutex;
 use std::{
     any::Any,
     future::Future,
@@ -14,7 +15,7 @@ use std::{
     pin::Pin,
     ops::{Deref, DerefMut},
     sync::atomic::AtomicUsize,
-    sync::{Arc, Mutex},
+    sync::{Arc},
     task::{Context as PollContext, Poll, Waker},
 };
 

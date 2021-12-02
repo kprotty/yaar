@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+#[allow(unused)]
 mod dependencies;
 
 #[cfg(feature = "io")]

@@ -1,8 +1,9 @@
+use super::parking_lot::Mutex;
 use std::{
     cell::Cell,
     collections::VecDeque,
     sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc, Mutex},
+    sync::{Arc},
 };
 
 pub enum Steal<T> {
@@ -97,7 +98,7 @@ impl<T> Buffer<T> {
     }
 
     fn push(&self, item: T) {
-        let mut deque = self.deque.lock().unwrap();
+        let mut deque = self.deque.lock();
         deque.push_back(item);
         self.pending.store(true, Ordering::Relaxed);
     }
@@ -107,7 +108,7 @@ impl<T> Buffer<T> {
             return None;
         }
 
-        let mut deque = self.deque.lock().unwrap();
+        let mut deque = self.deque.lock();
         deque.pop_back().map(|item| {
             self.pending.store(deque.len() > 0, Ordering::Relaxed);
             item
@@ -120,8 +121,8 @@ impl<T> Buffer<T> {
         }
 
         let mut deque = match self.deque.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => return Steal::Retry,
+            Some(guard) => guard,
+            None => return Steal::Retry,
         };
 
         let item = match deque.pop_front() {
@@ -139,8 +140,8 @@ impl<T> Buffer<T> {
         }
 
         let mut deque = match self.deque.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => return Steal::Retry,
+            Some(guard) => guard,
+            None => return Steal::Retry,
         };
 
         let item = match deque.pop_front() {
@@ -150,7 +151,7 @@ impl<T> Buffer<T> {
 
         let batch_size = (deque.len() / 2).min(16);
         if batch_size > 0 {
-            let mut dst_deque = dst_buffer.deque.lock().unwrap();
+            let mut dst_deque = dst_buffer.deque.lock();
             dst_deque.extend(deque.drain(0..batch_size));
             dst_buffer.pending.store(true, Ordering::Relaxed);
         }
