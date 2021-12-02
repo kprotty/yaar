@@ -1,6 +1,6 @@
 use super::task::TaskRunnable;
-use std::sync::Arc;
 use crate::dependencies::crossbeam_deque;
+use std::sync::Arc;
 
 pub type Runnable = Arc<dyn TaskRunnable>;
 

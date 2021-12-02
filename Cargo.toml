@@ -5,7 +5,7 @@ version = "0.2.0"
 edition = "2021"
 
 [features]
-default = ["full", "fast"]
+default = ["full"]
 
 full = ["io", "io-util", "net", "sync", "time", "fs", "rt"]
 fast = ["crossbeam-deque", "try-lock", "parking_lot", "pin-utils"]

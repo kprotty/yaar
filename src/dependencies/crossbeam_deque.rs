@@ -3,7 +3,7 @@ use std::{
     cell::Cell,
     collections::VecDeque,
     sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc},
+    sync::Arc,
 };
 
 pub enum Steal<T> {
@@ -60,7 +60,9 @@ pub struct Injector<T> {
 
 impl<T> Injector<T> {
     pub fn new() -> Self {
-        Self { buffer: Buffer::new() }
+        Self {
+            buffer: Buffer::new(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {

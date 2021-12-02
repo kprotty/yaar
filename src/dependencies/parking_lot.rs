@@ -6,15 +6,19 @@ pub struct Mutex<T> {
 
 impl<T: Default> Default for Mutex<T> {
     fn default() -> Self {
-        Self { inner: Default::default() }
+        Self {
+            inner: Default::default(),
+        }
     }
 }
 
 impl<T> Mutex<T> {
     pub fn new(value: T) -> Self {
-        Self { inner: std::sync::Mutex::new(value) }
+        Self {
+            inner: std::sync::Mutex::new(value),
+        }
     }
-    
+
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         self.inner.try_lock().ok()
     }

@@ -12,8 +12,3 @@ pub mod parking_lot;
 pub use try_lock;
 #[cfg(not(feature = "try-lock"))]
 pub mod try_lock;
-
-#[cfg(feature = "pin-utils")]
-pub use pin_utils;
-#[cfg(not(feature = "pin-utils"))]
-pub mod pin_utils;

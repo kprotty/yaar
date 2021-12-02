@@ -6,15 +6,15 @@ use super::{
     random::RngSeqSeed,
     worker::Worker,
 };
-use once_cell::sync::OnceCell;
 use crate::dependencies::parking_lot::Mutex;
+use once_cell::sync::OnceCell;
 use std::{
     future,
     mem::drop,
     num::NonZeroUsize,
     pin::Pin,
     sync::atomic::{fence, AtomicUsize, Ordering},
-    sync::{Arc},
+    sync::Arc,
     thread,
 };
 
@@ -109,7 +109,7 @@ impl Executor {
             }
         }
 
-        let searching = self.searching.fetch_add(1, Ordering::Relaxed);
+        let searching = self.searching.fetch_sub(1, Ordering::Relaxed);
         assert!(searching <= self.workers.len());
         assert_ne!(searching, 0);
     }

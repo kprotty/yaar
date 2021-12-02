@@ -7,7 +7,7 @@ use std::{
     panic,
     pin::Pin,
     sync::atomic::{AtomicU8, Ordering},
-    sync::{Arc},
+    sync::Arc,
     task::{Context as PollContext, Poll, Wake, Waker},
 };
 
@@ -97,7 +97,7 @@ where
     }
 }
 
-impl<F> Wake for Task<F> 
+impl<F> Wake for Task<F>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
