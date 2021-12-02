@@ -11,11 +11,11 @@ use std::{
     future::Future,
     hint::spin_loop,
     mem::replace,
+    ops::{Deref, DerefMut},
     panic,
     pin::Pin,
-    ops::{Deref, DerefMut},
     sync::atomic::AtomicUsize,
-    sync::{Arc},
+    sync::Arc,
     task::{Context as PollContext, Poll, Waker},
 };
 
@@ -29,7 +29,7 @@ impl Worker {
     pub fn new() -> Self {
         let worker = QueueWorker::new_lifo();
         let stealer = worker.stealer();
-        
+
         Self {
             idle_next: AtomicUsize::new(0),
             queue_worker: TryLock::new(Some(worker)),
@@ -37,7 +37,7 @@ impl Worker {
         }
     }
 
-    pub fn block_on<F, P>(mut worker_index: Option<usize>, future: Pin<P>) -> F::Output 
+    pub fn block_on<F, P>(mut worker_index: Option<usize>, future: Pin<P>) -> F::Output
     where
         F: Future,
         P: Deref<Target = F> + DerefMut,
@@ -75,7 +75,7 @@ impl Worker {
     }
 }
 
-struct WorkerContext<F, P> 
+struct WorkerContext<F, P>
 where
     F: Future,
     P: Deref<Target = F> + DerefMut,
@@ -91,8 +91,8 @@ where
 
 impl<F, P> WorkerContext<F, P>
 where
-F: Future,
-P: Deref<Target = F> + DerefMut,
+    F: Future,
+    P: Deref<Target = F> + DerefMut,
 {
     fn transition_to_notified(&mut self, worker_index: usize) {
         assert_eq!(self.context.worker_index.get(), None);
@@ -100,7 +100,7 @@ P: Deref<Target = F> + DerefMut,
 
         let queue_worker_slot = &self.executor.workers[worker_index].queue_worker;
         let queue_worker = replace(&mut *queue_worker_slot.try_lock().unwrap(), None);
-        let queue_worker = queue_worker.unwrap();
+        let queue_worker = queue_worker.expect("worker index without a queue_worker");
 
         let queue_worker = self.context.queue_worker.borrow_mut().replace(queue_worker);
         assert!(queue_worker.is_none());
@@ -145,7 +145,7 @@ P: Deref<Target = F> + DerefMut,
             if poll_retry {
                 continue;
             }
-
+            
             if let Some(worker_index) = self.executor.park(&self.parker) {
                 self.transition_to_notified(worker_index);
             }

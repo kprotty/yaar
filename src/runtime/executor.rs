@@ -13,6 +13,7 @@ use std::{
     mem::drop,
     num::NonZeroUsize,
     pin::Pin,
+    task::Poll,
     sync::atomic::{fence, AtomicUsize, Ordering},
     sync::Arc,
     thread,
@@ -50,23 +51,6 @@ impl Executor {
 
             executor
         })
-    }
-
-    fn idle_empty(&self) -> bool {
-        self.idle_queue.is_empty()
-    }
-
-    fn idle_push(&self, worker_index: usize) {
-        self.idle_queue.push(worker_index, |next_index| {
-            self.workers[worker_index]
-                .idle_next
-                .store(next_index, Ordering::Relaxed);
-        })
-    }
-
-    fn idle_pop(&self) -> Option<usize> {
-        self.idle_queue
-            .pop(|worker_index| self.workers[worker_index].idle_next.load(Ordering::Relaxed))
     }
 
     pub fn schedule(&self, runnable: Runnable, context: Option<&Context>) {
@@ -114,59 +98,6 @@ impl Executor {
         assert_ne!(searching, 0);
     }
 
-    pub fn park(&self, parker: &Arc<Parker>) -> Option<usize> {
-        if let Some(worker_index) = parker.poll() {
-            return worker_index;
-        }
-
-        let mut parked = self.parked.lock();
-        if let Some(worker_index) = parker.poll() {
-            return worker_index;
-        }
-
-        parked.push(parker.clone());
-        drop(parked);
-
-        if let Some(worker_index) = parker.park() {
-            return Some(worker_index);
-        }
-
-        let mut parked = self.parked.lock();
-        for index in 0..parked.len() {
-            if Arc::ptr_eq(&parked[index], parker) {
-                drop(parked.swap_remove(index));
-                break;
-            }
-        }
-
-        drop(parked);
-        parker.poll().unwrap()
-    }
-
-    fn unpark(&self, worker_index: Option<usize>) -> Result<(), ()> {
-        {
-            let mut parked = self.parked.lock();
-            while let Some(index) = parked.len().checked_sub(1) {
-                let parker = parked.swap_remove(index);
-                drop(parked);
-
-                if parker.unpark(worker_index) {
-                    return Ok(());
-                } else {
-                    parked = self.parked.lock();
-                }
-            }
-        }
-
-        thread::Builder::new()
-            .spawn(move || {
-                let mut future = future::pending::<()>();
-                Worker::block_on(worker_index, Pin::new(&mut future))
-            })
-            .map(drop)
-            .map_err(drop)
-    }
-
     pub fn search_begin(&self) -> bool {
         let searching = self.searching.load(Ordering::Relaxed);
         if (2 * searching) >= self.workers.len() {
@@ -207,5 +138,81 @@ impl Executor {
             assert!(searching < self.workers.len());
             worker_index
         })
+    }
+
+    fn idle_empty(&self) -> bool {
+        self.idle_queue.is_empty()
+    }
+
+    fn idle_push(&self, worker_index: usize) {
+        self.idle_queue.push(worker_index, |next_index| {
+            self.workers[worker_index]
+                .idle_next
+                .store(next_index, Ordering::Relaxed);
+        })
+    }
+
+    fn idle_pop(&self) -> Option<usize> {
+        self.idle_queue
+            .pop(|worker_index| self.workers[worker_index].idle_next.load(Ordering::Relaxed))
+    }
+
+    pub fn park(&self, parker: &Arc<Parker>) -> Option<usize> {
+        if let Poll::Ready(worker_index) = parker.poll() {
+            return worker_index;
+        }
+
+        {
+            let mut parked = self.parked.lock();
+            if let Poll::Ready(worker_index) = parker.poll() {
+                return worker_index;
+            }
+
+            assert!(!parker.queued.load(Ordering::Relaxed));
+            parker.queued.store(true, Ordering::Relaxed);
+            parked.push(parker.clone());
+        }
+
+        let worker_index = parker.park();
+
+        if parker.queued.load(Ordering::Relaxed) {
+            let mut parked = self.parked.lock();
+            if parker.queued.load(Ordering::Relaxed) {
+                for index in 0..parked.len() {
+                    if Arc::ptr_eq(&parked[index], parker) {
+                        drop(parked.swap_remove(index));
+                        break;
+                    }
+                }
+            }
+        }
+
+        worker_index
+    }
+
+    fn unpark(&self, worker_index: Option<usize>) -> Result<(), ()> {
+        {
+            let mut parked = self.parked.lock();
+            while let Some(index) = parked.len().checked_sub(1) {
+                let parker = parked.swap_remove(index);
+                assert!(parker.queued.load(Ordering::Relaxed));
+                parker.queued.store(false, Ordering::Relaxed);
+
+                drop(parked);
+                if parker.unpark(worker_index) {
+                    return Ok(());
+                }
+                
+                parked = self.parked.lock();
+            }
+        }
+
+        thread::Builder::new()
+            .spawn(move || {
+                let mut future = future::pending::<()>();
+                Worker::block_on(worker_index, Pin::new(&mut future))
+            })
+            .map(drop)
+            .map_err(drop)
     }
 }

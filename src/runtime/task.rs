@@ -169,7 +169,10 @@ impl<F: Future> TaskJoinable<F::Output> for Task<F> {
         }
 
         let mut data = self.data.try_lock().unwrap();
-        match replace(&mut *data, TaskData::Joined) {
+        let task_data = replace(&mut *data, TaskData::Joined);
+        drop(data);
+
+        match task_data {
             TaskData::Ready(output) => Poll::Ready(output),
             TaskData::Error(error) => panic::resume_unwind(error),
             TaskData::Joined => unreachable!("Task joined multiple times"),

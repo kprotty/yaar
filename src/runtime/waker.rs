@@ -38,7 +38,7 @@ impl AtomicWaker {
             let mut waker = self.waker.try_lock().unwrap();
             let will_wake = waker
                 .as_ref()
-                .map(|waker| ctx.waker().will_wake(waker))
+                .map(|w| ctx.waker().will_wake(w))
                 .unwrap_or(false);
 
             if !will_wake {
@@ -64,7 +64,10 @@ impl AtomicWaker {
             _ => unreachable!("invalid AtomicWaker state"),
         }
 
-        if let Some(waker) = replace(&mut *self.waker.try_lock().unwrap(), None) {
+        if let Some(waker) = {
+            let mut waker = self.waker.try_lock().unwrap();
+            replace(&mut *waker, None)
+        } {
             waker.wake();
         }
     }

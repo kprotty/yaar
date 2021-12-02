@@ -1,8 +1,8 @@
 use super::task::TaskState;
 use std::{
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, AtomicBool, Ordering},
     sync::Arc,
-    task::Wake,
+    task::{Wake, Poll},
     thread::{self, Thread},
 };
 
@@ -40,6 +40,7 @@ impl From<usize> for ParkState {
 pub struct Parker {
     state: AtomicUsize,
     thread: Thread,
+    pub queued: AtomicBool,
     pub task_state: TaskState,
 }
 
@@ -60,61 +61,68 @@ impl Parker {
         Self {
             state: AtomicUsize::new(0),
             thread: thread::current(),
+            queued: AtomicBool::new(false),
             task_state: TaskState::default(),
         }
     }
 
-    pub fn poll(&self) -> Option<Option<usize>> {
+    fn reset(&self) {
+        let new_state = ParkState::Empty.into();
+        self.state.store(new_state, Ordering::Relaxed);
+    }
+
+    pub fn poll(&self) -> Poll<Option<usize>> {
         match ParkState::from(self.state.load(Ordering::Acquire)) {
-            ParkState::Notified(worker_index) => Some(worker_index),
-            _ => None,
+            ParkState::Notified(worker_index) => {
+                self.reset();
+                Poll::Ready(worker_index)
+            }
+            ParkState::Empty => Poll::Pending,
+            ParkState::Waiting => unreachable!("Parker polling when waiting")
         }
     }
 
     pub fn park(&self) -> Option<usize> {
-        let worker_index = self
-            .state
-            .fetch_update(
-                Ordering::Acquire,
-                Ordering::Acquire,
-                |state| match ParkState::from(state) {
-                    ParkState::Waiting => unreachable!("parking when already parked"),
-                    ParkState::Empty => Some(ParkState::Waiting.into()),
-                    ParkState::Notified(_) => None,
-                },
-            )
-            .map(|_| loop {
-                thread::park();
-                match self.poll() {
-                    Some(worker_index) => break worker_index,
-                    None => continue,
-                }
-            })
-            .unwrap_or_else(|state| match ParkState::from(state) {
-                ParkState::Notified(worker_index) => worker_index,
-                _ => unreachable!("invalid ParkState when notified"),
-            });
+        if let Err(state) = self.state.compare_exchange(
+            ParkState::Empty.into(),
+            ParkState::Waiting.into(),
+            Ordering::Acquire,
+            Ordering::Acquire,
+        ) {
+            match ParkState::from(state) {
+                ParkState::Notified(worker_index) => return worker_index,
+                _ => unreachable!("invalid Parker state when waiting"),
+            }
+        }
 
-        let new_state = ParkState::Empty.into();
-        self.state.store(new_state, Ordering::Relaxed);
+        let worker_index = loop {
+            thread::park();
+            match ParkState::from(self.state.load(Ordering::Acquire)) {
+                ParkState::Waiting => continue,
+                ParkState::Notified(worker_index) => break worker_index,
+                ParkState::Empty => unreachable!("invalid Parker state while waiting")
+            }
+        };
+
+        self.reset();
         worker_index
     }
 
     pub fn unpark(&self, worker_index: Option<usize>) -> bool {
         self.state
             .fetch_update(
-                Ordering::Release,
+                Ordering::AcqRel,
                 Ordering::Relaxed,
                 |state| match ParkState::from(state) {
                     ParkState::Notified(_) => None,
                     _ => Some(ParkState::Notified(worker_index).into()),
                 },
             )
-            .ok()
-            .and_then(|state| match ParkState::from(state) {
-                ParkState::Waiting => Some(self.thread.unpark()),
-                _ => None,
+            .map(|state| match ParkState::from(state) {
+                ParkState::Empty => {},
+                ParkState::Waiting => self.thread.unpark(),
+                ParkState::Notified(_) => unreachable!(),
             })
-            .is_some()
+            .is_ok()
     }
 }
