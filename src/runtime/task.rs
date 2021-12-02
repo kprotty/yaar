@@ -1,5 +1,5 @@
 use super::{context::Context, executor::Executor, waker::AtomicWaker};
-use crate::dependencies::parking_lot::Mutex;
+use crate::dependencies::try_lock::TryLock;
 use std::{
     any::Any,
     future::Future,
@@ -70,7 +70,7 @@ enum TaskData<F: Future> {
 
 pub struct Task<F: Future> {
     state: TaskState,
-    data: Mutex<TaskData<F>>,
+    data: TryLock<TaskData<F>>,
     waker: AtomicWaker,
 }
 
@@ -82,7 +82,7 @@ where
     pub fn spawn(future: F, context: Option<&Context>) -> Arc<Self> {
         let task = Arc::new(Self {
             state: TaskState::default(),
-            data: Mutex::new(TaskData::Polling(Box::pin(future))),
+            data: TryLock::new(TaskData::Polling(Box::pin(future))),
             waker: AtomicWaker::default(),
         });
 
@@ -126,7 +126,7 @@ where
 {
     fn run(self: Arc<Self>, context: &Context) {
         assert!(self.state.transition_to_running_from_scheduled());
-        let mut data = self.data.lock();
+        let mut data = self.data.try_lock().unwrap();
 
         let poll_result = match &mut *data {
             TaskData::Polling(future) => {
@@ -168,7 +168,7 @@ impl<F: Future> TaskJoinable<F::Output> for Task<F> {
             return Poll::Pending;
         }
 
-        let mut data = self.data.lock();
+        let mut data = self.data.try_lock().unwrap();
         match replace(&mut *data, TaskData::Joined) {
             TaskData::Ready(output) => Poll::Ready(output),
             TaskData::Error(error) => panic::resume_unwind(error),

@@ -1,4 +1,4 @@
-use crate::dependencies::parking_lot::Mutex;
+use crate::dependencies::try_lock::TryLock;
 use std::{
     mem::replace,
     sync::atomic::{AtomicU8, Ordering},
@@ -13,7 +13,7 @@ const NOTIFIED: u8 = 3;
 #[derive(Default)]
 pub struct AtomicWaker {
     state: AtomicU8,
-    waker: Mutex<Option<Waker>>,
+    waker: TryLock<Option<Waker>>,
 }
 
 impl AtomicWaker {

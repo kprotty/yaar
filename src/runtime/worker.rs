@@ -5,7 +5,7 @@ use super::{
     queue::{Runnable, Steal, Stealer as QueueStealer, Worker as QueueWorker},
     random::Rng,
 };
-use crate::dependencies::parking_lot::Mutex;
+use crate::dependencies::try_lock::TryLock;
 use std::{
     any::Any,
     future::Future,
@@ -21,7 +21,7 @@ use std::{
 
 pub struct Worker {
     pub idle_next: AtomicUsize,
-    queue_worker: Mutex<Option<QueueWorker>>,
+    queue_worker: TryLock<Option<QueueWorker>>,
     queue_stealer: QueueStealer,
 }
 
@@ -32,7 +32,7 @@ impl Worker {
         
         Self {
             idle_next: AtomicUsize::new(0),
-            queue_worker: Mutex::new(Some(worker)),
+            queue_worker: TryLock::new(Some(worker)),
             queue_stealer: stealer,
         }
     }

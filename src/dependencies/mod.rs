@@ -8,3 +8,7 @@ pub use parking_lot;
 #[cfg(not(feature = "parking_lot"))]
 pub mod parking_lot;
 
+#[cfg(feature = "try-lock")]
+pub use try_lock;
+#[cfg(not(feature = "try-lock"))]
+pub mod try_lock;
