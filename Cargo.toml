@@ -5,7 +5,10 @@ version = "0.2.0"
 edition = "2021"
 
 [features]
-default = ["io", "io-util", "net", "sync", "time", "fs", "rt"]
+default = ["full", "fast"]
+
+full = ["io", "io-util", "net", "sync", "time", "fs", "rt"]
+fast = ["crossbeam-deque", "try-lock", "parking_lot", "pin-utils"]
 
 io = ["tokio"]
 io-util = ["tokio/io-util"]

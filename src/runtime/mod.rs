@@ -21,12 +21,7 @@ use std::{
 };
 
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    #[cfg(feature = "pin-utils")]
-    pin_utils::pin_mut!(future);
-
-    #[cfg(not(feature = "pin-utils"))]
-    let future = Box::pin(future);
-
+    crate::dependencies::pin_utils::pin_mut!(future);
     Worker::block_on(None, future)
 }
 
