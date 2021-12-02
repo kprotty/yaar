@@ -39,7 +39,7 @@ impl Executor {
                 searching: AtomicUsize::new(0),
                 parked: Mutex::new(Vec::with_capacity(max_threads.get())),
                 rng_seq_seed: RngSeqSeed::new(max_threads),
-                injector: QueueInjector::default(),
+                injector: QueueInjector::new(),
                 workers: (0..max_threads.get()).map(|_| Worker::new()).collect(),
             };
 

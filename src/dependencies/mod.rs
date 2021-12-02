@@ -1,4 +1,4 @@
-#[cfg(feature = "once_cell")]
-pub use once_cell;
-#[cfg(not(feature = "once_cell"))]
-pub mod once_cell;
+#[cfg(feature = "crossbeam-deque")]
+pub use crossbeam_deque;
+#[cfg(not(feature = "crossbeam-deque"))]
+pub mod crossbeam_deque;
