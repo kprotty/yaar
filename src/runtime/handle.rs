@@ -1,5 +1,5 @@
-use super::scheduler::{
-    config::Config,
+use super::{
+    builder::Config,
     context::Context,
     executor::Executor,
     task::{JoinHandle, Task},
@@ -8,7 +8,7 @@ use super::scheduler::{
 use std::{future::Future, io, marker::PhantomData, sync::Arc};
 
 pub struct Handle {
-    pub(crate) executor: Arc<Executor>,
+    pub(super) executor: Arc<Executor>,
 }
 
 impl Clone for Handle {
@@ -21,7 +21,7 @@ impl Clone for Handle {
 
 impl Handle {
     pub(crate) fn new(config: Config) -> io::Result<Self> {
-        Executor::build(config).map(|executor| Self {
+        Executor::new(config).map(|executor| Self {
             executor: Arc::new(executor),
         })
     }
@@ -48,16 +48,13 @@ impl Handle {
         JoinHandle(Some(task))
     }
 
-    pub fn spawn_blocking<F, R>(&self, func: F) -> JoinHandle<R>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        unimplemented!("todo")
-    }
-
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        #[cfg(feature = "pin_utils")]
         pin_utils::pin_mut!(future);
+
+        #[cfg(not(feature = "pin_utils"))]
+        let future = Box::pin(future);
+
         Worker::block_on(&self.executor, None, future)
     }
 

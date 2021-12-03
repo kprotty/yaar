@@ -10,41 +10,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-struct Idle {
-    pending: AtomicBool,
-    indices: Mutex<Vec<usize>>,
-}
-
-impl From<Vec<usize>> for Idle {
-    fn from(indices: Vec<usize>) -> Self {
-        Self {
-            pending: AtomicBool::new(indices.len() > 0),
-            indices: Mutex::new(indices),
-        }
-    }
-}
-
-impl Idle {
-    fn push(&self, index: usize) {
-        let mut indices = self.indices.lock().unwrap();
-        self.pending.store(true, Ordering::Relaxed);
-        indices.push(index);
-    }
-
-    fn pop(&self) -> Option<usize> {
-        if !self.pending.load(Ordering::Acquire) {
-            return None;
-        }
-
-        let mut indices = self.indices.lock().unwrap();
-        let index = indices.len().checked_sub(1);
-        let index = index.map(|i| indices.swap_remove(i));
-
-        self.pending.store(indices.len() > 0, Ordering::Relaxed);
-        index
-    }
-}
-
 pub struct Executor {
     idle: Idle,
     searching: AtomicUsize,
@@ -112,7 +77,7 @@ impl Executor {
         assert_ne!(searching, 0);
     }
 
-    pub(super) fn search_begin(&self) -> bool {
+    pub fn search_begin(&self) -> bool {
         let searching = self.searching.load(Ordering::Relaxed);
         assert!(searching <= self.workers.len());
 
@@ -125,7 +90,7 @@ impl Executor {
         true
     }
 
-    pub(super) fn search_discovered(&self) {
+    pub fn search_discovered(&self) {
         let searching = self.searching.fetch_sub(1, Ordering::Relaxed);
         assert!(searching <= self.workers.len());
         assert_ne!(searching, 0);
@@ -135,7 +100,7 @@ impl Executor {
         }
     }
 
-    pub(super) fn search_failed(&self, was_searching: bool, worker_index: usize) -> Option<usize> {
+    pub fn search_failed(&self, was_searching: bool, worker_index: usize) -> Option<usize> {
         assert!(worker_index < self.workers.len());
         self.idle.push(worker_index);
 
@@ -152,11 +117,20 @@ impl Executor {
         None
     }
 
-    pub(super) fn search_retry(&self) -> Option<usize> {
+    pub fn search_retry(&self) -> Option<usize> {
         self.idle.pop().map(|worker_index| {
             let searching = self.searching.fetch_add(1, Ordering::Acquire);
             assert!(searching < self.workers.len());
             worker_index
         })
+    }
+
+    pub fn call_blocking<F>(self: &Arc<Self>, f: impl FnOnce()) -> (F, Option<usize>) {
+        // mark current worker as blocked
+        // do f()
+        // try to unmark current worker (races with monitor)
+        // - on success return current worker index
+        // - on failure, pop_idle_worker()
+        // to inject on failure, wake_by_ref() with Pending
     }
 }

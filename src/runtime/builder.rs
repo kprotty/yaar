@@ -1,6 +1,30 @@
 use super::{scheduler::config::ConfigBuilder, Runtime};
 use std::{io, num::NonZeroUsize, sync::Arc, time::Duration};
 
+pub struct Config {
+    pub keep_alive: Option<Duration>,
+    pub stack_size: Option<NonZeroUsize>,
+    pub worker_threads: Option<NonZeroUsize>,
+    pub blocking_threads: Option<NonZeroUsize>,
+    pub on_thread_start: Option<Box<dyn Fn() + Send + Sync + 'static>>,
+    pub on_thread_stop: Option<Box<dyn Fn() + Send + Sync + 'static>>,
+    pub on_thread_park: Option<Box<dyn Fn() + Send + Sync + 'static>>,
+    pub on_thread_unpark: Option<Box<dyn Fn() + Send + Sync + 'static>>,
+    pub on_thread_name: Option<Box<dyn Fn() -> String + Send + Sync + 'static>>,
+}
+
+impl Config {
+    pub fn max_threads(&self) -> NonZeroUsize {
+        let blocking_threads = config.blocking_threads.unwrap();
+        let worker_threads = config.worker_threads.unwrap();
+        worker_threads + blocking_threads
+    }
+}
+
+pub struct Builder {
+    config: Config,
+}
+
 #[derive(Default)]
 pub struct Builder {
     config_builder: ConfigBuilder,
