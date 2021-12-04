@@ -652,7 +652,7 @@ impl Executor {
 
     fn shutdown_and_join(&self, timeout: Option<Option<Duration>>) {
         let mut parked = self.parked.lock().unwrap();
-        assert!(!self.running.load(Ordering::Relaxed));
+        assert!(self.running.load(Ordering::Relaxed));
         self.running.store(false, Ordering::Release);
 
         let pending = replace(&mut *parked, Vec::new());
@@ -788,6 +788,8 @@ impl<F: Future, P: Deref<Target = F> + DerefMut> Worker<F, P> {
     }
 
     fn block_on_worker(&mut self) -> Result<F::Output, Box<dyn Any + Send + 'static>> {
+        assert!(self.parker.task_state.transition_to_scheduled());
+
         loop {
             let retry_poll_future = match self.poll_future() {
                 Poll::Ready(Some(result)) => return result,
@@ -1114,3 +1116,4 @@ impl<T> Queue<T> {
         Steal::Success(item)
     }
 }
+
