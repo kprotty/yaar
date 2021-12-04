@@ -62,8 +62,9 @@ impl Runtime {
         let future = Box::pin(future);
 
         self.context.with_executor(|e| e.task_begin());
-        let result = Worker::block_on(
+        let result = WorkerThread::block_on(
             future,
+            None,
             match &self.context {
                 RuntimeContext::New(executor) => Thread::enter(executor),
                 RuntimeContext::Current(thread) => thread.clone(),
@@ -83,7 +84,7 @@ impl Runtime {
         F::Output: Send + 'static,
     {
         let executor = self.context.with_executor(|e| e.clone());
-        executor.task_complete();
+        executor.task_begin();
 
         let task = Arc::new(Task {
             state: TaskState::default(),
@@ -373,65 +374,103 @@ impl<F: Future> Joinable<F::Output> for Task<F> {
     }
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ParkState {
+    Empty,
+    Waiting,
+    Notified(Option<usize>),
+}
+
+impl Into<usize> for ParkState {
+    fn into(self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Waiting => 1,
+            Self::Notified(index) => {
+                let index = index.map(|i| i + 1).unwrap_or(0);
+                2 | (index << 2)
+            }
+        }
+    }
+}
+
+impl From<usize> for ParkState {
+    fn from(value: usize) -> Self {
+        match value & 0b11 {
+            0 => Self::Empty,
+            1 => Self::Waiting,
+            2 => Self::Notified((value >> 2).checked_sub(1)),
+            _ => unreachable!(),
+        }
+    }
+}
+
 struct Parker {
-    state: AtomicU8,
+    state: AtomicUsize,
     parked: AtomicBool,
     thread: thread::Thread,
     task_state: TaskState,
 }
 
 impl Parker {
-    const EMPTY: u8 = 0;
-    const WAITING: u8 = 1;
-    const NOTIFIED: u8 = 2;
-
     fn new() -> Self {
         Self {
-            state: AtomicU8::new(Self::EMPTY),
+            state: AtomicUsize::new(ParkState::Empty.into()),
             parked: AtomicBool::new(false),
             thread: thread::current(),
             task_state: TaskState::default(),
         }
     }
 
-    fn unparked(&self) -> bool {
-        match self.state.load(Ordering::Acquire) {
-            Self::EMPTY | Self::WAITING => false,
-            Self::NOTIFIED => true,
-            _ => unreachable!(),
+    fn reset(&self) {
+        let new_state = ParkState::Empty.into();
+        self.state.store(new_state, Ordering::Relaxed);
+    }
+
+    fn poll(&self) -> Poll<Option<usize>> {
+        match ParkState::from(self.state.load(Ordering::Acquire)) {
+            ParkState::Notified(worker_index) => Poll::Ready(worker_index),
+            _ => Poll::Pending,
         }
     }
 
-    fn park(&self) {
-        match self.state.compare_exchange(
-            Self::EMPTY,
-            Self::WAITING,
+    fn park(&self) -> Option<usize> {
+        if let Err(state) = self.state.compare_exchange(
+            ParkState::Empty.into(),
+            ParkState::Waiting.into(),
             Ordering::Acquire,
             Ordering::Acquire,
         ) {
-            Err(Self::NOTIFIED) => {}
-            Err(_) => unreachable!(),
-            Ok(_) => loop {
-                thread::park();
-                match self.state.load(Ordering::Acquire) {
-                    Self::WAITING => continue,
-                    Self::NOTIFIED => break,
-                    _ => unreachable!(),
-                }
-            },
+            match ParkState::from(state) {
+                ParkState::Notified(worker_index) => return worker_index,
+                _ => unreachable!(),
+            }
         }
 
-        self.state.store(Self::EMPTY, Ordering::Relaxed);
+        loop {
+            thread::park();
+            match self.poll() {
+                Poll::Ready(worker_index) => return worker_index,
+                Poll::Pending => continue,
+            }
+        }
     }
 
-    fn unpark(&self) -> bool {
-        match self.state.swap(Self::NOTIFIED, Ordering::Release) {
-            Self::EMPTY => {}
-            Self::WAITING => self.thread.unpark(),
-            Self::NOTIFIED => return false,
-            _ => unreachable!(),
-        }
-        true
+    fn unpark(&self, worker_index: Option<usize>) -> bool {
+        self.state
+            .fetch_update(
+                Ordering::Release,
+                Ordering::Relaxed,
+                |state| match ParkState::from(state) {
+                    ParkState::Notified(_) => None,
+                    _ => Some(ParkState::Notified(worker_index).into()),
+                },
+            )
+            .map(|state| match ParkState::from(state) {
+                ParkState::Waiting => self.thread.unpark(),
+                _ => {}
+            })
+            .is_ok()
     }
 }
 
@@ -442,21 +481,27 @@ impl Wake for Parker {
 
     fn wake_by_ref(self: &Arc<Self>) {
         if self.task_state.transition_to_scheduled() {
-            self.unpark();
+            self.unpark(None);
         }
     }
 }
 
+#[derive(Default)]
+struct Worker {
+    idle_next: AtomicUsize,
+    run_queue: Queue<Arc<dyn Runnable>>,
+}
+
 struct Executor {
-    idle: Queue<usize>,
-    injector: Queue<Arc<dyn Runnable>>,
+    idle: AtomicUsize,
     tasks: AtomicUsize,
     running: AtomicBool,
     searching: AtomicUsize,
+    injector: Queue<Arc<dyn Runnable>>,
     joiner: Condvar,
     rng_seq_seed: RngSeqSeed,
     parked: Mutex<Vec<Arc<Parker>>>,
-    run_queues: Box<[Queue<Arc<dyn Runnable>>]>,
+    workers: Box<[Worker]>,
 }
 
 impl Executor {
@@ -466,19 +511,19 @@ impl Executor {
             .unwrap();
 
         let executor = Self {
-            idle: Queue::default(),
-            injector: Queue::default(),
+            idle: AtomicUsize::new(0),
             tasks: AtomicUsize::new(0),
             running: AtomicBool::new(true),
             searching: AtomicUsize::new(0),
+            injector: Queue::default(),
             joiner: Condvar::new(),
             rng_seq_seed: RngSeqSeed::new(num_threads),
             parked: Mutex::new(Vec::with_capacity(num_threads.get())),
-            run_queues: (0..num_threads.get()).map(|_| Queue::default()).collect(),
+            workers: (0..num_threads.get()).map(|_| Worker::default()).collect(),
         };
 
-        for queue_index in (0..num_threads.get()).rev() {
-            executor.idle.push(queue_index);
+        for worker_index in (0..num_threads.get()).rev() {
+            executor.push_idle_worker(worker_index);
         }
 
         executor
@@ -486,8 +531,8 @@ impl Executor {
 
     fn schedule(self: &Arc<Self>, runnable: Arc<dyn Runnable>, thread: Option<&Thread>) {
         if let Some(thread) = thread {
-            if let Some(queue_index) = thread.queue_index.get() {
-                self.run_queues[queue_index].push(runnable);
+            if let Some(worker_index) = thread.worker_index.get() {
+                self.workers[worker_index].run_queue.push(runnable);
                 self.notify();
                 return;
             }
@@ -499,12 +544,12 @@ impl Executor {
     }
 
     fn notify(self: &Arc<Self>) {
-        if self.idle.is_empty() {
+        if self.peek_idle_worker().is_none() {
             return;
         }
 
         let searching = self.searching.load(Ordering::Relaxed);
-        assert!(searching <= self.run_queues.len());
+        assert!(searching <= self.workers.len());
         if searching > 0 {
             return;
         }
@@ -513,60 +558,119 @@ impl Executor {
             self.searching
                 .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
         {
-            assert!(searching <= self.run_queues.len());
+            assert!(searching <= self.workers.len());
             return;
         }
 
-        if self.unpark() {
-            return;
+        if let Some(worker_index) = self.pop_idle_worker() {
+            if self.unpark(Some(worker_index)) {
+                return;
+            } else {
+                self.push_idle_worker(worker_index);
+            }
         }
 
         let searching = self.searching.fetch_sub(1, Ordering::Relaxed);
-        assert!(searching <= self.run_queues.len());
+        assert!(searching <= self.workers.len());
         assert_ne!(searching, 0);
     }
 
     fn search_begin(&self) -> bool {
         let searching = self.searching.load(Ordering::Relaxed);
-        assert!(searching <= self.run_queues.len());
+        assert!(searching <= self.workers.len());
 
-        (2 * searching) < self.run_queues.len() && {
-            let searching = self.searching.fetch_add(1, Ordering::Acquire);
-            assert!(searching < self.run_queues.len());
-            true
+        if (2 * searching) >= self.workers.len() {
+            return false;
+        }
+
+        let searching = self.searching.fetch_add(1, Ordering::Acquire);
+        assert!(searching < self.workers.len());
+        true
+    }
+
+    fn search_discovered(self: &Arc<Self>) {
+        let searching = self.searching.fetch_sub(1, Ordering::Relaxed);
+        assert!(searching <= self.workers.len());
+        assert_ne!(searching, 0);
+
+        if searching == 1 {
+            self.notify();
         }
     }
 
-    fn search_complete(&self) -> bool {
-        let searching = self.searching.fetch_sub(1, Ordering::Relaxed);
-        assert!(searching <= self.run_queues.len());
-        assert_ne!(searching, 0);
-        searching == 1
+    fn search_failed(&self, was_searching: bool, worker_index: usize) -> bool {
+        assert!(worker_index < self.workers.len());
+        self.push_idle_worker(worker_index);
+
+        was_searching && {
+            let searching = self.searching.fetch_sub(1, Ordering::SeqCst);
+            assert!(searching <= self.workers.len());
+            assert_ne!(searching, 0);
+            searching == 1
+        }
     }
 
-    fn is_empty(&self) -> bool {
-        self.run_queues
-            .iter()
-            .map(|worker| !worker.is_empty())
-            .find(|&is_not_empty| is_not_empty)
-            .unwrap_or(false)
+    fn search_retry(&self) -> Option<usize> {
+        self.pop_idle_worker().map(|worker_index| {
+            let searching = self.searching.fetch_add(1, Ordering::Acquire);
+            assert!(searching < self.workers.len());
+            worker_index
+        })
     }
 
-    fn park(&self, parker: &Arc<Parker>) {
-        if parker.unparked() {
-            return;
+    const IDLE_SHIFT: u32 = usize::BITS / 2;
+    const IDLE_MASK: usize = (1 << Self::IDLE_SHIFT) - 1;
+
+    fn push_idle_worker(&self, worker_index: usize) {
+        let _ = self
+            .idle
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |idle| {
+                assert!(worker_index < self.workers.len());
+                assert!(worker_index < Self::IDLE_MASK);
+
+                let top_index = idle & Self::IDLE_MASK;
+                self.workers[worker_index]
+                    .idle_next
+                    .store(top_index, Ordering::Relaxed);
+
+                let new_aba_count = idle >> Self::IDLE_SHIFT;
+                let new_top_index = worker_index + 1;
+                Some((new_aba_count << Self::IDLE_SHIFT) | new_top_index)
+            });
+    }
+
+    fn peek_idle_worker(&self) -> Option<usize> {
+        let idle = self.idle.load(Ordering::Acquire);
+        (idle & Self::IDLE_MASK).checked_sub(1)
+    }
+
+    fn pop_idle_worker(&self) -> Option<usize> {
+        self.idle
+            .fetch_update(Ordering::Acquire, Ordering::Acquire, |idle| {
+                let worker_index = (idle & Self::IDLE_MASK).checked_sub(1)?;
+                assert!(worker_index < self.workers.len());
+
+                let new_top_index = self.workers[worker_index].idle_next.load(Ordering::Relaxed);
+                Some((idle & !Self::IDLE_MASK) | new_top_index)
+            })
+            .ok()
+            .map(|idle| (idle & Self::IDLE_MASK) - 1)
+    }
+
+    fn park(&self, parker: &Arc<Parker>) -> Option<usize> {
+        if let Poll::Ready(worker_index) = parker.poll() {
+            return worker_index;
         }
 
         {
             let mut parked = self.parked.lock().unwrap();
-            if parker.unparked() {
-                return;
+            if let Poll::Ready(worker_index) = parker.poll() {
+                return worker_index;
             }
 
             if !self.running.load(Ordering::Relaxed) {
                 drop(parked);
-                parker.park();
-                return;
+                return parker.park();
             }
 
             assert!(!parker.parked.load(Ordering::Relaxed));
@@ -574,29 +678,39 @@ impl Executor {
             parked.push(parker.clone());
         }
 
-        parker.park();
-        if !parker.parked.load(Ordering::Relaxed) {
-            return;
-        }
+        let worker_index = parker.park();
 
-        let mut parked = self.parked.lock().unwrap();
-        if !parker.parked.load(Ordering::Relaxed) {
-            return;
-        }
-
-        for park_index in 0..parked.len() {
-            if Arc::ptr_eq(parker, &parked[park_index]) {
-                assert!(parker.parked.load(Ordering::Relaxed));
-                parker.parked.store(false, Ordering::Relaxed);
-                drop(parked.swap_remove(park_index));
+        // If we're still parked, make sure to remove ourselves from the parked Vec
+        (|| {
+            if !parker.parked.load(Ordering::Relaxed) {
                 return;
             }
-        }
 
-        unreachable!()
+            let mut parked = self.parked.lock().unwrap();
+            if !parker.parked.load(Ordering::Relaxed) {
+                return;
+            }
+
+            if !self.running.load(Ordering::Relaxed) {
+                return;
+            }
+
+            for park_index in 0..parked.len() {
+                if Arc::ptr_eq(parker, &parked[park_index]) {
+                    assert!(parker.parked.load(Ordering::Relaxed));
+                    parker.parked.store(false, Ordering::Relaxed);
+                    drop(parked.swap_remove(park_index));
+                    return;
+                }
+            }
+
+            unreachable!();
+        })();
+
+        worker_index
     }
 
-    fn unpark(self: &Arc<Self>) -> bool {
+    fn unpark(self: &Arc<Self>, worker_index: Option<usize>) -> bool {
         {
             let mut parked = self.parked.lock().unwrap();
             if !self.running.load(Ordering::Relaxed) {
@@ -609,7 +723,7 @@ impl Executor {
                 parker.parked.store(false, Ordering::Relaxed);
 
                 drop(parked);
-                if parker.unpark() {
+                if parker.unpark(worker_index) {
                     return true;
                 }
 
@@ -623,11 +737,12 @@ impl Executor {
         let executor = self.clone();
         thread::Builder::new()
             .spawn(move || {
-                struct ThreadPoolFuture<'a> {
+                // Really with std::future::poll_fn was stable :|
+                struct RunningFuture<'a> {
                     executor: &'a Executor,
                 }
 
-                impl<'a> Future for ThreadPoolFuture<'a> {
+                impl<'a> Future for RunningFuture<'a> {
                     type Output = ();
 
                     fn poll(self: Pin<&mut Self>, _ctx: &mut Context<'_>) -> Poll<()> {
@@ -639,13 +754,12 @@ impl Executor {
                     }
                 }
 
-                let mut future = ThreadPoolFuture {
-                    executor: &executor,
-                };
+                let executor = &executor;
+                let mut future = RunningFuture { executor };
                 let future = Pin::new(&mut future);
 
-                let thread = Thread::enter(&executor);
-                Worker::block_on(future, thread).unwrap()
+                let thread = Thread::enter(executor);
+                WorkerThread::block_on(future, worker_index, thread).unwrap()
             })
             .is_ok()
     }
@@ -658,7 +772,7 @@ impl Executor {
         let pending = replace(&mut *parked, Vec::new());
         drop(parked);
         for parker in pending {
-            parker.unpark();
+            parker.unpark(None);
         }
 
         if let Some(timeout) = timeout {
@@ -679,19 +793,21 @@ impl Executor {
     }
 
     fn task_complete(&self) {
-        let tasks = self.tasks.fetch_sub(1, Ordering::Release);
+        let tasks = self.tasks.fetch_sub(1, Ordering::AcqRel);
         assert_ne!(tasks, 0);
 
         if tasks == 1 {
-            drop(self.parked.lock().unwrap());
-            self.joiner.notify_one();
+            if !self.running.load(Ordering::Acquire) {
+                drop(self.parked.lock().unwrap());
+                self.joiner.notify_one();
+            }
         }
     }
 }
 
 struct ThreadContext {
     executor: Arc<Executor>,
-    queue_index: Cell<Option<usize>>,
+    worker_index: Cell<Option<usize>>,
 }
 
 impl ThreadContext {
@@ -709,7 +825,7 @@ impl Thread {
     fn enter(executor: &Arc<Executor>) -> Self {
         let context = Rc::new(ThreadContext {
             executor: executor.clone(),
-            queue_index: Cell::new(None),
+            worker_index: Cell::new(None),
         });
 
         match ThreadContext::with_tls(|tls| match tls {
@@ -754,7 +870,7 @@ impl Drop for Thread {
     }
 }
 
-struct Worker<F: Future, P: Deref<Target = F> + DerefMut> {
+struct WorkerThread<F: Future, P: Deref<Target = F> + DerefMut> {
     rng: Rng,
     tick: usize,
     future: Pin<P>,
@@ -763,15 +879,16 @@ struct Worker<F: Future, P: Deref<Target = F> + DerefMut> {
     parker: Arc<Parker>,
 }
 
-impl<F: Future, P: Deref<Target = F> + DerefMut> Worker<F, P> {
+impl<F: Future, P: Deref<Target = F> + DerefMut> WorkerThread<F, P> {
     fn block_on(
         future: Pin<P>,
+        worker_index: Option<usize>,
         thread: Thread,
     ) -> Result<F::Output, Box<dyn Any + Send + 'static>> {
         let mut rng = Rng::new();
         let tick = rng.gen();
 
-        let mut worker = Self {
+        let mut this = Self {
             rng,
             tick,
             future,
@@ -780,16 +897,21 @@ impl<F: Future, P: Deref<Target = F> + DerefMut> Worker<F, P> {
             parker: Arc::new(Parker::new()),
         };
 
-        worker.try_transition_to_notified();
-        let result = worker.block_on_worker();
+        if let Some(worker_index) = worker_index.or_else(|| this.thread.executor.search_retry()) {
+            this.transition_to_notified(worker_index);
+        }
 
-        worker.try_transition_to_idle();
+        assert!(this.parker.task_state.transition_to_scheduled());
+        let result = this.block_on_worker();
+
+        if let Some(worker_index) = this.thread.worker_index.get() {
+            this.transition_to_idle(worker_index);
+        }
+
         result
     }
 
     fn block_on_worker(&mut self) -> Result<F::Output, Box<dyn Any + Send + 'static>> {
-        assert!(self.parker.task_state.transition_to_scheduled());
-
         loop {
             let retry_poll_future = match self.poll_future() {
                 Poll::Ready(Some(result)) => return result,
@@ -799,9 +921,7 @@ impl<F: Future, P: Deref<Target = F> + DerefMut> Worker<F, P> {
 
             if let Some(runnable) = self.poll_runnable() {
                 if replace(&mut self.searching, false) {
-                    if self.thread.executor.search_complete() {
-                        self.thread.executor.notify();
-                    }
+                    self.thread.executor.search_discovered();
                 }
 
                 self.tick = self.tick.wrapping_add(1);
@@ -813,9 +933,11 @@ impl<F: Future, P: Deref<Target = F> + DerefMut> Worker<F, P> {
                 continue;
             }
 
-            self.thread.executor.park(&self.parker);
-            if let Some(queue_index) = self.thread.executor.idle.pop() {
-                self.transition_to_notified(queue_index);
+            let worker_index = self.thread.executor.park(&self.parker);
+            self.parker.reset();
+
+            if let Some(worker_index) = worker_index  {
+                self.transition_to_notified(worker_index);
             }
         }
     }
@@ -851,9 +973,9 @@ impl<F: Future, P: Deref<Target = F> + DerefMut> Worker<F, P> {
 
     fn poll_runnable(&mut self) -> Option<Arc<dyn Runnable>> {
         loop {
-            let queue_index = self.thread.queue_index.get()?;
+            let worker_index = self.thread.worker_index.get()?;
             let executor = &self.thread.executor;
-            let run_queue = &executor.run_queues[queue_index];
+            let run_queue = &executor.workers[worker_index].run_queue;
 
             if self.tick % 61 == 0 {
                 if let Steal::Success(runnable) = executor.injector.steal() {
@@ -879,12 +1001,13 @@ impl<F: Future, P: Deref<Target = F> + DerefMut> Worker<F, P> {
                     };
 
                     for steal_index in self.rng.gen_seq(executor.rng_seq_seed) {
-                        assert!(steal_index < executor.run_queues.len());
-                        if steal_index == queue_index {
+                        assert!(steal_index < executor.workers.len());
+                        if steal_index == worker_index {
                             continue;
                         }
 
-                        match executor.run_queues[steal_index].steal_into(run_queue) {
+                        let steal_queue = &executor.workers[steal_index].run_queue;
+                        match steal_queue.steal_into(run_queue) {
                             Steal::Success(runnable) => return Some(runnable),
                             Steal::Retry => is_empty = false,
                             Steal::Empty => {}
@@ -899,49 +1022,32 @@ impl<F: Future, P: Deref<Target = F> + DerefMut> Worker<F, P> {
 
             drop(run_queue);
             drop(executor);
-            self.transition_to_idle(queue_index);
+            self.transition_to_idle(worker_index);
         }
     }
 
-    fn try_transition_to_notified(&mut self) -> bool {
-        self.thread
-            .executor
-            .idle
-            .pop()
-            .map(|queue_index| {
-                self.transition_to_notified(queue_index);
-            })
-            .is_some()
-    }
-
-    fn transition_to_notified(&mut self, queue_index: usize) {
-        assert_eq!(self.thread.queue_index.get(), None);
-        self.thread.queue_index.set(Some(queue_index));
+    fn transition_to_notified(&mut self, worker_index: usize) {
+        assert_eq!(self.thread.worker_index.get(), None);
+        self.thread.worker_index.set(Some(worker_index));
 
         assert!(!self.searching);
-        self.searching = self.thread.executor.search_begin();
+        self.searching = true;
     }
 
-    fn try_transition_to_idle(&mut self) -> bool {
-        self.thread
-            .queue_index
-            .get()
-            .map(|queue_index| {
-                self.transition_to_idle(queue_index);
-            })
-            .is_some()
-    }
+    fn transition_to_idle(&mut self, worker_index: usize) {
+        assert_eq!(self.thread.worker_index.get(), Some(worker_index));
+        self.thread.worker_index.set(None);
 
-    fn transition_to_idle(&mut self, queue_index: usize) {
-        assert_eq!(self.thread.queue_index.get(), Some(queue_index));
-        self.thread.queue_index.set(None);
-
-        self.thread.executor.idle.push(queue_index);
         let was_searching = replace(&mut self.searching, false);
-        let search_retry = was_searching && self.thread.executor.search_complete();
+        let last_searching = self
+            .thread
+            .executor
+            .search_failed(was_searching, worker_index);
 
-        if search_retry && !self.thread.executor.is_empty() {
-            self.try_transition_to_notified();
+        if last_searching && !self.thread.executor.injector.is_empty() {
+            if let Some(worker_index) = self.thread.executor.search_retry() {
+                self.transition_to_notified(worker_index);
+            }
         }
     }
 }
@@ -1105,7 +1211,7 @@ impl<T> Queue<T> {
             None => return Steal::Empty,
         };
 
-        let migrate = (deque.len() / 2).min(16);
+        let migrate = (deque.len() / 2).min(8);
         if migrate > 0 {
             let mut dst_deque = dst_queue.deque.lock().unwrap();
             dst_deque.extend(deque.drain(0..migrate));
@@ -1116,4 +1222,3 @@ impl<T> Queue<T> {
         Steal::Success(item)
     }
 }
-
