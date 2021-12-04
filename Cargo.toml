@@ -1,25 +1,5 @@
 [package]
-name = "yaar"
+name = "uasync"
 license = "MIT"
-version = "0.4.0"
+version = "0.2.0"
 edition = "2021"
-
-[features]
-default = []
-full = ["io-util", "sync", "time", "net", "fs", "rt"]
-
-io-util = ["tokio/io-util"]
-sync = []
-time = []
-net = ["tokio"]
-fs = ["tokio"]
-rt = ["num_cpus"]
-
-[dependencies]
-tokio = "1"
-loom = { version = "0.5", optional = true }
-num_cpus = { version = "1", optional = true }
-try_lock = { version = "0.2", optional = true }
-pin-utils = { version = "0.1", optional = true }
-parking_lot = { version = "0.11", optional = true }
-crossbeam-deque = { version = "0.8", optional = true }
