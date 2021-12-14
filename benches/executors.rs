@@ -1,0 +1,41 @@
+#[macro_use]
+extern crate criterion;
+
+#[path = "prelude.rs"]
+mod prelude;
+use prelude::*;
+
+use criterion::{black_box, Bencher, Criterion};
+
+fn bench_yield<E: BenchExecutor>(b: &mut Bencher, cpus: usize, tasks: usize) {
+    b.iter_custom(|iters| {
+        E::record(cpus, async move {
+            let handles = (0..tasks).map(|_| {
+                E::spawn(async move {
+                    for _ in 0..black_box(iters * cpus as u64) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+            });
+                
+            for handle in handles.collect::<Vec<_>>() {
+                handle.await;
+            }
+        })
+    })
+}
+
+fn yield_now(c: &mut Criterion) {
+    let cpus = cpu_count();
+    let tasks = 100_000;
+    c.bench_function("tokio-yield_now", |b| {
+        bench_yield::<TokioExecutor>(b, cpus, tasks)
+    });
+    c.bench_function("yaar-yield_now", |b| {
+        bench_yield::<YaarExecutor>(b, cpus, tasks)
+    });
+}
+
+criterion_group!(bench_executors, yield_now,);
+
+criterion_main!(bench_executors);
