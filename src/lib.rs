@@ -458,16 +458,16 @@ impl Scheduler {
     }
 
     fn on_worker_search(&self) -> bool {
-        let state = self.state.load(Ordering::Relaxed);
-        if state & (1 << Self::SHUTDOWN_SHIFT) != 0 {
-            return false;
-        }
+        // let state = self.state.load(Ordering::Relaxed);
+        // if state & (1 << Self::SHUTDOWN_SHIFT) != 0 {
+        //     return false;
+        // }
 
-        let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
-        assert!(searching <= self.workers.len());
-        if 2 * state >= self.workers.len() {
-            return false;
-        }
+        // let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
+        // assert!(searching <= self.workers.len());
+        // if 2 * state >= self.workers.len() {
+        //     return false;
+        // }
 
         let state = self
             .state
@@ -506,7 +506,7 @@ impl Scheduler {
         assert!(searching <= self.workers.len());
         assert!(searching >= was_searching as usize);
 
-        if was_searching && searching == 1 && self.pending() {
+        if was_searching && self.pending() {
             self.notify();
         }
 
