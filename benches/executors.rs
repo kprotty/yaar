@@ -17,7 +17,7 @@ fn bench_yield<E: BenchExecutor>(b: &mut Bencher, cpus: usize, tasks: usize) {
                     }
                 })
             });
-                
+
             for handle in handles.collect::<Vec<_>>() {
                 handle.await;
             }

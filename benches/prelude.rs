@@ -3,8 +3,8 @@ use pin_project_lite::pin_project;
 use std::{
     future::Future,
     pin::Pin,
-    time::{Instant, Duration},
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 pub fn cpu_count() -> usize {

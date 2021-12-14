@@ -561,7 +561,7 @@ impl Worker {
         loop {
             let polled = (|| {
                 let run_queue = &scheduler.workers[worker_index].run_queue;
-                if let Ok(runnable) = run_queue.pop() {
+                if let Some(runnable) = run_queue.pop() {
                     return Some(runnable);
                 }
 
@@ -570,7 +570,11 @@ impl Worker {
                     for _attempt in 0..32 {
                         let mut was_contended = false;
                         for steal_index in scheduler.rng_seq.gen(&mut rng) {
-                            match scheduler.workers[steal_index].run_queue.pop() {
+                            if steal_index == worker_index {
+                                continue;
+                            }
+
+                            match scheduler.workers[steal_index].run_queue.steal(run_queue) {
                                 Ok(runnable) => return Some(runnable),
                                 Err(contended) => was_contended = was_contended || contended,
                             }
@@ -675,7 +679,20 @@ impl Queue {
         self.pending.load(Ordering::Acquire)
     }
 
-    fn pop(&self) -> Result<Arc<dyn Runnable>, bool> {
+    fn pop(&self) -> Option<Arc<dyn Runnable>> {
+        if !self.pending.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let mut array = self.array.lock().unwrap();
+        let index = array.len().checked_sub(1)?;
+        let runnable = array.swap_remove(index);
+
+        self.pending.store(array.len() > 0, Ordering::Relaxed);
+        Some(runnable)
+    }
+
+    fn steal(&self, dst: &Self) -> Result<Arc<dyn Runnable>, bool> {
         if !self.pending() {
             return Err(false);
         }
@@ -689,6 +706,18 @@ impl Queue {
             Some(index) => array.swap_remove(index),
             None => return Err(false),
         };
+
+        let take = (array.len() / 2).min(64);
+        let migrate = (0..take).map(|_| {
+            let index = array.len() - 1;
+            array.swap_remove(index)
+        });
+
+        if take > 0 {
+            let mut dst_array = dst.array.lock().unwrap();
+            dst_array.extend(migrate);
+            dst.pending.store(true, Ordering::Relaxed);
+        }
 
         self.pending.store(array.len() > 0, Ordering::Relaxed);
         Ok(runnable)
