@@ -707,15 +707,11 @@ impl Queue {
             None => return Err(false),
         };
 
-        let take = (array.len() / 2).min(64);
-        let migrate = (0..take).map(|_| {
-            let index = array.len() - 1;
-            array.swap_remove(index)
-        });
-
+        let take = (array.len() / 2).min(256);
         if take > 0 {
             let mut dst_array = dst.array.lock().unwrap();
-            dst_array.extend(migrate);
+            let offset = array.len() - take;
+            dst_array.extend(array.drain(offset..));
             dst.pending.store(true, Ordering::Relaxed);
         }
 
