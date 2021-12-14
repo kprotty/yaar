@@ -352,7 +352,6 @@ struct Scheduler {
     rng_seq: RngSeq,
     state: AtomicUsize,
     tasks: AtomicUsize,
-    injecting: AtomicUsize,
     semaphore: Semaphore,
     workers: Box<[Worker]>,
 }
@@ -378,7 +377,6 @@ impl Scheduler {
             rng_seq: RngSeq::new(num_workers),
             state: AtomicUsize::new(0),
             tasks: AtomicUsize::new(0),
-            injecting: AtomicUsize::new(0),
             semaphore: Semaphore::default(),
             workers: (0..num_workers.get()).map(|_| Worker::default()).collect(),
         }
@@ -391,12 +389,29 @@ impl Scheduler {
             return;
         }
 
-        let injecting = self.injecting.fetch_add(1, Ordering::Relaxed);
-        let worker_index = injecting % self.workers.len();
-        self.workers[worker_index].run_queue.push(runnable);
-
+        self.inject(runnable);
         fence(Ordering::SeqCst);
         self.notify();
+    }
+
+    fn inject(&self, mut runnable: Arc<dyn Runnable>) {
+        thread_local!(static RNG: RefCell<Rng> = RefCell::new(Rng::new({
+            static INJECTOR: AtomicUsize = AtomicUsize::new(0);
+            INJECTOR.fetch_add(1, Ordering::Relaxed)
+        })));
+
+        RNG.with(|rng| {
+            let mut rng = rng.borrow_mut();
+            for worker_index in self.rng_seq.gen(&mut *rng) {
+                runnable = match self.workers[worker_index].run_queue.try_push(runnable) {
+                    Ok(_) => return,
+                    Err(r) => r,
+                }
+            };
+
+            let worker_index = rng.gen().get() % self.workers.len();
+            self.workers[worker_index].run_queue.push(runnable);
+        })
     }
 
     fn notify(self: &Arc<Self>) {
@@ -669,6 +684,18 @@ struct Queue {
 }
 
 impl Queue {
+    fn try_push(&self, runnable: Arc<dyn Runnable>) -> Result<(), Arc<dyn Runnable>> {
+        let mut array = match self.array.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return Err(runnable),
+        };
+        
+        Ok({
+            array.push(runnable);
+            self.pending.store(true, Ordering::Relaxed);
+        })
+    }
+
     fn push(&self, runnable: Arc<dyn Runnable>) {
         let mut array = self.array.lock().unwrap();
         array.push(runnable);
