@@ -3,7 +3,6 @@
 use std::{
     any::Any,
     cell::RefCell,
-    collections::VecDeque,
     future::Future,
     hint::spin_loop,
     mem::{drop, replace},
@@ -17,6 +16,8 @@ use std::{
     task::{Context, Poll, Wake, Waker},
     thread,
 };
+use try_lock::TryLock;
+use crossbeam_deque as Deque;
 
 pub struct Executor {
     worker_threads: usize,
@@ -116,7 +117,7 @@ impl Wake for Parker {
 #[derive(Default)]
 struct AtomicWaker {
     state: AtomicU8,
-    waker: Mutex<Option<Waker>>,
+    waker: TryLock<Option<Waker>>,
 }
 
 impl AtomicWaker {
@@ -236,7 +237,7 @@ enum TaskData<F: Future> {
 struct Task<F: Future> {
     state: TaskState,
     waker: AtomicWaker,
-    data: Mutex<TaskData<F>>,
+    data: TryLock<TaskData<F>>,
     scheduler: Arc<Scheduler>,
 }
 
@@ -251,7 +252,7 @@ where
         let task = Arc::new(Self {
             state: TaskState::default(),
             waker: AtomicWaker::default(),
-            data: Mutex::new(TaskData::Empty),
+            data: TryLock::new(TaskData::Empty),
             scheduler: thread.scheduler.clone(),
         });
 
@@ -264,10 +265,9 @@ where
     }
 
     fn schedule(self: Arc<Self>) {
-        let order = QueueOrder::Lifo;
         match Thread::current() {
-            Some(thread) => thread.scheduler.schedule(self, thread.worker_index, order),
-            None => self.scheduler.schedule(self.clone(), None, order),
+            Some(thread) => thread.scheduler.schedule(self, Some(&thread)),
+            None => self.scheduler.schedule(self.clone(), None),
         }
     }
 }
@@ -322,9 +322,7 @@ where
                 }
 
                 self.state.transition_to_scheduled_from_notified();
-                return thread
-                    .scheduler
-                    .schedule(self, thread.worker_index, QueueOrder::Fifo);
+                return thread.scheduler.schedule(self, None);
             }
         };
 
@@ -356,7 +354,7 @@ struct Scheduler {
     rng_seq: RngSeq,
     state: AtomicUsize,
     tasks: AtomicUsize,
-    injecting: AtomicUsize,
+    injector: QueueInjector,
     semaphore: Semaphore,
     workers: Box<[Worker]>,
 }
@@ -382,31 +380,21 @@ impl Scheduler {
             rng_seq: RngSeq::new(num_workers),
             state: AtomicUsize::new(0),
             tasks: AtomicUsize::new(0),
-            injecting: AtomicUsize::new(0),
+            injector: QueueInjector::new(),
             semaphore: Semaphore::default(),
-            workers: (0..num_workers.get()).map(|_| Worker::default()).collect(),
+            workers: (0..num_workers.get()).map(|_| Worker::new()).collect(),
         }
     }
 
-    fn schedule(
-        self: &Arc<Self>,
-        runnable: Arc<dyn Runnable>,
-        worker_index: Option<usize>,
-        queue_order: QueueOrder,
-    ) {
-        if let Some(worker_index) = worker_index {
-            self.workers[worker_index]
-                .run_queue
-                .push(runnable, queue_order);
-            return self.notify();
+    fn schedule(self: &Arc<Self>, runnable: Arc<dyn Runnable>, thread: Option<&Thread>) {
+        if let Some(thread) = thread {
+            if let Some(queue_worker) = thread.queue_worker.as_ref() {
+                queue_worker.push(runnable);
+                return self.notify();
+            }
         }
 
-        let injecting = self.injecting.fetch_add(1, Ordering::Relaxed);
-        let worker_index = injecting % self.workers.len();
-        self.workers[worker_index]
-            .run_queue
-            .push(runnable, queue_order);
-
+        self.injector.push(runnable);
         fence(Ordering::SeqCst);
         self.notify();
     }
@@ -443,8 +431,7 @@ impl Scheduler {
                 let idle = (state >> Self::IDLE_SHIFT) & Self::STATE_MASK;
                 assert!(idle <= self.workers.len());
                 if idle > 0 {
-                    self.semaphore.post();
-                    return;
+                    return self.semaphore.post();
                 }
 
                 let spawned = (state >> Self::SPAWN_SHIFT) & Self::STATE_MASK;
@@ -472,6 +459,7 @@ impl Scheduler {
         let state = self
             .state
             .fetch_add(1 << Self::SEARCH_SHIFT, Ordering::Acquire);
+
         let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
         assert!(searching < self.workers.len());
         true
@@ -485,6 +473,7 @@ impl Scheduler {
         let state = self
             .state
             .fetch_sub(1 << Self::SEARCH_SHIFT, Ordering::Release);
+
         let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
         assert!(searching <= self.workers.len());
         assert_ne!(searching, 0);
@@ -497,7 +486,7 @@ impl Scheduler {
     fn on_worker_idle(self: &Arc<Self>, was_searching: bool) -> bool {
         let update: usize = 1 << Self::IDLE_SHIFT;
         let update = update.wrapping_sub((was_searching as usize) << Self::SEARCH_SHIFT);
-        let state = self.state.fetch_add(update, Ordering::AcqRel);
+        let state = self.state.fetch_add(update, Ordering::SeqCst);
 
         let idle = (state >> Self::IDLE_SHIFT) & Self::STATE_MASK;
         assert!(idle < self.workers.len());
@@ -506,19 +495,11 @@ impl Scheduler {
         assert!(searching <= self.workers.len());
         assert!(searching >= was_searching as usize);
 
-        if was_searching && searching == 1 && self.pending() {
+        if !self.injector.is_empty() {
             self.notify();
         }
 
         state & (1 << Self::SHUTDOWN_SHIFT) == 0
-    }
-
-    fn pending(&self) -> bool {
-        self.workers
-            .iter()
-            .map(|w| w.run_queue.pending())
-            .find(|&pending| pending)
-            .unwrap_or(false)
     }
 
     fn on_task_begin(&self) {
@@ -560,39 +541,68 @@ impl Scheduler {
     }
 }
 
-#[derive(Default)]
+type QueueSteal = Deque::Steal<Arc<dyn Runnable>>;
+type QueueWorker = Deque::Worker<Arc<dyn Runnable>>;
+type QueueStealer = Deque::Stealer<Arc<dyn Runnable>>;
+type QueueInjector = Deque::Injector<Arc<dyn Runnable>>;
+
 struct Worker {
-    run_queue: Queue,
+    queue_stealer: QueueStealer,
+    queue_worker: TryLock<Option<QueueWorker>>,
 }
 
 impl Worker {
+    fn new() -> Self {
+        let queue_worker = QueueWorker::new_lifo();
+        let queue_stealer = queue_worker.stealer();
+
+        Self {
+            queue_worker: TryLock::new(Some(queue_worker)),
+            queue_stealer,
+        }
+    }
+
     fn run(scheduler: Arc<Scheduler>, worker_index: usize) {
         let mut rng = Rng::new(worker_index);
         let mut tick = rng.gen().get();
         let mut searching = true;
 
         let thread = Thread::enter(scheduler, Some(worker_index));
+        let queue_worker = thread.queue_worker.as_ref().unwrap();
         let scheduler = &thread.scheduler;
 
         loop {
             let polled = (|| {
-                let run_queue = &scheduler.workers[worker_index].run_queue;
-                if let Some(runnable) = run_queue.pop(tick % 61 == 0) {
+                if tick % 61 == 0 {
+                    if let QueueSteal::Success(runnable) = scheduler.injector.steal() {
+                        return Some(runnable);
+                    }
+                }
+
+                if let Some(runnable) = queue_worker.pop() {
                     return Some(runnable);
                 }
 
                 searching = searching || scheduler.on_worker_search();
                 if searching {
                     for _attempt in 0..32 {
-                        let mut was_contended = false;
+                        let mut was_contended =
+                            match scheduler.injector.steal_batch_and_pop(&*queue_worker) {
+                                QueueSteal::Success(runnable) => return Some(runnable),
+                                QueueSteal::Retry => true,
+                                QueueSteal::Empty => false,
+                            };
+
                         for steal_index in scheduler.rng_seq.gen(&mut rng) {
                             if steal_index == worker_index {
                                 continue;
                             }
 
-                            match scheduler.workers[steal_index].run_queue.steal(run_queue) {
-                                Ok(runnable) => return Some(runnable),
-                                Err(contended) => was_contended = was_contended || contended,
+                            let queue_stealer = &scheduler.workers[steal_index].queue_stealer;
+                            match queue_stealer.steal_batch_and_pop(&*queue_worker) {
+                                QueueSteal::Success(runnable) => return Some(runnable),
+                                QueueSteal::Retry => was_contended = true,
+                                QueueSteal::Empty => {}
                             }
                         }
 
@@ -628,7 +638,7 @@ impl Worker {
 
 struct ThreadContext {
     scheduler: Arc<Scheduler>,
-    worker_index: Option<usize>,
+    queue_worker: Option<QueueWorker>,
 }
 
 impl ThreadContext {
@@ -644,9 +654,15 @@ struct Thread {
 
 impl Thread {
     fn enter(scheduler: Arc<Scheduler>, worker_index: Option<usize>) -> Self {
+        let queue_worker = worker_index.map(|worker_index| {
+            let worker = &scheduler.workers[worker_index];
+            let mut queue_worker = worker.queue_worker.try_lock().unwrap();
+            replace(&mut *queue_worker, None).unwrap()
+        });
+        
         ThreadContext::with_tls(|tls| {
             let context = Rc::new(ThreadContext {
-                worker_index,
+                queue_worker,
                 scheduler,
             });
 
@@ -676,74 +692,6 @@ impl Drop for Thread {
             let old_tls = old_tls.expect("Thread dropped without ThreadContext");
             assert!(Rc::ptr_eq(&self.context, &old_tls));
         }
-    }
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum QueueOrder {
-    Lifo,
-    Fifo,
-}
-
-#[derive(Default)]
-struct Queue {
-    pending: AtomicBool,
-    deque: Mutex<VecDeque<Arc<dyn Runnable>>>,
-}
-
-impl Queue {
-    fn push(&self, runnable: Arc<dyn Runnable>, queue_order: QueueOrder) {
-        let mut deque = self.deque.lock().unwrap();
-        match queue_order {
-            QueueOrder::Lifo => deque.push_front(runnable),
-            QueueOrder::Fifo => deque.push_back(runnable),
-        }
-        self.pending.store(true, Ordering::Relaxed);
-    }
-
-    fn pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire)
-    }
-
-    fn pop(&self, be_fair: bool) -> Option<Arc<dyn Runnable>> {
-        if !self.pending.load(Ordering::Relaxed) {
-            return None;
-        }
-
-        let mut deque = self.deque.lock().unwrap();
-        let runnable = match be_fair {
-            true => deque.pop_back(),
-            false => deque.pop_front(),
-        };
-
-        self.pending.store(deque.len() > 0, Ordering::Relaxed);
-        runnable
-    }
-
-    fn steal(&self, dst: &Self) -> Result<Arc<dyn Runnable>, bool> {
-        if !self.pending() {
-            return Err(false);
-        }
-
-        let mut deque = match self.deque.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => return Err(true),
-        };
-
-        let runnable = match deque.pop_front() {
-            Some(runnable) => runnable,
-            None => return Err(false),
-        };
-
-        let take = (deque.len() / 2).min(64);
-        if take > 0 {
-            let mut dst_deque = dst.deque.lock().unwrap();
-            dst_deque.extend(deque.drain(0..take));
-            dst.pending.store(true, Ordering::Relaxed);
-        }
-
-        self.pending.store(deque.len() > 0, Ordering::Relaxed);
-        Ok(runnable)
     }
 }
 
