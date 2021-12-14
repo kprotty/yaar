@@ -567,8 +567,9 @@ struct Worker {
 
 impl Worker {
     fn run(scheduler: Arc<Scheduler>, worker_index: usize) {
-        let mut searching = true;
         let mut rng = Rng::new(worker_index);
+        let mut tick = rng.gen().get();
+        let mut searching = true;
 
         let thread = Thread::enter(scheduler, Some(worker_index));
         let scheduler = &thread.scheduler;
@@ -576,7 +577,7 @@ impl Worker {
         loop {
             let polled = (|| {
                 let run_queue = &scheduler.workers[worker_index].run_queue;
-                if let Some(runnable) = run_queue.pop() {
+                if let Some(runnable) = run_queue.pop(tick % 61 == 0) {
                     return Some(runnable);
                 }
 
@@ -609,6 +610,7 @@ impl Worker {
             let was_searching = replace(&mut searching, false);
             if let Some(runnable) = polled {
                 scheduler.on_worker_discovered(was_searching);
+                tick = tick.wrapping_add(1);
                 runnable.run(&thread);
                 continue;
             }
@@ -693,8 +695,8 @@ impl Queue {
     fn push(&self, runnable: Arc<dyn Runnable>, queue_order: QueueOrder) {
         let mut deque = self.deque.lock().unwrap();
         match queue_order {
-            QueueOrder::Lifo => deque.push_back(runnable),
-            QueueOrder::Fifo => deque.push_front(runnable),
+            QueueOrder::Lifo => deque.push_front(runnable),
+            QueueOrder::Fifo => deque.push_back(runnable),
         }
         self.pending.store(true, Ordering::Relaxed);
     }
@@ -703,16 +705,19 @@ impl Queue {
         self.pending.load(Ordering::Acquire)
     }
 
-    fn pop(&self) -> Option<Arc<dyn Runnable>> {
+    fn pop(&self, be_fair: bool) -> Option<Arc<dyn Runnable>> {
         if !self.pending.load(Ordering::Relaxed) {
             return None;
         }
 
         let mut deque = self.deque.lock().unwrap();
-        let runnable = deque.pop_back()?;
+        let runnable = match be_fair {
+            true => deque.pop_back(),
+            false => deque.pop_front(),
+        };
 
         self.pending.store(deque.len() > 0, Ordering::Relaxed);
-        Some(runnable)
+        runnable
     }
 
     fn steal(&self, dst: &Self) -> Result<Arc<dyn Runnable>, bool> {
