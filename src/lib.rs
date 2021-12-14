@@ -3,6 +3,7 @@
 use std::{
     any::Any,
     cell::RefCell,
+    collections::VecDeque,
     future::Future,
     hint::spin_loop,
     mem::{drop, replace},
@@ -261,6 +262,14 @@ where
         Waker::from(task.clone()).wake();
         task
     }
+
+    fn schedule(self: Arc<Self>) {
+        let order = QueueOrder::Lifo;
+        match Thread::current() {
+            Some(thread) => thread.scheduler.schedule(self, thread.worker_index, order),
+            None => self.scheduler.schedule(self.clone(), None, order),
+        }
+    }
 }
 
 impl<F> Wake for Task<F>
@@ -270,25 +279,19 @@ where
 {
     fn wake(self: Arc<Self>) {
         if self.state.transition_to_scheduled() {
-            match Thread::current() {
-                Some(thread) => thread.scheduler.schedule(self, thread.worker_index),
-                None => self.scheduler.schedule(self.clone(), None),
-            }
+            self.schedule();
         }
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
         if self.state.transition_to_scheduled() {
-            match Thread::current() {
-                Some(thread) => thread.scheduler.schedule(self.clone(), thread.worker_index),
-                None => self.scheduler.schedule(self.clone(), None),
-            }
+            Arc::clone(self).schedule();
         }
     }
 }
 
 trait Runnable: Send + Sync {
-    fn run(self: Arc<Self>, scheduler: &Arc<Scheduler>);
+    fn run(self: Arc<Self>, thread: &Thread);
 }
 
 impl<F> Runnable for Task<F>
@@ -296,7 +299,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    fn run(self: Arc<Self>, scheduler: &Arc<Scheduler>) {
+    fn run(self: Arc<Self>, thread: &Thread) {
         let mut data = self.data.try_lock().unwrap();
         self.state.transition_to_running();
 
@@ -319,14 +322,15 @@ where
                 }
 
                 self.state.transition_to_scheduled_from_notified();
-                scheduler.schedule(self, None);
-                return;
+                return thread
+                    .scheduler
+                    .schedule(self, thread.worker_index, QueueOrder::Fifo);
             }
         };
 
         drop(data);
         self.waker.wake();
-        scheduler.on_task_complete();
+        thread.scheduler.on_task_complete();
     }
 }
 
@@ -352,6 +356,7 @@ struct Scheduler {
     rng_seq: RngSeq,
     state: AtomicUsize,
     tasks: AtomicUsize,
+    injecting: AtomicUsize,
     semaphore: Semaphore,
     workers: Box<[Worker]>,
 }
@@ -377,41 +382,33 @@ impl Scheduler {
             rng_seq: RngSeq::new(num_workers),
             state: AtomicUsize::new(0),
             tasks: AtomicUsize::new(0),
+            injecting: AtomicUsize::new(0),
             semaphore: Semaphore::default(),
             workers: (0..num_workers.get()).map(|_| Worker::default()).collect(),
         }
     }
 
-    fn schedule(self: &Arc<Self>, runnable: Arc<dyn Runnable>, worker_index: Option<usize>) {
+    fn schedule(
+        self: &Arc<Self>,
+        runnable: Arc<dyn Runnable>,
+        worker_index: Option<usize>,
+        queue_order: QueueOrder,
+    ) {
         if let Some(worker_index) = worker_index {
-            self.workers[worker_index].run_queue.push(runnable);
-            self.notify();
-            return;
+            self.workers[worker_index]
+                .run_queue
+                .push(runnable, queue_order);
+            return self.notify();
         }
 
-        self.inject(runnable);
+        let injecting = self.injecting.fetch_add(1, Ordering::Relaxed);
+        let worker_index = injecting % self.workers.len();
+        self.workers[worker_index]
+            .run_queue
+            .push(runnable, queue_order);
+
         fence(Ordering::SeqCst);
         self.notify();
-    }
-
-    fn inject(&self, mut runnable: Arc<dyn Runnable>) {
-        thread_local!(static RNG: RefCell<Rng> = RefCell::new(Rng::new({
-            static INJECTOR: AtomicUsize = AtomicUsize::new(0);
-            INJECTOR.fetch_add(1, Ordering::Relaxed)
-        })));
-
-        RNG.with(|rng| {
-            let mut rng = rng.borrow_mut();
-            for worker_index in self.rng_seq.gen(&mut *rng) {
-                runnable = match self.workers[worker_index].run_queue.try_push(runnable) {
-                    Ok(_) => return,
-                    Err(r) => r,
-                }
-            };
-
-            let worker_index = rng.gen().get() % self.workers.len();
-            self.workers[worker_index].run_queue.push(runnable);
-        })
     }
 
     fn notify(self: &Arc<Self>) {
@@ -573,6 +570,9 @@ impl Worker {
         let mut searching = true;
         let mut rng = Rng::new(worker_index);
 
+        let thread = Thread::enter(scheduler, Some(worker_index));
+        let scheduler = &thread.scheduler;
+
         loop {
             let polled = (|| {
                 let run_queue = &scheduler.workers[worker_index].run_queue;
@@ -609,7 +609,7 @@ impl Worker {
             let was_searching = replace(&mut searching, false);
             if let Some(runnable) = polled {
                 scheduler.on_worker_discovered(was_searching);
-                runnable.run(&scheduler);
+                runnable.run(&thread);
                 continue;
             }
 
@@ -677,28 +677,25 @@ impl Drop for Thread {
     }
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum QueueOrder {
+    Lifo,
+    Fifo,
+}
+
 #[derive(Default)]
 struct Queue {
     pending: AtomicBool,
-    array: Mutex<Vec<Arc<dyn Runnable>>>,
+    deque: Mutex<VecDeque<Arc<dyn Runnable>>>,
 }
 
 impl Queue {
-    fn try_push(&self, runnable: Arc<dyn Runnable>) -> Result<(), Arc<dyn Runnable>> {
-        let mut array = match self.array.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => return Err(runnable),
-        };
-        
-        Ok({
-            array.push(runnable);
-            self.pending.store(true, Ordering::Relaxed);
-        })
-    }
-
-    fn push(&self, runnable: Arc<dyn Runnable>) {
-        let mut array = self.array.lock().unwrap();
-        array.push(runnable);
+    fn push(&self, runnable: Arc<dyn Runnable>, queue_order: QueueOrder) {
+        let mut deque = self.deque.lock().unwrap();
+        match queue_order {
+            QueueOrder::Lifo => deque.push_back(runnable),
+            QueueOrder::Fifo => deque.push_front(runnable),
+        }
         self.pending.store(true, Ordering::Relaxed);
     }
 
@@ -711,11 +708,10 @@ impl Queue {
             return None;
         }
 
-        let mut array = self.array.lock().unwrap();
-        let index = array.len().checked_sub(1)?;
-        let runnable = array.swap_remove(index);
+        let mut deque = self.deque.lock().unwrap();
+        let runnable = deque.pop_back()?;
 
-        self.pending.store(array.len() > 0, Ordering::Relaxed);
+        self.pending.store(deque.len() > 0, Ordering::Relaxed);
         Some(runnable)
     }
 
@@ -724,25 +720,24 @@ impl Queue {
             return Err(false);
         }
 
-        let mut array = match self.array.try_lock() {
+        let mut deque = match self.deque.try_lock() {
             Ok(guard) => guard,
             Err(_) => return Err(true),
         };
 
-        let runnable = match array.len().checked_sub(1) {
-            Some(index) => array.swap_remove(index),
+        let runnable = match deque.pop_front() {
+            Some(runnable) => runnable,
             None => return Err(false),
         };
 
-        let take = (array.len() / 2).min(256);
+        let take = (deque.len() / 2).min(64);
         if take > 0 {
-            let mut dst_array = dst.array.lock().unwrap();
-            let offset = array.len() - take;
-            dst_array.extend(array.drain(offset..));
+            let mut dst_deque = dst.deque.lock().unwrap();
+            dst_deque.extend(deque.drain(0..take));
             dst.pending.store(true, Ordering::Relaxed);
         }
 
-        self.pending.store(array.len() > 0, Ordering::Relaxed);
+        self.pending.store(deque.len() > 0, Ordering::Relaxed);
         Ok(runnable)
     }
 }
