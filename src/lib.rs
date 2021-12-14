@@ -485,7 +485,7 @@ impl Scheduler {
     fn on_worker_idle(self: &Arc<Self>, was_searching: bool) -> bool {
         let update: usize = 1 << Self::IDLE_SHIFT;
         let update = update.wrapping_sub((was_searching as usize) << Self::SEARCH_SHIFT);
-        let state = self.state.fetch_sub(update, Ordering::AcqRel);
+        let state = self.state.fetch_add(update, Ordering::AcqRel);
 
         let idle = (state >> Self::IDLE_SHIFT) & Self::STATE_MASK;
         assert!(idle < self.workers.len());
