@@ -1,48 +1,7 @@
 [package]
 name = "yaar"
 license = "MIT"
-version = "0.2.0"
+version = "0.5.0"
 edition = "2021"
-authors = ["kprotty"]
 
-[dependencies]
-# Necessary (to avoid unsafe)
-num_cpus = "1"
-pin-project-lite = "0.2"
-mio = { version = "0.7", features = ["net", "os-poll"] }
 
-# Convenience
-gcd = "2"
-pin-utils = "0.1"
-tokio = { version = "1", features = ["io-util"] }
-
-# Optimizations
-arc-swap = "1"
-try-lock = "0.2"
-parking_lot = "0.11"
-crossbeam-deque = "0.8"
-
-[[example]]
-name = "yaar_qsort"
-path = "examples/qsort/yaar.rs"
-
-[[example]]
-name = "rayon_qsort"
-path = "examples/qsort/rayon.rs"
-
-[[example]]
-name = "tokio_qsort"
-path = "examples/qsort/tokio.rs"
-
-[[example]]
-name = "yaar_http"
-path = "examples/http/yaar.rs"
-
-[[example]]
-name = "tokio_http"
-path = "examples/http/tokio.rs"
-
-[dev-dependencies]
-rayon = "1.5"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
-hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
