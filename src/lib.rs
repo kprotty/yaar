@@ -2,7 +2,7 @@
 
 use std::{
     any::Any,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     future::Future,
     hint::spin_loop,
     mem::{drop, replace},
@@ -266,8 +266,8 @@ where
 
     fn schedule(self: Arc<Self>) {
         match Thread::current() {
-            Some(thread) => thread.scheduler.schedule(self, Some(&thread)),
-            None => self.scheduler.schedule(self.clone(), None),
+            Some(thread) => thread.scheduler.schedule(self, Some(&thread), false),
+            None => self.scheduler.schedule(self.clone(), None, false),
         }
     }
 }
@@ -322,7 +322,7 @@ where
                 }
 
                 self.state.transition_to_scheduled_from_notified();
-                return thread.scheduler.schedule(self, None);
+                return thread.scheduler.schedule(self, Some(thread), true);
             }
         };
 
@@ -386,8 +386,9 @@ impl Scheduler {
         }
     }
 
-    fn schedule(self: &Arc<Self>, runnable: Arc<dyn Runnable>, thread: Option<&Thread>) {
+    fn schedule(self: &Arc<Self>, runnable: Arc<dyn Runnable>, thread: Option<&Thread>, be_fair: bool) {
         if let Some(thread) = thread {
+            thread.be_fair.set(be_fair);
             if let Some(queue_worker) = thread.queue_worker.as_ref() {
                 queue_worker.push(runnable);
                 return self.notify();
@@ -445,16 +446,16 @@ impl Scheduler {
     }
 
     fn on_worker_search(&self) -> bool {
-        let state = self.state.load(Ordering::Relaxed);
-        if state & (1 << Self::SHUTDOWN_SHIFT) != 0 {
-            return false;
-        }
+        // let state = self.state.load(Ordering::Relaxed);
+        // if state & (1 << Self::SHUTDOWN_SHIFT) != 0 {
+        //     return false;
+        // }
 
-        let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
-        assert!(searching <= self.workers.len());
-        if 2 * state >= self.workers.len() {
-            return false;
-        }
+        // let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
+        // assert!(searching <= self.workers.len());
+        // if 2 * state >= self.workers.len() {
+        //     return false;
+        // }
 
         let state = self
             .state
@@ -573,8 +574,14 @@ impl Worker {
 
         loop {
             let polled = (|| {
-                if tick % 61 == 0 {
+                let be_fair = thread.be_fair.take() || tick % 61 == 0;
+                if be_fair {
                     if let QueueSteal::Success(runnable) = scheduler.injector.steal() {
+                        return Some(runnable);
+                    }
+
+                    let queue_stealer = &scheduler.workers[worker_index].queue_stealer;
+                    if let QueueSteal::Success(runnable) = queue_stealer.steal() {
                         return Some(runnable);
                     }
                 }
@@ -637,6 +644,7 @@ impl Worker {
 }
 
 struct ThreadContext {
+    be_fair: Cell<bool>,
     scheduler: Arc<Scheduler>,
     queue_worker: Option<QueueWorker>,
 }
@@ -662,6 +670,7 @@ impl Thread {
         
         ThreadContext::with_tls(|tls| {
             let context = Rc::new(ThreadContext {
+                be_fair: Cell::new(false),
                 queue_worker,
                 scheduler,
             });
