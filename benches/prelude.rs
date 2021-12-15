@@ -1,4 +1,3 @@
-use once_cell::sync::OnceCell;
 use pin_project_lite::pin_project;
 use std::{
     future::Future,
@@ -7,21 +6,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub fn cpu_count() -> usize {
-    static NUM_CPUS: OnceCell<usize> = OnceCell::new();
-    *NUM_CPUS.get_or_init(|| num_cpus::get())
-}
-
 pub trait BenchExecutor {
     type JoinHandle: Future<Output = ()>;
 
     fn spawn<F: Future<Output = ()> + Send + 'static>(future: F) -> Self::JoinHandle;
 
-    fn block_on<F: Future<Output = ()>>(cpus: usize, future: F);
+    fn block_on<F: Future<Output = ()>>(future: F);
 
-    fn record<F: Future<Output = ()>>(cpus: usize, future: F) -> Duration {
+    fn record<F: Future<Output = ()>>(future: F) -> Duration {
         let mut elapsed = None;
-        Self::block_on(cpus, async {
+        Self::block_on(async {
             let started = Instant::now();
             future.await;
             elapsed = Some(started.elapsed());
@@ -59,9 +53,8 @@ impl BenchExecutor for TokioExecutor {
         }
     }
 
-    fn block_on<F: Future<Output = ()>>(cpus: usize, future: F) {
+    fn block_on<F: Future<Output = ()>>(future: F) {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(cpus)
             .build()
             .unwrap()
             .block_on(future)
@@ -77,7 +70,7 @@ impl BenchExecutor for YaarExecutor {
         yaar::spawn(future)
     }
 
-    fn block_on<F: Future<Output = ()>>(cpus: usize, future: F) {
-        yaar::Executor::with_threads(cpus).block_on(future)
+    fn block_on<F: Future<Output = ()>>(future: F) {
+        yaar::block_on(future)
     }
 }

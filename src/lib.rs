@@ -1,14 +1,15 @@
 #![forbid(unsafe_code)]
 
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use once_cell::sync::OnceCell;
+use pin_utils::pin_mut;
 use std::{
     any::Any,
-    cell::RefCell,
-    collections::VecDeque,
+    cell::{Cell, RefCell},
     future::Future,
     hint::spin_loop,
     mem::{drop, replace},
     num::NonZeroUsize,
-    ops::Deref,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     pin::Pin,
     rc::Rc,
@@ -17,38 +18,34 @@ use std::{
     task::{Context, Poll, Wake, Waker},
     thread,
 };
+use try_lock::TryLock;
 
-pub struct Executor {
-    worker_threads: usize,
-}
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    pin_mut!(future);
 
-impl Executor {
-    pub fn with_threads(worker_threads: usize) -> Self {
-        Self { worker_threads }
-    }
+    thread_local!(static TLS_PARKER: Arc<Parker> = Arc::new(Parker::new()));
+    let parker = TLS_PARKER.with(|parker| parker.clone());
 
-    pub fn block_on<F: Future>(self, future: F) -> F::Output {
-        let mut future = Box::pin(future);
-        let scheduler = Arc::new(Scheduler::new(self.worker_threads));
-        let thread = Thread::enter(scheduler, None);
+    assert!(
+        !parker.active.load(Ordering::Relaxed),
+        "nested calls to block_on() are explicitely not supported",
+    );
 
-        let parker = Arc::new(Parker::new());
-        let waker = Waker::from(parker.clone());
-        let mut ctx = Context::from_waker(&waker);
+    let waker = Waker::from(parker.clone());
+    let mut ctx = Context::from_waker(&waker);
+    parker.active.store(true, Ordering::Relaxed);
 
-        thread.scheduler.on_task_begin();
-        let poll_result = catch_unwind(AssertUnwindSafe(|| loop {
-            match future.as_mut().poll(&mut ctx) {
-                Poll::Ready(output) => break output,
-                Poll::Pending => parker.park(),
-            }
-        }));
-
-        thread.scheduler.on_task_complete();
-        match poll_result {
-            Ok(output) => output,
-            Err(error) => resume_unwind(error),
+    let poll_result = catch_unwind(AssertUnwindSafe(|| loop {
+        match future.as_mut().poll(&mut ctx) {
+            Poll::Ready(output) => break output,
+            Poll::Pending => parker.park(),
         }
+    }));
+
+    parker.active.store(false, Ordering::Relaxed);
+    match poll_result {
+        Ok(output) => output,
+        Err(error) => resume_unwind(error),
     }
 }
 
@@ -80,6 +77,7 @@ impl<T> Future for JoinHandle<T> {
 }
 
 struct Parker {
+    active: AtomicBool,
     notified: AtomicBool,
     thread: thread::Thread,
 }
@@ -87,17 +85,15 @@ struct Parker {
 impl Parker {
     fn new() -> Self {
         Self {
+            active: AtomicBool::new(false),
             notified: AtomicBool::new(false),
             thread: thread::current(),
         }
     }
 
     fn park(&self) {
-        loop {
-            match self.notified.load(Ordering::Acquire) {
-                true => return self.notified.store(false, Ordering::Relaxed),
-                false => thread::park(),
-            }
+        while !self.notified.swap(false, Ordering::Acquire) {
+            thread::park();
         }
     }
 }
@@ -108,15 +104,16 @@ impl Wake for Parker {
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        self.notified.store(true, Ordering::Release);
-        self.thread.unpark();
+        if !self.notified.swap(true, Ordering::Release) {
+            self.thread.unpark();
+        }
     }
 }
 
 #[derive(Default)]
 struct AtomicWaker {
     state: AtomicU8,
-    waker: Mutex<Option<Waker>>,
+    waker: TryLock<Option<Waker>>,
 }
 
 impl AtomicWaker {
@@ -236,8 +233,7 @@ enum TaskData<F: Future> {
 struct Task<F: Future> {
     state: TaskState,
     waker: AtomicWaker,
-    data: Mutex<TaskData<F>>,
-    scheduler: Arc<Scheduler>,
+    data: TryLock<TaskData<F>>,
 }
 
 impl<F> Task<F>
@@ -246,29 +242,17 @@ where
     F::Output: Send + 'static,
 {
     fn spawn(future: Pin<Box<F>>) -> Arc<Self> {
-        let thread = Thread::current().expect("spawn() called outside the Executor context");
-
         let task = Arc::new(Self {
             state: TaskState::default(),
             waker: AtomicWaker::default(),
-            data: Mutex::new(TaskData::Empty),
-            scheduler: thread.scheduler.clone(),
+            data: TryLock::new(TaskData::Empty),
         });
 
         let waker = Waker::from(task.clone());
         *task.data.try_lock().unwrap() = TaskData::Polling(future, waker);
 
-        thread.scheduler.on_task_begin();
         Waker::from(task.clone()).wake();
         task
-    }
-
-    fn schedule(self: Arc<Self>) {
-        let order = QueueOrder::Lifo;
-        match Thread::current() {
-            Some(thread) => thread.scheduler.schedule(self, thread.worker_index, order),
-            None => self.scheduler.schedule(self.clone(), None, order),
-        }
     }
 }
 
@@ -279,19 +263,19 @@ where
 {
     fn wake(self: Arc<Self>) {
         if self.state.transition_to_scheduled() {
-            self.schedule();
+            Executor::global().schedule(Scheduled::Wake(self));
         }
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
         if self.state.transition_to_scheduled() {
-            Arc::clone(self).schedule();
+            Executor::global().schedule(Scheduled::WakeByRef(self.clone()));
         }
     }
 }
 
 trait Runnable: Send + Sync {
-    fn run(self: Arc<Self>, thread: &Thread);
+    fn run(self: Arc<Self>);
 }
 
 impl<F> Runnable for Task<F>
@@ -299,7 +283,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    fn run(self: Arc<Self>, thread: &Thread) {
+    fn run(self: Arc<Self>) {
         let mut data = self.data.try_lock().unwrap();
         self.state.transition_to_running();
 
@@ -322,15 +306,12 @@ where
                 }
 
                 self.state.transition_to_scheduled_from_notified();
-                return thread
-                    .scheduler
-                    .schedule(self, thread.worker_index, QueueOrder::Fifo);
+                return Executor::global().schedule(Scheduled::WakeByRef(self));
             }
         };
 
         drop(data);
         self.waker.wake();
-        thread.scheduler.on_task_complete();
     }
 }
 
@@ -352,132 +333,106 @@ impl<F: Future> Joinable<F::Output> for Task<F> {
     }
 }
 
-struct Scheduler {
-    rng_seq: RngSeq,
-    state: AtomicUsize,
-    tasks: AtomicUsize,
-    injecting: AtomicUsize,
-    semaphore: Semaphore,
-    workers: Box<[Worker]>,
+enum Scheduled {
+    Wake(Arc<dyn Runnable>),
+    WakeByRef(Arc<dyn Runnable>),
 }
 
-impl Scheduler {
-    const STATE_BITS: u32 = usize::BITS / 3;
+struct Executor {
+    rng_seq: RngSeq,
+    state: AtomicUsize,
+    semaphore: Semaphore,
+    injector: Injector<Arc<dyn Runnable>>,
+    stealers: Box<[Stealer<Arc<dyn Runnable>>]>,
+}
+
+impl Executor {
+    const STATE_BITS: u32 = usize::BITS / 2;
     const STATE_MASK: usize = (1 << Self::STATE_BITS) - 1;
 
     const IDLE_SHIFT: u32 = Self::STATE_BITS * 0;
-    const SPAWN_SHIFT: u32 = Self::STATE_BITS * 1;
-    const SEARCH_SHIFT: u32 = Self::STATE_BITS * 2;
+    const SEARCH_SHIFT: u32 = Self::STATE_BITS * 1;
 
-    const PADDING_BITS: u32 = usize::BITS % 3;
-    const SHUTDOWN_SHIFT: u32 = usize::BITS - Self::PADDING_BITS;
+    fn global() -> &'static Self {
+        static GLOBAL_EXECUTOR: OnceCell<Executor> = OnceCell::new();
+        GLOBAL_EXECUTOR.get_or_init(|| {
+            let num_threads = num_cpus::get().min(Self::STATE_MASK);
+            let num_workers = NonZeroUsize::new(num_threads)
+                .or(NonZeroUsize::new(1))
+                .unwrap();
 
-    fn new(mut worker_threads: usize) -> Self {
-        worker_threads = worker_threads.min(Self::STATE_MASK);
-        let num_workers = NonZeroUsize::new(worker_threads)
-            .or(NonZeroUsize::new(1))
-            .unwrap();
-
-        Self {
-            rng_seq: RngSeq::new(num_workers),
-            state: AtomicUsize::new(0),
-            tasks: AtomicUsize::new(0),
-            injecting: AtomicUsize::new(0),
-            semaphore: Semaphore::default(),
-            workers: (0..num_workers.get()).map(|_| Worker::default()).collect(),
-        }
+            Self {
+                rng_seq: RngSeq::new(num_workers),
+                state: AtomicUsize::new(0),
+                semaphore: Semaphore::default(),
+                injector: Injector::new(),
+                stealers: (0..num_workers.get())
+                    .map(|stealer_index| {
+                        let worker = Worker::new_lifo();
+                        let stealer = worker.stealer();
+                        thread::spawn(move || Self::global().run_worker(worker, stealer_index));
+                        stealer
+                    })
+                    .collect(),
+            }
+        })
     }
 
-    fn schedule(
-        self: &Arc<Self>,
-        runnable: Arc<dyn Runnable>,
-        worker_index: Option<usize>,
-        queue_order: QueueOrder,
-    ) {
-        if let Some(worker_index) = worker_index {
-            self.workers[worker_index]
-                .run_queue
-                .push(runnable, queue_order);
+    fn schedule(&self, scheduled: Scheduled) {
+        let (runnable, be_fair) = match scheduled {
+            Scheduled::Wake(runnable) => (runnable, false),
+            Scheduled::WakeByRef(runnable) => (runnable, true),
+        };
+
+        if let Some(thread) = Thread::with(|tls| tls.as_ref().map(Rc::clone)) {
+            thread.be_fair.set(be_fair || thread.be_fair.get());
+            thread.worker.push(runnable);
             return self.notify();
         }
 
-        let injecting = self.injecting.fetch_add(1, Ordering::Relaxed);
-        let worker_index = injecting % self.workers.len();
-        self.workers[worker_index]
-            .run_queue
-            .push(runnable, queue_order);
-
+        self.injector.push(runnable);
         fence(Ordering::SeqCst);
         self.notify();
     }
 
-    fn notify(self: &Arc<Self>) {
+    fn notify(&self) {
         self.state
             .fetch_update(Ordering::Release, Ordering::Relaxed, |state| {
-                let new_state = state + (1 << Self::SEARCH_SHIFT);
-                if state & (1 << Self::SHUTDOWN_SHIFT) != 0 {
-                    return None;
-                }
-
                 let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
-                assert!(searching <= self.workers.len());
+                assert!(searching <= self.stealers.len());
                 if searching > 0 {
                     return None;
                 }
 
                 let idle = (state >> Self::IDLE_SHIFT) & Self::STATE_MASK;
-                assert!(idle <= self.workers.len());
-                if idle > 0 {
-                    return Some(new_state - (1 << Self::IDLE_SHIFT));
+                assert!(idle <= self.stealers.len());
+                if idle == 0 {
+                    return None;
                 }
 
-                let spawned = (state >> Self::SPAWN_SHIFT) & Self::STATE_MASK;
-                assert!(spawned <= self.workers.len());
-                if spawned < self.workers.len() {
-                    return Some(new_state + (1 << Self::SPAWN_SHIFT));
-                }
-
-                None
+                let mut new_state = state;
+                new_state += 1 << Self::SEARCH_SHIFT;
+                new_state -= 1 << Self::IDLE_SHIFT;
+                return Some(new_state);
             })
-            .map(|state| {
-                let idle = (state >> Self::IDLE_SHIFT) & Self::STATE_MASK;
-                assert!(idle <= self.workers.len());
-                if idle > 0 {
-                    self.semaphore.post();
-                    return;
-                }
-
-                let spawned = (state >> Self::SPAWN_SHIFT) & Self::STATE_MASK;
-                assert!(spawned < self.workers.len());
-
-                let worker_index = spawned;
-                let scheduler = Arc::clone(self);
-                thread::spawn(move || Worker::run(scheduler, worker_index));
-            })
+            .map(|_| self.semaphore.post())
             .unwrap_or(())
     }
 
-    fn on_worker_search(&self) -> bool {
-        // let state = self.state.load(Ordering::Relaxed);
-        // if state & (1 << Self::SHUTDOWN_SHIFT) != 0 {
-        //     return false;
-        // }
-
-        // let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
-        // assert!(searching <= self.workers.len());
-        // if 2 * state >= self.workers.len() {
-        //     return false;
-        // }
+    fn on_worker_search(&self, is_searching: bool) {
+        if is_searching {
+            return;
+        }
 
         let state = self
             .state
             .fetch_add(1 << Self::SEARCH_SHIFT, Ordering::Acquire);
+
         let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
-        assert!(searching < self.workers.len());
-        true
+        assert!(searching < self.stealers.len());
     }
 
-    fn on_worker_discovered(self: &Arc<Self>, was_searching: bool) {
+    fn on_worker_discovered(&self, was_searching: bool) {
         if !was_searching {
             return;
         }
@@ -485,8 +440,9 @@ impl Scheduler {
         let state = self
             .state
             .fetch_sub(1 << Self::SEARCH_SHIFT, Ordering::Release);
+
         let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
-        assert!(searching <= self.workers.len());
+        assert!(searching <= self.stealers.len());
         assert_ne!(searching, 0);
 
         if searching == 1 {
@@ -494,113 +450,78 @@ impl Scheduler {
         }
     }
 
-    fn on_worker_idle(self: &Arc<Self>, was_searching: bool) -> bool {
+    fn on_worker_idle(&self, was_searching: bool) {
         let update: usize = 1 << Self::IDLE_SHIFT;
         let update = update.wrapping_sub((was_searching as usize) << Self::SEARCH_SHIFT);
         let state = self.state.fetch_add(update, Ordering::AcqRel);
 
         let idle = (state >> Self::IDLE_SHIFT) & Self::STATE_MASK;
-        assert!(idle < self.workers.len());
+        assert!(idle < self.stealers.len());
 
         let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
-        assert!(searching <= self.workers.len());
+        assert!(searching <= self.stealers.len());
         assert!(searching >= was_searching as usize);
 
-        if was_searching && self.pending() {
+        if was_searching && !self.injector.is_empty() {
             self.notify();
         }
-
-        state & (1 << Self::SHUTDOWN_SHIFT) == 0
     }
 
-    fn pending(&self) -> bool {
-        self.workers
-            .iter()
-            .map(|w| w.run_queue.pending())
-            .find(|&pending| pending)
-            .unwrap_or(false)
-    }
+    fn run_worker(&self, worker: Worker<Arc<dyn Runnable>>, stealer_index: usize) {
+        let thread = Rc::new(Thread {
+            worker,
+            be_fair: Cell::new(false),
+        });
 
-    fn on_task_begin(&self) {
-        let tasks = self.tasks.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(tasks, usize::MAX);
-    }
+        let worker = &thread.worker;
+        Thread::with(|tls| *tls = Some(thread.clone()));
 
-    fn on_task_complete(&self) {
-        let tasks = self.tasks.fetch_sub(1, Ordering::Release);
-        assert_ne!(tasks, 0);
-
-        if tasks == 1 {
-            fence(Ordering::Acquire);
-            self.shutdown();
-        }
-    }
-
-    fn shutdown(&self) {
-        self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |mut state| {
-                let idle = (state >> Self::IDLE_SHIFT) & Self::STATE_MASK;
-                assert!(idle <= self.workers.len());
-                state -= idle << Self::IDLE_SHIFT;
-
-                let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
-                assert!(searching <= self.workers.len());
-                state += idle << Self::SEARCH_SHIFT;
-
-                assert_eq!(state & (1 << Self::SHUTDOWN_SHIFT), 0);
-                Some(state | (1 << Self::SHUTDOWN_SHIFT))
-            })
-            .map(|state| {
-                let idle = (state >> Self::IDLE_SHIFT) & Self::STATE_MASK;
-                for _idle_worker in 0..idle {
-                    self.semaphore.post();
-                }
-            })
-            .unwrap_or(())
-    }
-}
-
-#[derive(Default)]
-struct Worker {
-    run_queue: Queue,
-}
-
-impl Worker {
-    fn run(scheduler: Arc<Scheduler>, worker_index: usize) {
-        let mut rng = Rng::new(worker_index);
+        let mut rng = Rng::new(stealer_index);
         let mut tick = rng.gen().get();
-        let mut searching = true;
-
-        let thread = Thread::enter(scheduler, Some(worker_index));
-        let scheduler = &thread.scheduler;
+        let mut searching = false;
 
         loop {
             let polled = (|| {
-                let run_queue = &scheduler.workers[worker_index].run_queue;
-                if let Some(runnable) = run_queue.pop(tick % 61 == 0) {
+                if thread.be_fair.take() || tick % 61 == 0 {
+                    if let Steal::Success(runnable) = self.injector.steal() {
+                        return Some(runnable);
+                    }
+
+                    if let Steal::Success(runnable) = self.stealers[stealer_index].steal() {
+                        return Some(runnable);
+                    }
+                }
+
+                if let Some(runnable) = worker.pop() {
                     return Some(runnable);
                 }
 
-                searching = searching || scheduler.on_worker_search();
-                if searching {
-                    for _attempt in 0..32 {
-                        let mut was_contended = false;
-                        for steal_index in scheduler.rng_seq.gen(&mut rng) {
-                            if steal_index == worker_index {
-                                continue;
-                            }
+                self.on_worker_search(searching);
+                searching = true;
 
-                            match scheduler.workers[steal_index].run_queue.steal(run_queue) {
-                                Ok(runnable) => return Some(runnable),
-                                Err(contended) => was_contended = was_contended || contended,
-                            }
+                for _attempt in 0..32 {
+                    let mut was_contended = match self.injector.steal_batch_and_pop(&*worker) {
+                        Steal::Success(runnable) => return Some(runnable),
+                        Steal::Retry => true,
+                        Steal::Empty => false,
+                    };
+
+                    for target_index in self.rng_seq.gen(&mut rng) {
+                        if target_index == stealer_index {
+                            continue;
                         }
 
-                        if was_contended {
-                            spin_loop()
-                        } else {
-                            break;
+                        match self.stealers[target_index].steal_batch_and_pop(&*worker) {
+                            Steal::Success(runnable) => return Some(runnable),
+                            Steal::Retry => was_contended = true,
+                            Steal::Empty => {}
                         }
+                    }
+
+                    if was_contended {
+                        spin_loop()
+                    } else {
+                        break;
                     }
                 }
 
@@ -609,141 +530,28 @@ impl Worker {
 
             let was_searching = replace(&mut searching, false);
             if let Some(runnable) = polled {
-                scheduler.on_worker_discovered(was_searching);
+                self.on_worker_discovered(was_searching);
                 tick = tick.wrapping_add(1);
-                runnable.run(&thread);
+                runnable.run();
                 continue;
             }
 
-            if scheduler.on_worker_idle(was_searching) {
-                scheduler.semaphore.wait();
-                searching = true;
-                continue;
-            }
-
-            return;
+            self.on_worker_idle(was_searching);
+            self.semaphore.wait();
+            searching = true;
         }
-    }
-}
-
-struct ThreadContext {
-    scheduler: Arc<Scheduler>,
-    worker_index: Option<usize>,
-}
-
-impl ThreadContext {
-    fn with_tls<F>(f: impl FnOnce(&mut Option<Rc<Self>>) -> F) -> F {
-        thread_local!(static TLS: RefCell<Option<Rc<ThreadContext>>> = RefCell::new(None));
-        TLS.with(|ref_cell| f(&mut *ref_cell.borrow_mut()))
     }
 }
 
 struct Thread {
-    context: Rc<ThreadContext>,
+    worker: Worker<Arc<dyn Runnable>>,
+    be_fair: Cell<bool>,
 }
 
 impl Thread {
-    fn enter(scheduler: Arc<Scheduler>, worker_index: Option<usize>) -> Self {
-        ThreadContext::with_tls(|tls| {
-            let context = Rc::new(ThreadContext {
-                worker_index,
-                scheduler,
-            });
-
-            let old_tls = replace(tls, Some(context.clone()));
-            assert!(old_tls.is_none(), "Nested thread blocking is not supported");
-            Self { context }
-        })
-    }
-
-    fn current() -> Option<Self> {
-        ThreadContext::with_tls(|tls| tls.as_ref().map(Rc::clone)).map(|context| Self { context })
-    }
-}
-
-impl Deref for Thread {
-    type Target = ThreadContext;
-
-    fn deref(&self) -> &Self::Target {
-        &*self.context
-    }
-}
-
-impl Drop for Thread {
-    fn drop(&mut self) {
-        if Rc::strong_count(&self.context) == 2 {
-            let old_tls = ThreadContext::with_tls(|tls| replace(tls, None));
-            let old_tls = old_tls.expect("Thread dropped without ThreadContext");
-            assert!(Rc::ptr_eq(&self.context, &old_tls));
-        }
-    }
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum QueueOrder {
-    Lifo,
-    Fifo,
-}
-
-#[derive(Default)]
-struct Queue {
-    pending: AtomicBool,
-    deque: Mutex<VecDeque<Arc<dyn Runnable>>>,
-}
-
-impl Queue {
-    fn push(&self, runnable: Arc<dyn Runnable>, queue_order: QueueOrder) {
-        let mut deque = self.deque.lock().unwrap();
-        match queue_order {
-            QueueOrder::Lifo => deque.push_front(runnable),
-            QueueOrder::Fifo => deque.push_back(runnable),
-        }
-        self.pending.store(true, Ordering::Relaxed);
-    }
-
-    fn pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire)
-    }
-
-    fn pop(&self, be_fair: bool) -> Option<Arc<dyn Runnable>> {
-        if !self.pending.load(Ordering::Relaxed) {
-            return None;
-        }
-
-        let mut deque = self.deque.lock().unwrap();
-        let runnable = match be_fair {
-            true => deque.pop_back(),
-            false => deque.pop_front(),
-        };
-
-        self.pending.store(deque.len() > 0, Ordering::Relaxed);
-        runnable
-    }
-
-    fn steal(&self, dst: &Self) -> Result<Arc<dyn Runnable>, bool> {
-        if !self.pending() {
-            return Err(false);
-        }
-
-        let mut deque = match self.deque.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => return Err(true),
-        };
-
-        let runnable = match deque.pop_front() {
-            Some(runnable) => runnable,
-            None => return Err(false),
-        };
-
-        let take = (deque.len() / 2).min(64);
-        if take > 0 {
-            let mut dst_deque = dst.deque.lock().unwrap();
-            dst_deque.extend(deque.drain(0..take));
-            dst.pending.store(true, Ordering::Relaxed);
-        }
-
-        self.pending.store(deque.len() > 0, Ordering::Relaxed);
-        Ok(runnable)
+    fn with<F>(f: impl FnOnce(&mut Option<Rc<Self>>) -> F) -> F {
+        thread_local!(static TLS_WORKER: RefCell<Option<Rc<Thread>>> = RefCell::new(None));
+        TLS_WORKER.with(|ref_cell| f(&mut *ref_cell.borrow_mut()))
     }
 }
 
