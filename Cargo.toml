@@ -12,9 +12,9 @@ pin-utils = "0.1"
 crossbeam-deque = "0.8"
 
 [dev-dependencies]
-criterion = "0.3"
 pin-project-lite = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+criterion = { version = "0.3", features = ["html_reports"] }
 
 [[bench]]
 name = "executors"

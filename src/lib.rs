@@ -13,7 +13,7 @@ use std::{
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     pin::Pin,
     rc::Rc,
-    sync::atomic::{fence, AtomicBool, AtomicU8, AtomicUsize, AtomicIsize, Ordering},
+    sync::atomic::{fence, AtomicBool, AtomicIsize, AtomicU8, AtomicUsize, Ordering},
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll, Wake, Waker},
     thread,
@@ -315,11 +315,15 @@ where
     }
 }
 
-trait Joinable<T> {
+trait Joinable<T>: Send + Sync {
     fn poll_join(&self, ctx: &mut Context<'_>) -> Poll<T>;
 }
 
-impl<F: Future> Joinable<F::Output> for Task<F> {
+impl<F> Joinable<F::Output> for Task<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     fn poll_join(&self, ctx: &mut Context<'_>) -> Poll<F::Output> {
         if let Poll::Pending = self.waker.poll(ctx) {
             return Poll::Pending;
@@ -511,15 +515,16 @@ impl Executor {
                     for _attempt in 0..32 {
                         let mut retry = false;
                         for index in self.rng_seq.gen(&mut rng) {
-                            let stole = match index {
-                                i if i == stealer_index => self.injector.steal_batch_and_pop(&*worker),
-                                _ => self.stealers[index].steal_batch_and_pop(&*worker),
+                            let stole = if index == stealer_index {
+                                self.injector.steal_batch_and_pop(&*worker)
+                            } else {
+                                self.stealers[index].steal_batch_and_pop(&*worker)
                             };
 
                             match stole {
                                 Steal::Success(runnable) => return Some(runnable),
                                 Steal::Retry => retry = true,
-                                Steal::Empty => {},
+                                Steal::Empty => {}
                             }
                         }
 
