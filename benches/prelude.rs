@@ -98,13 +98,13 @@ impl BenchExecutor for TokioExecutor {
 pub struct YaarExecutor;
 
 impl BenchExecutor for YaarExecutor {
-    type JoinHandle = yaar::JoinHandle<()>;
+    type JoinHandle = yaar::task::JoinHandle<()>;
 
     fn spawn<F: Future<Output = ()> + Send + 'static>(future: F) -> Self::JoinHandle {
-        yaar::spawn(future)
+        yaar::task::spawn(future)
     }
 
     fn block_on<F: Future<Output = ()>>(future: F) {
-        yaar::block_on(future)
+        yaar::task::block_on(future)
     }
 }
