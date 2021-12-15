@@ -10,6 +10,7 @@ once_cell = "1"
 try-lock = "0.2"
 pin-utils = "0.1"
 crossbeam-deque = "0.8"
+mio = { version = "0.8", features = ["net", "os-poll"] }
 
 [dev-dependencies]
 pin-project-lite = "0.2"
