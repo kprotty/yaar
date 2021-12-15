@@ -13,10 +13,18 @@ crossbeam-deque = "0.8"
 mio = { version = "0.8", features = ["net", "os-poll"] }
 
 [dev-dependencies]
+pin-utils = "0.1"
 pin-project-lite = "0.2"
 criterion = { version = "0.3", features = ["html_reports"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net"] }
 
 [[bench]]
 name = "executors"
 harness = false
+
+[[example]]
+name = "yaar_http"
+
+[[example]]
+name = "tokio_http"

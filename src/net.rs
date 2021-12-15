@@ -92,8 +92,7 @@ impl AtomicWaker {
     fn wake(&self, wakers: &mut Vec<Waker>) {
         match self.state.swap(Self::NOTIFIED, Ordering::AcqRel) {
             Self::READY => {}
-            Self::EMPTY | Self::UPDATING => return,
-            Self::NOTIFIED => unreachable!("AtomicWaker awoken multiple times"),
+            Self::EMPTY | Self::UPDATING | Self::NOTIFIED => return,
             _ => unreachable!("invalid AtomicWaker state"),
         }
 
