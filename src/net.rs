@@ -97,8 +97,10 @@ impl AtomicWaker {
             _ => unreachable!("invalid AtomicWaker state"),
         }
 
-        if let Some(waker) = replace(&mut *self.waker.try_lock().unwrap(), None) {
-            wakers.push(waker);
+        if let Some(mut waker) = self.waker.try_lock() {
+            if let Some(waker) = replace(&mut *waker, None) {
+                wakers.push(waker);
+            }
         }
     }
 }
