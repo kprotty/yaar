@@ -7,6 +7,7 @@ use prelude::*;
 
 use criterion::{Bencher, Criterion};
 use std::{mem::drop, sync::Arc};
+use tokio::sync::oneshot;
 
 fn bench_yield_many<E: BenchExecutor>(b: &mut Bencher) {
     const NUM_YIELDS: usize = 10_000;
@@ -68,6 +69,34 @@ fn bench_chained_spawn<E: BenchExecutor>(b: &mut Bencher) {
     })
 }
 
+fn bench_ping_pong<E: BenchExecutor>(b: &mut Bencher) {
+    const NUM_PINGS: usize = 50_000;
+
+    b.iter_custom(|iters| {
+        E::record(iters, |wg| async move {
+            wg.reset(NUM_PINGS);
+
+            for _ in 0..NUM_PINGS {
+                let wg = wg.clone();
+                E::spawn(async move {
+                    let (tx1, rx1) = oneshot::channel();
+                    let (tx2, rx2) = oneshot::channel();
+
+                    E::spawn(async move {
+                        rx1.await.unwrap();
+                        tx2.send(()).unwrap();
+                    });
+
+                    tx1.send(()).unwrap();
+                    rx2.await.unwrap();
+
+                    wg.done();
+                });
+            }
+        })
+    })
+}
+
 fn yield_many(c: &mut Criterion) {
     c.bench_function("tokio yield_many", |b| bench_yield_many::<TokioExecutor>(b));
     c.bench_function("yaar yield_many", |b| bench_yield_many::<YaarExecutor>(b));
@@ -87,5 +116,17 @@ fn chained_spawn(c: &mut Criterion) {
     });
 }
 
-criterion_group!(bench_executors, yield_many, spawn_many, chained_spawn);
+fn ping_pong(c: &mut Criterion) {
+    c.bench_function("tokio ping_pong", |b| bench_ping_pong::<TokioExecutor>(b));
+    c.bench_function("yaar ping_pong", |b| bench_ping_pong::<YaarExecutor>(b));
+}
+
+criterion_group!(
+    bench_executors,
+    yield_many,
+    spawn_many,
+    chained_spawn,
+    ping_pong
+);
+
 criterion_main!(bench_executors);
