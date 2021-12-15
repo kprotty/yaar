@@ -460,7 +460,7 @@ impl Executor {
 
     fn on_worker_idle(&self, is_searching: &mut bool) {
         let was_searching = replace(is_searching, false);
-        
+
         let update: usize = 1 << Self::IDLE_SHIFT;
         let update = update.wrapping_sub((was_searching as usize) << Self::SEARCH_SHIFT);
         let state = self.state.fetch_add(update, Ordering::AcqRel);
@@ -509,26 +509,22 @@ impl Executor {
                 self.on_worker_search(&mut searching);
                 if searching {
                     for _attempt in 0..32 {
-                        let mut was_contended = match self.injector.steal_batch_and_pop(&*worker) {
-                            Steal::Success(runnable) => return Some(runnable),
-                            Steal::Retry => true,
-                            Steal::Empty => false,
-                        };
-    
-                        for target_index in self.rng_seq.gen(&mut rng) {
-                            if target_index == stealer_index {
-                                continue;
-                            }
-    
-                            match self.stealers[target_index].steal_batch_and_pop(&*worker) {
+                        let mut retry = false;
+                        for index in self.rng_seq.gen(&mut rng) {
+                            let stole = match index {
+                                i if i == stealer_index => self.injector.steal_batch_and_pop(&*worker),
+                                _ => self.stealers[index].steal_batch_and_pop(&*worker),
+                            };
+
+                            match stole {
                                 Steal::Success(runnable) => return Some(runnable),
-                                Steal::Retry => was_contended = true,
-                                Steal::Empty => {}
+                                Steal::Retry => retry = true,
+                                Steal::Empty => {},
                             }
                         }
-    
-                        if was_contended {
-                            spin_loop()
+
+                        if retry {
+                            spin_loop();
                         } else {
                             break;
                         }
