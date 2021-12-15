@@ -372,7 +372,7 @@ impl Executor {
                 injector: Injector::new(),
                 stealers: (0..num_workers.get())
                     .map(|stealer_index| {
-                        let worker = Worker::new_lifo();
+                        let worker = Worker::new_fifo();
                         let stealer = worker.stealer();
                         thread::spawn(move || Self::global().run_worker(worker, stealer_index));
                         stealer
@@ -389,9 +389,19 @@ impl Executor {
         };
 
         if let Some(thread) = Thread::with(|tls| tls.as_ref().map(Rc::clone)) {
-            thread.be_fair.set(be_fair || thread.be_fair.get());
-            thread.worker.push(runnable);
-            return self.notify();
+            let mut runnable = Some(runnable);
+            if be_fair {
+                thread.be_fair.set(true);
+            } else {
+                runnable = thread.run_next.replace(runnable);
+            }
+
+            if let Some(runnable) = runnable {
+                thread.worker.push(runnable);
+                self.notify();
+            }
+
+            return;
         }
 
         self.injector.push(runnable);
@@ -483,6 +493,7 @@ impl Executor {
 
     fn run_worker(&self, worker: Worker<Arc<dyn Runnable>>, stealer_index: usize) {
         let thread = Rc::new(Thread {
+            run_next: Cell::new(None),
             worker,
             be_fair: Cell::new(false),
         });
@@ -497,16 +508,13 @@ impl Executor {
         loop {
             let polled = (|| {
                 if thread.be_fair.take() || tick % 61 == 0 {
-                    if let Steal::Success(runnable) = self.injector.steal() {
-                        return Some(runnable);
-                    }
-
-                    if let Steal::Success(runnable) = self.stealers[stealer_index].steal() {
+                    if let Some(runnable) = self.injector.steal().success().or_else(|| worker.pop())
+                    {
                         return Some(runnable);
                     }
                 }
 
-                if let Some(runnable) = worker.pop() {
+                if let Some(runnable) = thread.run_next.take().or_else(|| worker.pop()) {
                     return Some(runnable);
                 }
 
@@ -554,6 +562,7 @@ impl Executor {
 }
 
 struct Thread {
+    run_next: Cell<Option<Arc<dyn Runnable>>>,
     worker: Worker<Arc<dyn Runnable>>,
     be_fair: Cell<bool>,
 }
