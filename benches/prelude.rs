@@ -7,7 +7,7 @@ use std::{
 };
 
 pub trait BenchExecutor {
-    type JoinHandle: Future<Output = ()>;
+    type JoinHandle: Future<Output = ()> + Send + 'static;
 
     fn spawn<F: Future<Output = ()> + Send + 'static>(future: F) -> Self::JoinHandle;
 
