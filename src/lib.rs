@@ -13,7 +13,7 @@ use std::{
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     pin::Pin,
     rc::Rc,
-    sync::atomic::{fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{fence, AtomicBool, AtomicU8, AtomicUsize, AtomicIsize, Ordering},
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll, Wake, Waker},
     thread,
@@ -419,8 +419,15 @@ impl Executor {
             .unwrap_or(())
     }
 
-    fn on_worker_search(&self, is_searching: bool) {
-        if is_searching {
+    fn on_worker_search(&self, is_searching: &mut bool) {
+        if *is_searching {
+            return;
+        }
+
+        let state = self.state.load(Ordering::Relaxed);
+        let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
+        assert!(searching <= self.stealers.len());
+        if (2 * searching) >= self.stealers.len() {
             return;
         }
 
@@ -430,10 +437,11 @@ impl Executor {
 
         let searching = (state >> Self::SEARCH_SHIFT) & Self::STATE_MASK;
         assert!(searching < self.stealers.len());
+        *is_searching = true;
     }
 
-    fn on_worker_discovered(&self, was_searching: bool) {
-        if !was_searching {
+    fn on_worker_discovered(&self, is_searching: &mut bool) {
+        if !replace(is_searching, false) {
             return;
         }
 
@@ -450,7 +458,9 @@ impl Executor {
         }
     }
 
-    fn on_worker_idle(&self, was_searching: bool) {
+    fn on_worker_idle(&self, is_searching: &mut bool) {
+        let was_searching = replace(is_searching, false);
+        
         let update: usize = 1 << Self::IDLE_SHIFT;
         let update = update.wrapping_sub((was_searching as usize) << Self::SEARCH_SHIFT);
         let state = self.state.fetch_add(update, Ordering::AcqRel);
@@ -496,47 +506,46 @@ impl Executor {
                     return Some(runnable);
                 }
 
-                self.on_worker_search(searching);
-                searching = true;
-
-                for _attempt in 0..32 {
-                    let mut was_contended = match self.injector.steal_batch_and_pop(&*worker) {
-                        Steal::Success(runnable) => return Some(runnable),
-                        Steal::Retry => true,
-                        Steal::Empty => false,
-                    };
-
-                    for target_index in self.rng_seq.gen(&mut rng) {
-                        if target_index == stealer_index {
-                            continue;
-                        }
-
-                        match self.stealers[target_index].steal_batch_and_pop(&*worker) {
+                self.on_worker_search(&mut searching);
+                if searching {
+                    for _attempt in 0..32 {
+                        let mut was_contended = match self.injector.steal_batch_and_pop(&*worker) {
                             Steal::Success(runnable) => return Some(runnable),
-                            Steal::Retry => was_contended = true,
-                            Steal::Empty => {}
+                            Steal::Retry => true,
+                            Steal::Empty => false,
+                        };
+    
+                        for target_index in self.rng_seq.gen(&mut rng) {
+                            if target_index == stealer_index {
+                                continue;
+                            }
+    
+                            match self.stealers[target_index].steal_batch_and_pop(&*worker) {
+                                Steal::Success(runnable) => return Some(runnable),
+                                Steal::Retry => was_contended = true,
+                                Steal::Empty => {}
+                            }
                         }
-                    }
-
-                    if was_contended {
-                        spin_loop()
-                    } else {
-                        break;
+    
+                        if was_contended {
+                            spin_loop()
+                        } else {
+                            break;
+                        }
                     }
                 }
 
                 None
             })();
 
-            let was_searching = replace(&mut searching, false);
             if let Some(runnable) = polled {
-                self.on_worker_discovered(was_searching);
+                self.on_worker_discovered(&mut searching);
                 tick = tick.wrapping_add(1);
                 runnable.run();
                 continue;
             }
 
-            self.on_worker_idle(was_searching);
+            self.on_worker_idle(&mut searching);
             self.semaphore.wait();
             searching = true;
         }
@@ -557,18 +566,31 @@ impl Thread {
 
 #[derive(Default)]
 struct Semaphore {
+    count: AtomicIsize,
     value: Mutex<usize>,
     cond: Condvar,
 }
 
 impl Semaphore {
     fn wait(&self) {
+        let count = self.count.fetch_sub(1, Ordering::Acquire);
+        assert_ne!(count, isize::MIN);
+        if count > 0 {
+            return;
+        }
+
         let mut value = self.value.lock().unwrap();
         value = self.cond.wait_while(value, |v| *v == 0).unwrap();
         *value = value.checked_sub(1).unwrap();
     }
 
     fn post(&self) {
+        let count = self.count.fetch_add(1, Ordering::Release);
+        assert_ne!(count, isize::MAX);
+        if count >= 0 {
+            return;
+        }
+
         let mut value = self.value.lock().unwrap();
         *value = value.checked_add(1).unwrap();
         self.cond.notify_one();
