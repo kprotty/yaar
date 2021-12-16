@@ -89,18 +89,15 @@ impl AtomicWaker {
         self.notified.store(false, Ordering::Relaxed);
     }
 
-    fn wake(&self, wakers: &mut Vec<Waker>) {
+    fn wake(&self) -> Option<Waker> {
         match self.state.swap(Self::NOTIFIED, Ordering::AcqRel) {
+            Self::EMPTY | Self::UPDATING | Self::NOTIFIED => return None,
             Self::READY => {}
-            Self::EMPTY | Self::UPDATING | Self::NOTIFIED => return,
             _ => unreachable!("invalid AtomicWaker state"),
         }
 
-        if let Some(mut waker) = self.waker.try_lock() {
-            if let Some(waker) = replace(&mut *waker, None) {
-                wakers.push(waker);
-            }
-        }
+        let mut waker = self.waker.try_lock()?;
+        replace(&mut *waker, None)
     }
 }
 
@@ -177,10 +174,14 @@ impl Driver {
                 let index = event.token().0;
                 if let Some(waker) = storage.wakers[index].as_ref() {
                     if event.is_readable() {
-                        waker.wakers[IoKind::Read as usize].wake(&mut wakers);
+                        if let Some(waker) = waker.wakers[IoKind::Read as usize].wake() {
+                            wakers.push(waker);
+                        }
                     }
                     if event.is_writable() {
-                        waker.wakers[IoKind::Write as usize].wake(&mut wakers);
+                        if let Some(waker) = waker.wakers[IoKind::Write as usize].wake() {
+                            wakers.push(waker);
+                        }
                     }
                 }
             }
@@ -264,6 +265,12 @@ impl<S: Source> Pollable<S> {
 
 impl<S: Source> Drop for Pollable<S> {
     fn drop(&mut self) {
+        for kind in [IoKind::Read, IoKind::Write] {
+            if let Some(waker) = self.waker.wakers[kind as usize].wake() {
+                waker.wake();
+            }
+        }
+
         let driver = Driver::global().as_ref().unwrap();
         let _ = driver.registry.deregister(&mut self.source);
         driver.storage.lock().unwrap().free(self.waker.clone());
