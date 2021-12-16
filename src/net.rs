@@ -4,6 +4,7 @@ use mio::{
 };
 use once_cell::sync::OnceCell;
 use std::{
+    fmt,
     future::Future,
     io::{self, Read, Write},
     mem::{drop, replace},
@@ -281,6 +282,12 @@ pub struct TcpStream {
     pollable: Pollable<mio::net::TcpStream>,
 }
 
+impl fmt::Debug for TcpStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TcpStream").finish()
+    }
+}
+
 impl TcpStream {
     pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
         let stream = mio::net::TcpStream::connect(addr)?;
@@ -304,7 +311,7 @@ impl TcpStream {
 
     pub async fn write(&self, buffer: &[u8]) -> io::Result<usize> {
         self.pollable
-            .poll_io(IoKind::Read, || (&self.pollable.source).write(buffer))
+            .poll_io(IoKind::Write, || (&self.pollable.source).write(buffer))
             .await
     }
 
@@ -365,6 +372,12 @@ impl TcpStream {
 
 pub struct TcpListener {
     pollable: Pollable<mio::net::TcpListener>,
+}
+
+impl fmt::Debug for TcpListener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TcpListener").finish()
+    }
 }
 
 impl TcpListener {
