@@ -123,7 +123,7 @@ impl IoStorage {
     fn alloc(&mut self) -> Arc<IoWaker> {
         if let Some(idle_index) = self.idle.len().checked_sub(1) {
             let index = self.idle.swap_remove(idle_index);
-            return replace(&mut self.wakers[index], None).unwrap();
+            return self.wakers[index].as_ref().unwrap().clone();
         }
 
         let waker = Arc::new(IoWaker {
@@ -135,7 +135,7 @@ impl IoStorage {
         waker
     }
 
-    fn free(&mut self, waker: Arc<IoWaker>) {
+    fn free(&mut self, waker: &Arc<IoWaker>) {
         self.idle.push(waker.slot);
     }
 }
@@ -213,7 +213,7 @@ impl<S: Source> Pollable<S> {
             Token(waker.slot),
             Interest::READABLE | Interest::WRITABLE,
         ) {
-            driver.storage.lock().unwrap().free(waker);
+            driver.storage.lock().unwrap().free(&waker);
             return Err(err);
         }
 
@@ -267,14 +267,14 @@ impl<S: Source> Pollable<S> {
 impl<S: Source> Drop for Pollable<S> {
     fn drop(&mut self) {
         for kind in [IoKind::Read, IoKind::Write] {
-            if let Some(waker) = self.waker.wakers[kind as usize].wake() {
-                waker.wake();
-            }
+            let waker = &self.waker.wakers[kind as usize];
+            drop(waker.wake());
+            waker.reset();
         }
 
         let driver = Driver::global().as_ref().unwrap();
         let _ = driver.registry.deregister(&mut self.source);
-        driver.storage.lock().unwrap().free(self.waker.clone());
+        driver.storage.lock().unwrap().free(&self.waker);
     }
 }
 
