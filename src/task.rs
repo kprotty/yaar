@@ -249,7 +249,7 @@ where
         let waker = Waker::from(task.clone());
         *task.data.try_lock().unwrap() = TaskData::Polling(future, waker);
 
-        Waker::from(task.clone()).wake();
+        task.clone().wake();
         task
     }
 }
@@ -491,8 +491,8 @@ impl Executor {
 
     fn run_worker(&self, worker: Worker<Arc<dyn Runnable>>, stealer_index: usize) {
         let thread = Rc::new(Thread {
-            run_next: Cell::new(None),
             worker,
+            run_next: Cell::new(None),
             be_fair: Cell::new(false),
         });
 
@@ -505,39 +505,43 @@ impl Executor {
 
         loop {
             let polled = (|| {
-                if thread.be_fair.take() || tick % 61 == 0 {
-                    if let Some(runnable) = self.injector.steal().success().or_else(|| worker.pop())
-                    {
-                        return Some(runnable);
-                    }
-                }
+                let pop_local = || thread.run_next.take().or_else(|| worker.pop());
+                let pop_global = || self.injector.steal().success();
 
-                if let Some(runnable) = thread.run_next.take().or_else(|| worker.pop()) {
+                let be_fair = thread.be_fair.take() || tick % 61 == 0;
+                let local = match be_fair as usize {
+                    0 => pop_local().or_else(|| pop_global()),
+                    1 => pop_global().or_else(|| pop_local()),
+                    _ => unreachable!(),
+                };
+
+                if let Some(runnable) = local {
                     return Some(runnable);
                 }
 
                 self.on_worker_search(&mut searching);
                 if searching {
-                    for _attempt in 0..32 {
-                        let mut retry = false;
-                        for index in self.rng_seq.gen(&mut rng) {
-                            let stole = if index == stealer_index {
-                                self.injector.steal_batch_and_pop(&*worker)
-                            } else {
-                                self.stealers[index].steal_batch_and_pop(&*worker)
-                            };
+                    for _attempt in 0..4 {
+                        loop {
+                            let mut retry = false;
+                            for index in self.rng_seq.gen(&mut rng) {
+                                let stole = match (index == stealer_index) as usize {
+                                    0 => self.stealers[index].steal_batch_and_pop(&*worker),
+                                    1 => self.injector.steal_batch_and_pop(&*worker),
+                                    _ => unreachable!(),
+                                };
 
-                            match stole {
-                                Steal::Success(runnable) => return Some(runnable),
-                                Steal::Retry => retry = true,
-                                Steal::Empty => {}
+                                match stole {
+                                    Steal::Success(runnable) => return Some(runnable),
+                                    Steal::Retry => retry = true,
+                                    Steal::Empty => {}
+                                }
                             }
-                        }
 
-                        if retry {
                             spin_loop();
-                        } else {
-                            break;
+                            if !retry {
+                                break;
+                            }
                         }
                     }
                 }
@@ -560,8 +564,8 @@ impl Executor {
 }
 
 struct Thread {
-    run_next: Cell<Option<Arc<dyn Runnable>>>,
     worker: Worker<Arc<dyn Runnable>>,
+    run_next: Cell<Option<Arc<dyn Runnable>>>,
     be_fair: Cell<bool>,
 }
 
