@@ -484,9 +484,17 @@ impl Executor {
         assert!(searching <= self.stealers.len());
         assert!(searching >= was_searching as usize);
 
-        if was_searching && !self.injector.is_empty() {
+        if was_searching && searching == 1 && !self.is_empty() {
             self.notify();
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.stealers
+            .iter()
+            .map(|stealer| stealer.is_empty())
+            .find(|&is_empty| !is_empty)
+            .unwrap_or_else(|| self.injector.is_empty())
     }
 
     fn run_worker(&self, worker: Worker<Arc<dyn Runnable>>, stealer_index: usize) {
