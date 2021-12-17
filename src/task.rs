@@ -1,4 +1,4 @@
-use super::waker::AtomicWaker;
+use super::waker::OneshotWaker;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use once_cell::sync::OnceCell;
 use pin_utils::pin_mut;
@@ -164,7 +164,7 @@ enum TaskData<F: Future> {
 
 struct Task<F: Future> {
     state: TaskState,
-    waker: AtomicWaker,
+    waker: OneshotWaker,
     data: TryLock<TaskData<F>>,
 }
 
@@ -176,7 +176,7 @@ where
     fn spawn(future: Pin<Box<F>>) -> Arc<Self> {
         let task = Arc::new(Self {
             state: TaskState::default(),
-            waker: AtomicWaker::default(),
+            waker: OneshotWaker::default(),
             data: TryLock::new(TaskData::Empty),
         });
 
@@ -243,7 +243,7 @@ where
         };
 
         drop(data);
-        self.waker.wake().map(Waker::wake);
+        self.waker.wake();
     }
 }
 

@@ -1,4 +1,4 @@
-use super::waker::AtomicWaker;
+use super::waker::ResetWaker;
 use mio::{
     event::{Events, Source},
     Interest, Poll as Poller, Registry, Token,
@@ -11,41 +11,10 @@ use std::{
     mem::drop,
     net::{Shutdown, SocketAddr},
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
     thread,
 };
-
-#[derive(Default)]
-struct IoAtomicWaker {
-    waker: AtomicWaker,
-    notified: AtomicBool,
-}
-
-impl IoAtomicWaker {
-    fn poll(&self, ctx: &mut Context<'_>) -> Poll<()> {
-        if self.notified.load(Ordering::Relaxed) {
-            return Poll::Ready(());
-        }
-
-        let poll_result = self.waker.poll(ctx);
-        if let Poll::Ready(_) = poll_result {
-            self.notified.store(true, Ordering::Relaxed);
-            self.waker.reset();
-        }
-
-        poll_result
-    }
-
-    fn reset(&self) {
-        self.notified.store(false, Ordering::Relaxed);
-    }
-
-    fn wake(&self) -> Option<Waker> {
-        self.waker.wake()
-    }
-}
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum IoKind {
@@ -55,7 +24,7 @@ enum IoKind {
 
 struct IoWaker {
     slot: usize,
-    wakers: [IoAtomicWaker; 2],
+    wakers: [ResetWaker; 2],
 }
 
 #[derive(Default)]
@@ -73,7 +42,7 @@ impl IoStorage {
 
         let waker = Arc::new(IoWaker {
             slot: self.wakers.len(),
-            wakers: [IoAtomicWaker::default(), IoAtomicWaker::default()],
+            wakers: [ResetWaker::default(), ResetWaker::default()],
         });
 
         self.wakers.push(Some(waker.clone()));
