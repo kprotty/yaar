@@ -1,3 +1,4 @@
+use super::waker::AtomicWaker;
 use mio::{
     event::{Events, Source},
     Interest, Poll as Poller, Registry, Token,
@@ -7,80 +8,31 @@ use std::{
     fmt,
     future::Future,
     io::{self, Read, Write},
-    mem::{drop, replace},
+    mem::drop,
     net::{Shutdown, SocketAddr},
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
     thread,
 };
-use try_lock::TryLock;
 
 #[derive(Default)]
-struct AtomicWaker {
-    state: AtomicU8,
+struct IoAtomicWaker {
+    waker: AtomicWaker,
     notified: AtomicBool,
-    waker: TryLock<Option<Waker>>,
 }
 
-impl AtomicWaker {
-    const EMPTY: u8 = 0;
-    const UPDATING: u8 = 1;
-    const READY: u8 = 2;
-    const NOTIFIED: u8 = 3;
-
+impl IoAtomicWaker {
     fn poll(&self, ctx: &mut Context<'_>) -> Poll<()> {
         if self.notified.load(Ordering::Relaxed) {
             return Poll::Ready(());
         }
 
-        let poll_result = (|| {
-            let state = self.state.load(Ordering::Acquire);
-            match state {
-                Self::EMPTY | Self::READY => {}
-                Self::NOTIFIED => return Poll::Ready(()),
-                Self::UPDATING => unreachable!("AtomicWaker polled by multiple threads"),
-                _ => unreachable!("invalid AtomicWaker state"),
-            }
-
-            if let Err(state) = self.state.compare_exchange(
-                state,
-                Self::UPDATING,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
-                assert_eq!(state, Self::NOTIFIED);
-                return Poll::Ready(());
-            }
-
-            {
-                let mut waker = self.waker.try_lock().unwrap();
-                let will_wake = waker
-                    .as_ref()
-                    .map(|w| ctx.waker().will_wake(w))
-                    .unwrap_or(false);
-
-                if !will_wake {
-                    *waker = Some(ctx.waker().clone());
-                }
-            }
-
-            match self.state.compare_exchange(
-                Self::UPDATING,
-                Self::READY,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => Poll::Pending,
-                Err(Self::NOTIFIED) => Poll::Ready(()),
-                Err(_) => unreachable!("invalid AtomicWaker state"),
-            }
-        })();
-
+        let poll_result = self.waker.poll(ctx);
         if let Poll::Ready(_) = poll_result {
-            self.state.store(Self::EMPTY, Ordering::Relaxed);
             self.notified.store(true, Ordering::Relaxed);
+            self.waker.reset();
         }
 
         poll_result
@@ -91,14 +43,7 @@ impl AtomicWaker {
     }
 
     fn wake(&self) -> Option<Waker> {
-        match self.state.swap(Self::NOTIFIED, Ordering::AcqRel) {
-            Self::EMPTY | Self::UPDATING | Self::NOTIFIED => return None,
-            Self::READY => {}
-            _ => unreachable!("invalid AtomicWaker state"),
-        }
-
-        let mut waker = self.waker.try_lock()?;
-        replace(&mut *waker, None)
+        self.waker.wake()
     }
 }
 
@@ -110,7 +55,7 @@ enum IoKind {
 
 struct IoWaker {
     slot: usize,
-    wakers: [AtomicWaker; 2],
+    wakers: [IoAtomicWaker; 2],
 }
 
 #[derive(Default)]
@@ -128,7 +73,7 @@ impl IoStorage {
 
         let waker = Arc::new(IoWaker {
             slot: self.wakers.len(),
-            wakers: [AtomicWaker::default(), AtomicWaker::default()],
+            wakers: [IoAtomicWaker::default(), IoAtomicWaker::default()],
         });
 
         self.wakers.push(Some(waker.clone()));
